@@ -71,7 +71,7 @@ io-extras = "0.18.0"
 serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated XML config files
 glob = { version = "0.3" , optional = true } # for reading spec-mandated XML config files
 mailparse = { version = "0.15" , optional = true } # for reading S/MIME-encoded (XML) config files
-x509-certificate = { version = "0.23" , optional = true } # for configuration certificates
+x509-certificate = { version = "0.24" , optional = true } # for configuration certificates
 x509-cert = { version = "0.2" , optional = true }
 tempfile = { version = "3" , optional = true } # for calling external openssl command. Remove when no longer used.
 newline-converter = { version = "0.3" , optional = true } # helper for handling S/MIME
