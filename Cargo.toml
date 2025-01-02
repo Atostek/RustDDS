@@ -81,7 +81,7 @@ der = { version = "0.7" , optional = true } # ASN.1 DER encoding
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 const-oid = { version = "0.9" , optional = true } # more ASN.1
 openssl = { version = "0.10", optional = true }
-cryptoki = { version = "0.7", optional = true }
+cryptoki = { version = "0.8", optional = true }
 
 
 [target.'cfg(windows)'.dependencies]
