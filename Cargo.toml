@@ -94,7 +94,7 @@ log4rs = "1"
 test-case = "3.1.0"
 env_logger = "0.11"
 test-log = "0.2"
-hex-literal = "0.4"
+hex-literal = "1.0"
 anyhow = "1.0" # for test cases
 
 # ros_visualizer
