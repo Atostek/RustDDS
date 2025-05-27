@@ -42,7 +42,7 @@ use crate::{
     entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
     locator::Locator,
-    sequence_number::{FragmentNumber, SequenceNumber},
+    sequence_number::{FragmentNumber, FragmentNumberRange, SequenceNumber},
     time::Timestamp,
   },
 };
@@ -699,147 +699,11 @@ impl Writer {
       }
     }
 
-    // All the messages are pushed to a vector first before sending them.
-    // If this hinders performance when many datafrag messages need to be
-    // sent, optimize.
-    let mut messages_to_send: Vec<Message> = vec![];
-
-    // The EntityId of the destination
-    let reader_entity_id =
-      target_reader_opt.map_or(EntityId::UNKNOWN, |p| p.remote_reader_guid.entity_id);
-
-    let data_size = cc.data_value.payload_size();
-    let fragmentation_needed = data_size > self.data_max_size_serialized;
-
-    if !fragmentation_needed {
-      // We can send DATA
-      let mut message_builder = MessageBuilder::new();
-
-      // If DataWriter sent us a source timestamp, then add that.
-      // Timestamp has to go before Data to have effect on Data.
-      if let Some(src_ts) = cc.write_options.source_timestamp() {
-        message_builder = message_builder.ts_msg(self.endianness, Some(src_ts));
-      }
-
-      if let Some(reader) = target_reader_opt {
-        // Add info_destination
-        message_builder =
-          message_builder.dst_submessage(self.endianness, reader.remote_reader_guid.prefix);
-
-        // If the reader is pending GAPs on any sequence numbers, add a GAP
-        if !reader.get_pending_gap().is_empty() {
-          message_builder = message_builder.gap_msg(
-            reader.get_pending_gap(),
-            self.entity_id(),
-            self.endianness,
-            reader.remote_reader_guid,
-          );
-        }
-      }
-
-      // Add the DATA submessage
-      message_builder = message_builder.data_msg(
-        cc,
-        reader_entity_id,
-        self.my_guid, // writer
-        self.endianness,
-        self.security_plugins.as_ref(),
-      );
-
-      // Add HEARTBEAT if needed
-      if send_also_heartbeat && !self.like_stateless {
-        let final_flag = false; // false = request that readers acknowledge with ACKNACK.
-        let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
-                                     // writing new data.
-        message_builder = message_builder.heartbeat_msg(
-          self.entity_id(), // from Writer
-          self.history_buffer.first_change_sequence_number(),
-          self.history_buffer.last_change_sequence_number(),
-          self.next_heartbeat_count(),
-          self.endianness,
-          reader_entity_id, // to Reader
-          final_flag,
-          liveliness_flag,
-        );
-      }
-
-      let data_message = message_builder.add_header_and_build(self.my_guid.prefix);
-
-      messages_to_send.push(data_message);
-    } else {
-      // fragmentation_needed: We need to send DATAFRAGs
-
-      // If sending to a single reader, add a GAP message with pending gaps if any
-      if let Some(reader) = target_reader_opt {
-        if !reader.get_pending_gap().is_empty() {
-          let gap_msg = MessageBuilder::new()
-            .dst_submessage(self.endianness, reader.remote_reader_guid.prefix)
-            .gap_msg(
-              reader.get_pending_gap(),
-              self.entity_id(),
-              self.endianness,
-              reader.remote_reader_guid,
-            )
-            .add_header_and_build(self.my_guid.prefix);
-          messages_to_send.push(gap_msg);
-        }
-      }
-
-      let (num_frags, fragment_size) = self.num_frags_and_frag_size(data_size);
-
-      for frag_num in
-        FragmentNumber::range_inclusive(FragmentNumber::new(1), FragmentNumber::new(num_frags))
-      {
-        let mut message_builder = MessageBuilder::new(); // fresh builder
-
-        if let Some(src_ts) = cc.write_options.source_timestamp() {
-          // Add timestamp
-          message_builder = message_builder.ts_msg(self.endianness, Some(src_ts));
-        }
-
-        if let Some(reader) = target_reader_opt {
-          // Add info_destination
-          message_builder =
-            message_builder.dst_submessage(self.endianness, reader.remote_reader_guid.prefix);
-        }
-
-        message_builder = message_builder.data_frag_msg(
-          cc,
-          reader_entity_id, // reader
-          self.my_guid,     // writer
-          frag_num,
-          fragment_size,
-          data_size.try_into().unwrap(),
-          self.endianness,
-          self.security_plugins.as_ref(),
-        );
-
-        let datafrag_msg = message_builder.add_header_and_build(self.my_guid.prefix);
-        messages_to_send.push(datafrag_msg);
-      } // end for
-
-      // Add HEARTBEAT message if needed
-      if send_also_heartbeat && !self.like_stateless {
-        let final_flag = false; // false = request that readers acknowledge with ACKNACK.
-        let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
-                                     // writing new data.
-        let hb_msg = MessageBuilder::new()
-          .heartbeat_msg(
-            self.entity_id(), // from Writer
-            self.history_buffer.first_change_sequence_number(),
-            self.history_buffer.last_change_sequence_number(),
-            self.next_heartbeat_count(),
-            self.endianness,
-            reader_entity_id, // to Reader
-            final_flag,
-            liveliness_flag,
-          )
-          .add_header_and_build(self.my_guid.prefix);
-        messages_to_send.push(hb_msg);
-      }
-    }
+    let messages_to_send = FragmentationIter::new(self, cc, target_reader_opt, send_also_heartbeat);
+    let fragmentation_needed = messages_to_send.fragmentation_needed();
 
     // Send the messages, either to all readers or just one
+    // note, this might also have to pass &mut self in so that the iterator is valid
     for msg in messages_to_send {
       match target_reader_opt {
         None => {
@@ -856,7 +720,6 @@ impl Writer {
         }
       }
     }
-
     // The return value tells if the data had to be fragmented
     fragmentation_needed
   }
@@ -1736,6 +1599,225 @@ impl RTPSEntity for Writer {
 impl HasQoSPolicy for Writer {
   fn qos(&self) -> QosPolicies {
     self.qos_policies.clone()
+  }
+}
+
+struct FragmentationIter<'a, 'b, 'c> {
+  writer: &'a Writer,
+  cache_change: &'b CacheChange,
+  target_reader_opt: Option<&'c RtpsReaderProxy>,
+  reader_entity_id: EntityId,
+  send_heartbeat: bool,
+  finished: bool,
+  state: FragmentationIterState,
+}
+
+impl<'a, 'b, 'c> FragmentationIter<'a, 'b, 'c> {
+  fn new(
+    writer: &'a Writer,
+    cache_change: &'b CacheChange,
+    target_reader_opt: Option<&'c RtpsReaderProxy>,
+    send_heartbeat: bool,
+  ) -> Self {
+    // The EntityId of the destination
+    let reader_entity_id =
+      target_reader_opt.map_or(EntityId::UNKNOWN, |p| p.remote_reader_guid.entity_id);
+
+    let data_size = cache_change.data_value.payload_size();
+    let fragmentation_needed = data_size > writer.data_max_size_serialized;
+
+    let state = if fragmentation_needed {
+      FragmentationIterState::Fragmented(FragmentedState::TargetReader, data_size)
+    } else {
+      FragmentationIterState::Unfragmented
+    };
+
+    Self {
+      writer,
+      cache_change,
+      target_reader_opt,
+      state,
+      reader_entity_id,
+      finished: false,
+      send_heartbeat,
+    }
+  }
+
+  fn fragmentation_needed(&self) -> bool {
+    matches!(self.state, FragmentationIterState::Fragmented(..))
+  }
+}
+
+enum FragmentationIterState {
+  Fragmented(FragmentedState, usize),
+  Unfragmented,
+}
+
+enum FragmentedState {
+  TargetReader,
+  Fragments(FragmentNumberRange, u16),
+  Heartbeat,
+}
+
+impl<'a, 'b, 'c> Iterator for FragmentationIter<'a, 'b, 'c> {
+  type Item = Message;
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.finished {
+      return None;
+    }
+
+    let cc = self.cache_change;
+    let writer = self.writer;
+    let target_reader_opt = self.target_reader_opt;
+    let reader_entity_id = self.reader_entity_id;
+    let send_heartbeat = self.send_heartbeat;
+
+    match &mut self.state {
+      FragmentationIterState::Fragmented(state, data_size) => {
+        // fragmentation_needed: We need to send DATAFRAGs
+        match state {
+          FragmentedState::TargetReader => {
+            let (num_frags, fragment_size) = writer.num_frags_and_frag_size(*data_size);
+            *state = FragmentedState::Fragments(
+              FragmentNumber::range_inclusive(
+                FragmentNumber::new(1),
+                FragmentNumber::new(num_frags),
+              ),
+              fragment_size,
+            );
+
+            // If sending to a single reader, add a GAP message with pending gaps if any
+            if let Some(reader) = target_reader_opt {
+              if !reader.get_pending_gap().is_empty() {
+                let gap_msg = MessageBuilder::new()
+                  .dst_submessage(writer.endianness, reader.remote_reader_guid.prefix)
+                  .gap_msg(
+                    reader.get_pending_gap(),
+                    writer.entity_id(),
+                    writer.endianness,
+                    reader.remote_reader_guid,
+                  )
+                  .add_header_and_build(writer.my_guid.prefix);
+                return Some(gap_msg);
+              }
+            }
+            return self.next();
+          }
+          FragmentedState::Fragments(fragments, fragment_size) => {
+            if let Some(frag_num) = fragments.next() {
+              let mut message_builder = MessageBuilder::new(); // fresh builder
+
+              if let Some(src_ts) = cc.write_options.source_timestamp() {
+                // Add timestamp
+                message_builder = message_builder.ts_msg(writer.endianness, Some(src_ts));
+              }
+
+              if let Some(reader) = target_reader_opt {
+                // Add info_destination
+                message_builder = message_builder
+                  .dst_submessage(writer.endianness, reader.remote_reader_guid.prefix);
+              }
+
+              message_builder = message_builder.data_frag_msg(
+                cc,
+                reader_entity_id, // reader
+                writer.my_guid,
+                frag_num,
+                *fragment_size,
+                (*data_size).try_into().unwrap(),
+                writer.endianness,
+                writer.security_plugins.as_ref(),
+              );
+
+              let datafrag_msg = message_builder.add_header_and_build(writer.my_guid.prefix);
+              return Some(datafrag_msg);
+            }
+            *state = FragmentedState::Heartbeat;
+            return self.next();
+          }
+          FragmentedState::Heartbeat => {
+            self.finished = true;
+
+            // Add HEARTBEAT message if needed
+            if send_heartbeat && !writer.like_stateless {
+              let final_flag = false; // false = request that readers acknowledge with ACKNACK.
+              let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
+                                           // writing new data.
+              let hb_msg = MessageBuilder::new()
+                .heartbeat_msg(
+                  writer.entity_id(), // from Writer
+                  writer.history_buffer.first_change_sequence_number(),
+                  writer.history_buffer.last_change_sequence_number(),
+                  writer.next_heartbeat_count(),
+                  writer.endianness,
+                  reader_entity_id, // to Reader
+                  final_flag,
+                  liveliness_flag,
+                )
+                .add_header_and_build(writer.my_guid.prefix);
+              return Some(hb_msg);
+            }
+            return None;
+          }
+        }
+      }
+      FragmentationIterState::Unfragmented => {
+        // We can send DATA
+        let mut message_builder = MessageBuilder::new();
+
+        // If DataWriter sent us a source timestamp, then add that.
+        // Timestamp has to go before Data to have effect on Data.
+        if let Some(src_ts) = cc.write_options.source_timestamp() {
+          message_builder = message_builder.ts_msg(writer.endianness, Some(src_ts));
+        }
+
+        if let Some(reader) = target_reader_opt {
+          // Add info_destination
+          message_builder =
+            message_builder.dst_submessage(writer.endianness, reader.remote_reader_guid.prefix);
+
+          // If the reader is pending GAPs on any sequence numbers, add a GAP
+          if !reader.get_pending_gap().is_empty() {
+            message_builder = message_builder.gap_msg(
+              reader.get_pending_gap(),
+              writer.entity_id(),
+              writer.endianness,
+              reader.remote_reader_guid,
+            );
+          }
+        }
+
+        // Add the DATA submessage
+        message_builder = message_builder.data_msg(
+          cc,
+          reader_entity_id,
+          writer.my_guid,
+          writer.endianness,
+          writer.security_plugins.as_ref(),
+        );
+
+        // Add HEARTBEAT if needed
+        if send_heartbeat && !writer.like_stateless {
+          let final_flag = false; // false = request that readers acknowledge with ACKNACK.
+          let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
+                                       // writing new data.
+          message_builder = message_builder.heartbeat_msg(
+            writer.entity_id(),
+            writer.history_buffer.first_change_sequence_number(),
+            writer.history_buffer.last_change_sequence_number(),
+            writer.next_heartbeat_count(),
+            writer.endianness,
+            reader_entity_id, // to Reader
+            final_flag,
+            liveliness_flag,
+          );
+        }
+
+        let data_message = message_builder.add_header_and_build(writer.my_guid.prefix);
+        self.finished = true;
+        Some(data_message)
+      }
+    }
   }
 }
 
