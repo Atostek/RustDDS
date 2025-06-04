@@ -81,7 +81,7 @@ der = { version = "0.7" , optional = true } # ASN.1 DER encoding
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 const-oid = { version = "0.9" , optional = true } # more ASN.1
 openssl = { version = "0.10.70", optional = true }
-cryptoki = { version = "0.9", optional = true }
+cryptoki = { version = "0.10", optional = true }
 pnet = { version = "0.35.0", default-features = false, features = ["std", "pnet_datalink"] }
 pnet_sys = { version = "0.35.0", default-features = false }
 
