@@ -206,17 +206,13 @@ where
     self.event_source.drain();
   }
 
-  fn try_take_undecoded<'a>(
+  fn try_take_undecoded<'a, 'b: 'a>(
     is_reliable: bool,
     topic_cache: &'a TopicCache,
     latest_instant: Timestamp,
-    last_read_sn: &'a BTreeMap<GUID, SequenceNumber>,
-  ) -> Box<dyn Iterator<Item = (Timestamp, &'a CacheChange)> + 'a> {
-    if is_reliable {
-      topic_cache.get_changes_in_range_reliable(last_read_sn)
-    } else {
-      topic_cache.get_changes_in_range_best_effort(latest_instant, Timestamp::now())
-    }
+    last_read_sn: &'b BTreeMap<GUID, SequenceNumber>,
+  ) -> impl Iterator<Item = (Timestamp, &'a CacheChange)> {
+    topic_cache.get_changes_in_range(is_reliable, latest_instant, last_read_sn)
   }
 
   fn update_hash_to_key_map(
@@ -359,10 +355,12 @@ where
     let latest_instant = read_state_ref.latest_instant;
     let (last_read_sn, hash_to_key_map) = read_state_ref.get_sn_map_and_hash_map();
 
+    let mut changes = Self::try_take_undecoded(is_reliable, &topic_cache, latest_instant, last_read_sn);
+
     // loop in case we get a sample that should be ignored, so we try next.
     loop {
       let (timestamp, cc) =
-        match Self::try_take_undecoded(is_reliable, &topic_cache, latest_instant, last_read_sn)
+        match changes
           .next()
         {
           None => return Ok(None), // no more data available right now
@@ -374,6 +372,9 @@ where
       if let Err(ReadError::UnknownKey { .. }) = result {
         // ignore unknown key hash, continue looping
       } else {
+        // explicitly drop the cache changes to update the reader state
+        drop(changes);
+
         // return with this result
         // make copies of guid and SN to calm down borrow checker.
         let writer_guid = cc.writer_guid;

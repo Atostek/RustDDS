@@ -1,6 +1,7 @@
 use std::{
   cmp::max,
-  collections::{BTreeMap, HashMap},
+  collections::{btree_map, BTreeMap, HashMap},
+  iter,
   ops::Bound::{Excluded, Included},
   sync::{Arc, Mutex},
 };
@@ -280,11 +281,11 @@ impl TopicCache {
       .insert(cc.sequence_number, instant);
   }
 
-  pub fn get_changes_in_range_best_effort(
-    &self,
+  pub fn get_changes_in_range_best_effort<'a>(
+    &'a self,
     start_instant: Timestamp,
     end_instant: Timestamp,
-  ) -> Box<dyn Iterator<Item = (Timestamp, &CacheChange)> + '_> {
+  ) -> ChangesInRangeBestEffort<'a, impl FnMut(BestEffortMap<'a>) -> ChangesItem<'a>> {
     // Sanity check
     let start_instant = if start_instant <= end_instant {
       // sane case
@@ -299,36 +300,50 @@ impl TopicCache {
     };
 
     // Get result as tree range
-    Box::new(
-      self
-        .changes
-        .range((Excluded(start_instant), Included(end_instant)))
-        .map(|(i, c)| (*i, c)),
-    )
+    self
+      .changes
+      .range((Excluded(start_instant), Included(end_instant)))
+      .map(|(i, c)| (*i, c))
   }
 
-  pub fn get_changes_in_range_reliable<'a>(
+  pub fn get_changes_in_range_reliable<'a, 'b>(
     &'a self,
-    last_read_sn: &'a BTreeMap<GUID, SequenceNumber>,
-  ) -> Box<dyn Iterator<Item = (Timestamp, &'a CacheChange)> + 'a> {
-    Box::new(
-      self
-        .sequence_numbers
-        .iter()
-        .flat_map(|(guid, sn_map)| {
-          let lower_bound_exc = last_read_sn
-            .get(guid)
-            .cloned()
-            .unwrap_or(SequenceNumber::zero());
-          let upper_bound_exc = self.reliable_before(*guid);
-          // make sure lower < upper, so that `.range()` does not panic.
-          let upper_bound_exc = max(upper_bound_exc, lower_bound_exc.plus_1());
-          sn_map.range((Excluded(lower_bound_exc), Excluded(upper_bound_exc)))
-        }) // we get iterator of Timestamp
-        .filter_map(|(_sn, t)| self.get_change(t).map(|cc| (*t, cc))),
-    )
+    last_read_sn: &'b BTreeMap<GUID, SequenceNumber>,
+  ) -> ChangesInRangeReliable<
+    'a,
+    impl FnMut(ReliableFlat<'a>) -> ReliableFlatItem<'a> + use<'a, 'b>,
+    impl FnMut(ReliableMap<'a>) -> Option<ChangesItem<'a>>,
+  > {
+    self
+      .sequence_numbers
+      .iter()
+      .flat_map(|(guid, sn_map)| {
+        let lower_bound_exc = last_read_sn
+          .get(guid)
+          .cloned()
+          .unwrap_or(SequenceNumber::zero());
+        let upper_bound_exc = self.reliable_before(*guid);
+        // make sure lower < upper, so that `.range()` does not panic.
+        let upper_bound_exc = max(upper_bound_exc, lower_bound_exc.plus_1());
+        sn_map.range((Excluded(lower_bound_exc), Excluded(upper_bound_exc)))
+      }) // we get iterator of Timestamp
+      .filter_map(|(_sn, t)| self.get_change(t).map(|cc| (*t, cc)))
   }
 
+  pub fn get_changes_in_range<'a>(
+    &'a self,
+    reliable: bool,
+    latest_instant: Timestamp,
+    last_read_sn: &'a BTreeMap<GUID, SequenceNumber>,
+  ) -> impl Iterator<Item = (Timestamp, &'a CacheChange)> {
+    if reliable {
+      ChangesInRange::Reliable(self.get_changes_in_range_reliable(last_read_sn))
+    } else {
+      ChangesInRange::BestEffort(
+        self.get_changes_in_range_best_effort(latest_instant, Timestamp::now()),
+      )
+    }
+  }
   fn reliable_before(&self, writer: GUID) -> SequenceNumber {
     self
       .received_reliably_before
@@ -431,6 +446,46 @@ impl TopicCache {
 
   pub fn topic_name(&self) -> String {
     self.topic_name.clone()
+  }
+}
+
+type ChangesInRangeBestEffort<'a, F> = iter::Map<btree_map::Range<'a, Timestamp, CacheChange>, F>;
+type ChangesInRangeReliable<'a, F1, F2> = iter::FilterMap<
+  iter::FlatMap<
+    btree_map::Iter<'a, GUID, BTreeMap<SequenceNumber, Timestamp>>,
+    btree_map::Range<'a, SequenceNumber, Timestamp>,
+    F1,
+  >,
+  F2,
+>;
+
+// type definitions for iterators
+type BestEffortMap<'a> = (&'a Timestamp, &'a CacheChange);
+
+type ReliableMap<'a> = (&'a SequenceNumber, &'a Timestamp);
+type ReliableFlat<'a> = (&'a GUID, &'a BTreeMap<SequenceNumber, Timestamp>);
+type ReliableFlatItem<'a> = btree_map::Range<'a, SequenceNumber, Timestamp>;
+
+type ChangesItem<'a> = (Timestamp, &'a CacheChange);
+
+pub(crate) enum ChangesInRange<'a, F, F1, F2> {
+  BestEffort(ChangesInRangeBestEffort<'a, F>),
+  Reliable(ChangesInRangeReliable<'a, F1, F2>),
+}
+
+impl<'a, F, F1, F2> Iterator for ChangesInRange<'a, F, F1, F2>
+where
+  F: FnMut(BestEffortMap<'a>) -> ChangesItem<'a>,
+  F1: FnMut(ReliableFlat<'a>) -> ReliableFlatItem<'a>,
+  F2: FnMut(ReliableMap<'a>) -> Option<ChangesItem<'a>>,
+{
+  type Item = ChangesItem<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    match self {
+      Self::Reliable(r) => r.next(),
+      Self::BestEffort(b) => b.next(),
+    }
   }
 }
 
