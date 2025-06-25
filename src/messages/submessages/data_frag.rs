@@ -107,14 +107,7 @@ impl DataFrag {
     if frag_size < 1 {
       FragmentNumber::INVALID
     } else {
-      FragmentNumber::new((self.data_size / frag_size) + u32::from(self.data_size % frag_size > 0))
-      // TODO: Use self.data_size.div_ceil(frag_size) from core::num
-      // instead of the above when it is available in stable Rust.
-      //
-      // Note: Alternative solution
-      // (data_size + frag_size - 1) / frag_size
-      // will overflow for large values of data_size and frag_size, unless
-      // promoted to u64 arithmetic
+      FragmentNumber::new(self.data_size.div_ceil(frag_size))
     }
   }
 
