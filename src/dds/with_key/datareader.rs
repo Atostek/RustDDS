@@ -1227,8 +1227,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &QosPolicies::qos_none(),
     );
 
@@ -1392,8 +1392,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &QosPolicies::qos_none(),
     );
 

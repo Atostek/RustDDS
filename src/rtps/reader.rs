@@ -894,13 +894,6 @@ impl Reader {
       .with_mutable_writer_proxy(writer_guid, |this, writer_proxy| {
         // Note: This is worker closure. Use `this` instead of `self`.
 
-        // Decide where should we send a reply, i.e. ACKNACK
-        let reply_locators = match mr_state.unicast_reply_locator_list.as_slice() {
-          [] | [Locator::Invalid] => writer_proxy.unicast_locator_list.clone(),
-          //TODO: What is writer_proxy has an empty list?
-          others => others.to_vec(),
-        };
-
         if heartbeat.count <= writer_proxy.received_heartbeat_count {
           // This heartbeat was already seen an processed.
           return false;
@@ -1021,6 +1014,13 @@ impl Reader {
             }
           }
 
+          // Decide where should we send a reply, i.e. ACKNACK
+          let reply_locators = match mr_state.unicast_reply_locator_list {
+            [] | [Locator::Invalid] => &writer_proxy.unicast_locator_list,
+            //TODO: What is writer_proxy has an empty list?
+            others => others,
+          };
+
           if !nackfrags.is_empty() {
             this.send_nackfrags_to(
               nackfrag_flags,
@@ -1028,7 +1028,7 @@ impl Reader {
               InfoDestination {
                 guid_prefix: mr_state.source_guid_prefix,
               },
-              &reply_locators,
+              reply_locators,
               writer_guid,
             );
           }
@@ -1039,7 +1039,7 @@ impl Reader {
             InfoDestination {
               guid_prefix: mr_state.source_guid_prefix,
             },
-            &reply_locators,
+            reply_locators,
             writer_guid,
           );
 
@@ -1518,8 +1518,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &QosPolicies::qos_none(),
     );
 
@@ -1605,8 +1605,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &QosPolicies::qos_none(),
     );
 
@@ -1709,8 +1709,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &reliable_qos,
     );
 
@@ -1818,8 +1818,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &QosPolicies::qos_none(),
     );
 
@@ -1956,8 +1956,8 @@ mod tests {
     reader.matched_writer_add(
       writer_guid,
       EntityId::UNKNOWN,
-      mr_state.unicast_reply_locator_list.clone(),
-      mr_state.multicast_reply_locator_list.clone(),
+      mr_state.unicast_reply_locator_list.to_vec(),
+      mr_state.multicast_reply_locator_list.to_vec(),
       &QosPolicies::qos_none(),
     );
 
