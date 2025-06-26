@@ -350,7 +350,6 @@ impl Discovery {
       "Unable to create Discovery Publisher."
     );
 
-    // TODO: timeout value is not used. Remove.
     macro_rules! construct_topic_and_poll {
       ( $repr:ident, $has_key:ident,
         $topic_name:expr, $topic_type_name:expr, $message_type:ty,
@@ -405,9 +404,8 @@ impl Discovery {
           .expect("Failed to register a discovery reader to poll.");
 
         let mut timer: Timer<TimerPolicy> = new_simple_timer();
-        let timeout_and_timer_token_opt: Option<(StdDuration, mio_06::Token)> =
-          $timeout_and_timer_token_opt;
-        if let Some((_timeout_value, timer_token)) = timeout_and_timer_token_opt {
+        let timeout_and_timer_token_opt: Option<mio_06::Token> = $timeout_and_timer_token_opt;
+        if let Some(timer_token) = timeout_and_timer_token_opt {
           timer.set_timeout(StdDuration::from_millis(100), TimerPolicy::Repeat);
           poll
             .register(&timer, timer_token, Ready::readable(), PollOpt::edge())
@@ -449,10 +447,7 @@ impl Discovery {
       EntityId::SPDP_BUILTIN_PARTICIPANT_READER,
       DISCOVERY_PARTICIPANT_DATA_TOKEN,
       EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
-      Some((
-        Self::SPDP_PUBLISH_PERIOD,
-        DISCOVERY_SEND_PARTICIPANT_INFO_TOKEN,
-      )),
+      Some(DISCOVERY_SEND_PARTICIPANT_INFO_TOKEN),
     );
 
     // create lease duration check timer
@@ -539,10 +534,7 @@ impl Discovery {
       EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
       DISCOVERY_PARTICIPANT_MESSAGE_TOKEN,
       EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
-      Some((
-        Self::CHECK_PARTICIPANT_MESSAGES,
-        DISCOVERY_PARTICIPANT_MESSAGE_TIMER_TOKEN,
-      )),
+      Some(DISCOVERY_PARTICIPANT_MESSAGE_TIMER_TOKEN),
     );
 
     // DDS Security
