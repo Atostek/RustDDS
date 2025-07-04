@@ -67,14 +67,14 @@ pub struct SecureWrapping {
 
 // This is partial receiver state to be sent to a Reader or a Writer with a
 // Submessage
-#[derive(Debug, Clone)]
-pub struct MessageReceiverState {
+#[derive(Debug)]
+pub struct MessageReceiverState<'a> {
   pub source_guid_prefix: GuidPrefix,
-  pub unicast_reply_locator_list: Vec<Locator>,
+  pub unicast_reply_locator_list: &'a [Locator],
 
   #[allow(dead_code)]
   // TODO: We do not use the multicast Locators from InfoReply for anything for now.
-  pub multicast_reply_locator_list: Vec<Locator>,
+  pub multicast_reply_locator_list: &'a [Locator],
 
   pub source_timestamp: Option<Timestamp>,
 
@@ -83,12 +83,12 @@ pub struct MessageReceiverState {
   pub secure_rtps_wrapped: Option<SecureWrapping>,
 }
 
-impl Default for MessageReceiverState {
+impl Default for MessageReceiverState<'_> {
   fn default() -> Self {
     Self {
       source_guid_prefix: GuidPrefix::default(),
-      unicast_reply_locator_list: Vec::default(),
-      multicast_reply_locator_list: Vec::default(),
+      unicast_reply_locator_list: &[],
+      multicast_reply_locator_list: &[],
       source_timestamp: Some(Timestamp::INVALID),
       #[cfg(feature = "security")]
       secure_rtps_wrapped: None,
@@ -183,15 +183,24 @@ impl MessageReceiver {
     }
   }
 
-  fn clone_partial_message_receiver_state(&self) -> MessageReceiverState {
-    MessageReceiverState {
+  fn partial_message_receiver_state(
+    &mut self,
+    target_reader_entity_id: &EntityId,
+  ) -> (
+    MessageReceiverState<'_>,
+    Option<&mut Reader>,
+    Option<&SecurityPluginsHandle>,
+  ) {
+    let reader = self.available_readers.get_mut(target_reader_entity_id);
+    let state = MessageReceiverState {
       source_guid_prefix: self.source_guid_prefix,
-      unicast_reply_locator_list: self.unicast_reply_locator_list.clone(),
-      multicast_reply_locator_list: self.multicast_reply_locator_list.clone(),
+      unicast_reply_locator_list: &self.unicast_reply_locator_list,
+      multicast_reply_locator_list: &self.multicast_reply_locator_list,
       source_timestamp: self.source_timestamp,
       #[cfg(feature = "security")]
       secure_rtps_wrapped: self.secure_rtps_wrapped.clone(),
-    }
+    };
+    (state, reader, self.security_plugins.as_ref())
   }
 
   pub fn add_reader(&mut self, new_reader: Reader) {
@@ -569,7 +578,8 @@ impl MessageReceiver {
       }
     }
 
-    let mr_state = self.clone_partial_message_receiver_state();
+    let (mr_state, target_reader, security_plugins) =
+      self.partial_message_receiver_state(&target_reader_entity_id);
     let writer_entity_id = submessage.sender_entity_id();
     let source_guid_prefix = mr_state.source_guid_prefix;
     let source_guid = &GUID {
@@ -577,9 +587,7 @@ impl MessageReceiver {
       entity_id: writer_entity_id,
     };
 
-    let security_plugins = self.security_plugins.clone();
-
-    let target_reader = if let Some(target_reader) = self.reader_mut(target_reader_entity_id) {
+    let target_reader = if let Some(target_reader) = target_reader {
       target_reader
     } else {
       return error!("No reader matching the CryptoHandle found");
@@ -588,7 +596,7 @@ impl MessageReceiver {
     match submessage {
       WriterSubmessage::Data(data, data_flags) => {
         Self::decode_and_handle_data(
-          security_plugins.as_ref(),
+          security_plugins,
           source_guid,
           data,
           data_flags,
@@ -623,7 +631,7 @@ impl MessageReceiver {
 
       WriterSubmessage::DataFrag(datafrag, flags) => {
         Self::decode_and_handle_datafrag(
-          security_plugins.as_ref(),
+          security_plugins,
           source_guid,
           datafrag.clone(),
           flags,
@@ -646,7 +654,7 @@ impl MessageReceiver {
     data: Data,
     data_flags: BitFlags<DATA_Flags, u8>,
     reader: &mut Reader,
-    mr_state: &MessageReceiverState,
+    mr_state: &MessageReceiverState<'_>,
   ) {
     reader.handle_data_msg(data, data_flags, mr_state);
   }
@@ -658,7 +666,7 @@ impl MessageReceiver {
     data: Data,
     data_flags: BitFlags<DATA_Flags, u8>,
     reader: &mut Reader,
-    mr_state: &MessageReceiverState,
+    mr_state: &MessageReceiverState<'_>,
   ) {
     let Data {
       inline_qos,
@@ -705,7 +713,7 @@ impl MessageReceiver {
     datafrag: DataFrag,
     datafrag_flags: BitFlags<DATAFRAG_Flags, u8>,
     reader: &mut Reader,
-    mr_state: &MessageReceiverState,
+    mr_state: &MessageReceiverState<'_>,
   ) {
     let payload_buffer_length = datafrag.serialized_payload.len();
     if payload_buffer_length
@@ -737,7 +745,7 @@ impl MessageReceiver {
     datafrag: DataFrag,
     datafrag_flags: BitFlags<DATAFRAG_Flags, u8>,
     reader: &mut Reader,
-    mr_state: &MessageReceiverState,
+    mr_state: &MessageReceiverState<'_>,
   ) {
     let DataFrag {
       inline_qos,
