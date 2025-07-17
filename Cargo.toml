@@ -57,7 +57,7 @@ enumflags2 = { version = "0.7.7", features = ["serde"] }
 if-addrs = "0.13"
 paste = "1"
 md5 = "0.8.0"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
 static_assertions = "1.1"
 thiserror = "2.0.9"
