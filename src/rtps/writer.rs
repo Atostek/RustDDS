@@ -535,12 +535,36 @@ impl Writer {
   // --------------------------------------------------------------
   // --------------------------------------------------------------
   fn num_frags_and_frag_size(&self, payload_size: usize) -> (u32, u16) {
-    let fragment_size = self.data_max_size_serialized as u32; // TODO: overflow check
-    let data_size = payload_size as u32; // TODO: overflow check
-                                         // Formula from RTPS spec v2.5 Section "8.3.8.3.5 Logical Interpretation"
-    let num_frags = (data_size / fragment_size) + u32::from(data_size % fragment_size != 0); // rounding up
-    debug!("Fragmenting {data_size} to {num_frags} x {fragment_size}");
-    // TODO: Check fragment_size overflow
+    let calc_frag_size = |max_size| {
+      u16::try_from(max_size).unwrap_or_else(|_| {
+        warn!(
+          "Integer overflow when converting writer {:x?} fragmentation size ({}) to u16, using \
+           u16::MAX",
+          self.entity_id(),
+          self.data_max_size_serialized
+        );
+        u16::MAX
+      }) as usize
+    };
+    let mut fragment_size = calc_frag_size(self.data_max_size_serialized);
+
+    // RTPS spec v2.5 Section "8.3.8.3.5 Logical Interpretation"
+    let calc_num_frags = |frag_size| u32::try_from(payload_size.div_ceil(frag_size));
+    let mut num_frags = calc_num_frags(fragment_size);
+
+    while num_frags.is_err() {
+      let overflow_frag_count = payload_size.div_ceil(fragment_size);
+      let new_fragment_size = calc_frag_size(fragment_size * 2);
+      warn!(
+        "Integer overflow when converting writer {:x?} fragmentation count \
+         ({overflow_frag_count}) to u32, increasing fragmentation count to {new_fragment_size}",
+        self.entity_id()
+      );
+      num_frags = calc_num_frags(new_fragment_size);
+      fragment_size = new_fragment_size;
+    }
+    let num_frags = num_frags.unwrap();
+    debug!("Fragmenting {payload_size} to {num_frags} x {fragment_size}");
     (num_frags, fragment_size as u16)
   }
 
