@@ -52,19 +52,19 @@ use crate::no_security::SecureDiscovery;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpdpDiscoveredParticipantData {
   pub updated_time: chrono::DateTime<Utc>, // used internally by RustDDS
-  pub protocol_version: ProtocolVersion, // PartProxy
-  pub vendor_id: VendorId,  // PartProxy
-  pub expects_inline_qos: bool, // PartProxy
-  pub participant_guid: GUID, // PartProxy (as GUIDPrefix)
+  pub protocol_version: ProtocolVersion,   // PartProxy
+  pub vendor_id: VendorId,                 // PartProxy
+  pub expects_inline_qos: bool,            // PartProxy
+  pub participant_guid: GUID,              // PartProxy (as GUIDPrefix)
   pub metatraffic_unicast_locators: Vec<Locator>, // PartProxy
   pub metatraffic_multicast_locators: Vec<Locator>, // PartProxy
   pub default_unicast_locators: Vec<Locator>, // PartProxy
   pub default_multicast_locators: Vec<Locator>, // PartProxy
   pub available_builtin_endpoints: BuiltinEndpointSet, // PartProxy
-  pub lease_duration: Option<Duration>, // from SPDPdiscoveredParticipantData
-  pub manual_liveliness_count: i32, // PartProxy
+  pub lease_duration: Option<Duration>,    // from SPDPdiscoveredParticipantData
+  pub manual_liveliness_count: i32,        // PartProxy
   pub builtin_endpoint_qos: Option<BuiltinEndpointQos>, // PartProxy
-  pub entity_name: Option<String>, // where does this come from??
+  pub entity_name: Option<String>,         // where does this come from??
 
   // security
   #[cfg(feature = "security")]
@@ -96,9 +96,8 @@ impl SpdpDiscoveredParticipantData {
     entity_id: EntityId,
     reader_qos: &QosPolicies,
   ) -> RtpsReaderProxy {
-    assert!( entity_id.kind().is_built_in() );
-    let remote_reader_guid = 
-      GUID::new_with_prefix_and_id(self.participant_guid.prefix, entity_id);
+    assert!(entity_id.kind().is_built_in());
+    let remote_reader_guid = GUID::new_with_prefix_and_id(self.participant_guid.prefix, entity_id);
 
     let mut proxy = RtpsReaderProxy::new(
       remote_reader_guid,
@@ -116,39 +115,20 @@ impl SpdpDiscoveredParticipantData {
     proxy
   }
 
-  pub(crate) fn as_writer_proxy(
+  pub(crate) fn get_builtin_writer_proxy(
     &self,
-    is_metatraffic: bool,
-    entity_id: Option<EntityId>,
+    entity_id: EntityId,
+    //writer_qos: &QosPolicies,
   ) -> RtpsWriterProxy {
-    let remote_writer_guid = GUID::new_with_prefix_and_id(
-      self.participant_guid.prefix,
-      match entity_id {
-        Some(id) => id,
-        None => EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
-      },
-    );
+    assert!(entity_id.kind().is_built_in());
+    let remote_writer_guid = GUID::new_with_prefix_and_id(self.participant_guid.prefix, entity_id);
 
-    let mut proxy = RtpsWriterProxy::new(
+    RtpsWriterProxy::new(
       remote_writer_guid,
-      Vec::new(),
-      Vec::new(),
-      EntityId::UNKNOWN,
-    );
-
-    if is_metatraffic {
-      // TODO: possible multicast addresses
-      proxy
-        .unicast_locator_list
-        .clone_from(&self.metatraffic_unicast_locators);
-    } else {
-      // TODO: possible multicast addresses
-      proxy
-        .unicast_locator_list
-        .clone_from(&self.default_unicast_locators);
-    }
-
-    proxy
+      self.metatraffic_unicast_locators.clone(),
+      self.metatraffic_multicast_locators.clone(),
+      EntityId::UNKNOWN, // Remote Group Entityid, which we do not implement
+    )
   }
 
   pub(crate) fn from_local_participant(

@@ -23,7 +23,7 @@ use crate::{
   messages::submessages::submessages::AckSubmessage,
   network::{udp_listener::UDPListener, udp_sender::UDPSender},
   polling::new_simple_timer,
-  qos::HasQoSPolicy,
+  //qos::HasQoSPolicy,
   rtps::{
     constant::*,
     message_receiver::MessageReceiver,
@@ -614,12 +614,12 @@ impl DPEventLoop {
           .available_builtin_endpoints
           .contains(*reader_endpoint_set_elem)
         {
-          let reader_proxy = 
-            discovered_participant.get_builtin_reader_proxy(*reader_eid, &reader_qos);
+          let reader_proxy =
+            discovered_participant.get_builtin_reader_proxy(*reader_eid, reader_qos);
 
           // Get the QoS for the built-in topic from the local writer
           let mut reader_qos = reader_qos.clone();
-          
+
           // special case by RTPS 2.3 / 2.5 spec Section
           // "8.4.13.3 BuiltinParticipantMessageWriter and
           // BuiltinParticipantMessageReader QoS"
@@ -645,7 +645,7 @@ impl DPEventLoop {
     // update local readers.
     // list to be looped over is the same as above, but now
     // EntityIds are for announcers
-    for (writer_eid, reader_eid, writer_endpoint_set_elem) in &writers_init_list {
+    for (writer_eid, reader_eid, writer_endpoint_set_elem, writer_qos) in &writers_init_list {
       if let Some(reader) = self.message_receiver.available_readers.get_mut(reader_eid) {
         debug!("try update_discovery_reader - {:?}", reader.topic_name());
 
@@ -653,12 +653,9 @@ impl DPEventLoop {
           .available_builtin_endpoints
           .contains(*writer_endpoint_set_elem)
         {
-          let wp = discovered_participant.as_writer_proxy(true, Some(*writer_eid));
+          let writer_proxy = discovered_participant.get_builtin_writer_proxy(*writer_eid);
 
-          // Get the QoS for the built-in topic from the local reader
-          let qos = reader.qos();
-
-          reader.update_writer_proxy(wp, &qos);
+          reader.update_writer_proxy(writer_proxy, writer_qos);
           debug!(
             "update_discovery_reader - endpoint {:?} - {:?}",
             *writer_endpoint_set_elem, discovered_participant.participant_guid

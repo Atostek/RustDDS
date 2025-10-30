@@ -302,8 +302,9 @@ impl Discovery {
     // their reader for these messages is BestEffort, via builtinEndpointQos,
     // which writers must notice. This allows them to not expect ACKNACKs from BestEffort
     // Reader andavoid stalling.
-    reliability: 
-      Some(Reliability::Reliable { max_blocking_time: Duration::from_millis(10) }),
+    reliability: Some(Reliability::Reliable {
+      max_blocking_time: Duration::from_millis(10),
+    }),
     destination_order: None,
     history: Some(History::KeepLast { depth: 1 }),
     resource_limits: None,
