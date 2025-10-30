@@ -565,15 +565,15 @@ impl DPEventLoop {
     );
 
     #[cfg(feature = "security")]
-    let (readers_init_list, writers_init_list) = match &self.security_plugins_opt {
-      None => {
+    let (readers_init_list, writers_init_list) = if self.security_plugins_opt.is_none() {
+      
         // No security enabled, just the standard endpoints
         let readers_init_list = STANDARD_BUILTIN_READERS_INIT_LIST.to_vec();
         let writers_init_list = STANDARD_BUILTIN_WRITERS_INIT_LIST.to_vec();
 
         (readers_init_list, writers_init_list)
       }
-      Some(_handle) => {
+      else {
         // Security enabled. The endpoints are selected based on the authentication
         // status of the remote participant
         let mut readers_init_list = vec![];
@@ -603,8 +603,7 @@ impl DPEventLoop {
           }
         }
         (readers_init_list, writers_init_list)
-      }
-    };
+      };
 
     // Update local writers
     for (writer_eid, reader_eid, endpoint) in &readers_init_list {

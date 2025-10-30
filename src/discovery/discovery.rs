@@ -1018,7 +1018,12 @@ impl Discovery {
   ) {
     let was_new = discovery_db_write(&self.discovery_db).update_participant(participant_data);
     let guid_prefix = participant_data.participant_guid.prefix;
+
+    // Send notification to dp_event_loop. It will update local reader/writer proxies
+    // as the SpdpDiscoveredParticipantData contains a bitmap of the available
+    // built-in endpoints.
     self.send_discovery_notification(DiscoveryNotificationType::ParticipantUpdated { guid_prefix });
+
     if was_new {
       // Inform DDS Applications
       self.send_participant_status(DomainParticipantStatusEvent::ParticipantDiscovered {

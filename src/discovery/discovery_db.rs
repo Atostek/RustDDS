@@ -181,6 +181,9 @@ impl DiscoveryDB {
         new_participant = false;
       }
 
+      // This may be a rediscovery: Participant lease time timed out, but then
+      // came back, e.g. by network outage. We then restore readers/writers from
+      // attic to discovery DB.
       move_by_guid_prefix(
         guid.prefix,
         &mut self.external_topic_readers_attic,
@@ -192,8 +195,11 @@ impl DiscoveryDB {
         &mut self.external_topic_writers,
       );
     }
-    // actual work here:
+
+    // In any case:
+    // Update SpdpDiscoveredParticipantData to DB
     self.participant_proxies.insert(guid.prefix, data.clone());
+    // Timestamp last life sign fro participant
     self
       .participant_last_life_signs
       .insert(guid.prefix, Instant::now());
