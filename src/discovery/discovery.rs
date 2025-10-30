@@ -293,9 +293,17 @@ impl Discovery {
     ownership: None,
     liveliness: None,
     time_based_filter: None,
-    reliability: Some(Reliability::Reliable {
-      max_blocking_time: Duration::ZERO,
-    }),
+    // Note RTPS 2.3 / 2.5 spec Section
+    // "8.4.13.3 BuiltinParticipantMessageWriter and
+    // BuiltinParticipantMessageReader QoS":
+    // "BuiltinParticipantMessageWriter shall use reliability.kind = RELIABLE_RELIABILITY_QOS."
+    // but thre reader side can use either Realiability setting.
+    // SPDPdiscoveredParticipantData may indicate over the wire that
+    // their reader for these messages is BestEffort, via builtinEndpointQos,
+    // which writers must notice. This allows them to not expect ACKNACKs from BestEffort
+    // Reader andavoid stalling.
+    reliability: 
+      Some(Reliability::Reliable { max_blocking_time: Duration::from_millis(10) }),
     destination_order: None,
     history: Some(History::KeepLast { depth: 1 }),
     resource_limits: None,
@@ -1019,9 +1027,9 @@ impl Discovery {
     let was_new = discovery_db_write(&self.discovery_db).update_participant(participant_data);
     let guid_prefix = participant_data.participant_guid.prefix;
 
-    // Send notification to dp_event_loop. It will update local reader/writer proxies
-    // as the SpdpDiscoveredParticipantData contains a bitmap of the available
-    // built-in endpoints.
+    // Send notification to dp_event_loop. It will update local reader/writer
+    // proxies as the SpdpDiscoveredParticipantData contains a bitmap of the
+    // available built-in endpoints.
     self.send_discovery_notification(DiscoveryNotificationType::ParticipantUpdated { guid_prefix });
 
     if was_new {
@@ -1926,7 +1934,7 @@ impl Discovery {
     }
   }
 
-  pub fn subscriber_qos() -> QosPolicies {
+  pub const fn subscriber_qos() -> QosPolicies {
     // The Subscriber QoS is specified in DDS Spec v1.4 Section
     // "2.2.5 Built-in Topics"
     QosPolicyBuilder::new()
@@ -1964,7 +1972,7 @@ impl Discovery {
       .build()
   }
 
-  pub fn publisher_qos() -> QosPolicies {
+  pub const fn publisher_qos() -> QosPolicies {
     // TODO: Check if this definition is correct (spec?)
     // Problem: DDS spec v1.4 Section 2.2.5 gives Subscriber QoS policies,
     // but does not mention publisher QoS for built-in topics.
@@ -2004,7 +2012,7 @@ impl Discovery {
   // This is (partially) gven in DDS Spec v1.4 Section 8.5.3.3.1
   // SPDPbuiltinParticipantWriter Table 8.79 - Attributes of the RTPS
   // StatelessWriter used by the SPDP at least that is is BestEffort.
-  pub fn create_spdp_participant_qos() -> QosPolicies {
+  pub const fn create_spdp_participant_qos() -> QosPolicies {
     QosPolicyBuilder::new()
       .reliability(Reliability::BestEffort)
       // Use depth=8 to avoid losing data when we receive notifications
@@ -2014,7 +2022,7 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  pub fn create_participant_stateless_message_qos() -> QosPolicies {
+  pub const fn create_participant_stateless_message_qos() -> QosPolicies {
     // See section 7.4.3 "New DCPSParticipantStatelessMessage builtin Topic" of the
     // Security spec
     QosPolicyBuilder::new()
@@ -2024,7 +2032,7 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  pub fn create_participant_volatile_message_secure_qos() -> QosPolicies {
+  pub const fn create_participant_volatile_message_secure_qos() -> QosPolicies {
     // See Table 18 – Non-default Qos policies for
     // BuiltinParticipantVolatileMessageSecureWriter of the Security spec
     QosPolicyBuilder::new()

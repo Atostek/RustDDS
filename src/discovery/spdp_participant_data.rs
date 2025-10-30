@@ -45,22 +45,26 @@ use crate::no_security::SecureDiscovery;
 // of DomainParticipants. It is sent over topic "DCPSParticipant".
 // The type is called "ParticipantBuiltinTopicData" in DDS-Security Spec, e.g.
 // Section 7.4.1.4.
+//
+// Fields marked with PartProxy are inherited from "ParticiapntProxy"
+// See RTPS Spec v2.5 Section "8.5.3.2 SPDPdiscoveredParticipantData",
+// class hierarchy diagram
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpdpDiscoveredParticipantData {
-  pub updated_time: chrono::DateTime<Utc>,
-  pub protocol_version: ProtocolVersion,
-  pub vendor_id: VendorId,
-  pub expects_inline_qos: bool,
-  pub participant_guid: GUID,
-  pub metatraffic_unicast_locators: Vec<Locator>,
-  pub metatraffic_multicast_locators: Vec<Locator>,
-  pub default_unicast_locators: Vec<Locator>,
-  pub default_multicast_locators: Vec<Locator>,
-  pub available_builtin_endpoints: BuiltinEndpointSet,
-  pub lease_duration: Option<Duration>,
-  pub manual_liveliness_count: i32,
-  pub builtin_endpoint_qos: Option<BuiltinEndpointQos>,
-  pub entity_name: Option<String>,
+  pub updated_time: chrono::DateTime<Utc>, // used internally by RustDDS
+  pub protocol_version: ProtocolVersion, // PartProxy
+  pub vendor_id: VendorId,  // PartProxy
+  pub expects_inline_qos: bool, // PartProxy
+  pub participant_guid: GUID, // PartProxy (as GUIDPrefix)
+  pub metatraffic_unicast_locators: Vec<Locator>, // PartProxy
+  pub metatraffic_multicast_locators: Vec<Locator>, // PartProxy
+  pub default_unicast_locators: Vec<Locator>, // PartProxy
+  pub default_multicast_locators: Vec<Locator>, // PartProxy
+  pub available_builtin_endpoints: BuiltinEndpointSet, // PartProxy
+  pub lease_duration: Option<Duration>, // from SPDPdiscoveredParticipantData
+  pub manual_liveliness_count: i32, // PartProxy
+  pub builtin_endpoint_qos: Option<BuiltinEndpointQos>, // PartProxy
+  pub entity_name: Option<String>, // where does this come from??
 
   // security
   #[cfg(feature = "security")]
@@ -87,40 +91,27 @@ impl SpdpDiscoveredParticipantData {
       && self.security_info.is_some()
   }
 
-  pub(crate) fn as_reader_proxy(
+  pub(crate) fn get_builtin_reader_proxy(
     &self,
-    is_metatraffic: bool,
-    entity_id: Option<EntityId>,
+    entity_id: EntityId,
+    reader_qos: &QosPolicies,
   ) -> RtpsReaderProxy {
-    let remote_reader_guid = GUID::new_with_prefix_and_id(
-      self.participant_guid.prefix,
-      match entity_id {
-        Some(id) => id,
-        None => EntityId::SPDP_BUILTIN_PARTICIPANT_READER,
-      },
-    );
+    assert!( entity_id.kind().is_built_in() );
+    let remote_reader_guid = 
+      GUID::new_with_prefix_and_id(self.participant_guid.prefix, entity_id);
 
     let mut proxy = RtpsReaderProxy::new(
       remote_reader_guid,
-      QosPolicies::qos_none(), // TODO: What is the correct QoS value here?
+      reader_qos.clone(),
       self.expects_inline_qos,
     );
 
-    if !is_metatraffic {
-      proxy
-        .multicast_locator_list
-        .clone_from(&self.default_multicast_locators);
-      proxy
-        .unicast_locator_list
-        .clone_from(&self.default_unicast_locators);
-    } else {
-      proxy
-        .multicast_locator_list
-        .clone_from(&self.metatraffic_multicast_locators);
-      proxy
-        .unicast_locator_list
-        .clone_from(&self.metatraffic_unicast_locators);
-    }
+    proxy
+      .multicast_locator_list
+      .clone_from(&self.metatraffic_multicast_locators);
+    proxy
+      .unicast_locator_list
+      .clone_from(&self.metatraffic_unicast_locators);
 
     proxy
   }

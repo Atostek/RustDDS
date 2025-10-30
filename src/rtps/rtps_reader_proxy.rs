@@ -99,8 +99,14 @@ impl RtpsReaderProxy {
       || self.multicast_locator_list != update.multicast_locator_list
     {
       info!("Update changes Locators in ReaderProxy. topic={topic:?}");
-      info!("Old: {:?}\n{:?}", self.unicast_locator_list, self.multicast_locator_list);
-      info!("New: {:?}\n{:?}", update.unicast_locator_list, update.multicast_locator_list);
+      info!(
+        "Old: {:?}\n{:?}",
+        self.unicast_locator_list, self.multicast_locator_list
+      );
+      info!(
+        "New: {:?}\n{:?}",
+        update.unicast_locator_list, update.multicast_locator_list
+      );
       let mut unicasts = update.unicast_locator_list.clone();
       unicasts.retain(Self::not_loopback);
       self.unicast_locator_list = unicasts;
@@ -117,7 +123,10 @@ impl RtpsReaderProxy {
 
     if self.qos != updated_qos {
       warn!("Update changes QoS in ReaderProxy topic={topic:?}.");
-      info!("  details:\n  Old: {:?}\n  New: {:?}", self.qos, updated_qos);
+      info!(
+        "  details:\n  Old: {:?}\n  New: {:?}",
+        self.qos, updated_qos
+      );
       self.qos = updated_qos;
     }
   }

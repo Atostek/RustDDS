@@ -81,8 +81,11 @@ impl Duration {
     ((i128::from(self.to_ticks()) * 1_000_000_000) >> 32) as i64
   }
 
-  pub fn from_std(duration: std::time::Duration) -> Self {
-    Self::from(duration)
+  pub const fn from_std(duration: std::time::Duration) -> Self {
+    Self {
+      seconds: duration.as_secs() as i32,
+      fraction: (((duration.subsec_nanos() as u64) << 32) / 1_000_000_000) as u32,
+    }
   }
 
   pub fn to_std(&self) -> std::time::Duration {
@@ -98,10 +101,7 @@ impl From<Duration> for chrono::Duration {
 
 impl From<std::time::Duration> for Duration {
   fn from(duration: std::time::Duration) -> Self {
-    Self {
-      seconds: duration.as_secs() as i32,
-      fraction: ((u64::from(duration.subsec_nanos()) << 32) / 1_000_000_000) as u32,
-    }
+    Self::from_std(duration)
   }
 }
 

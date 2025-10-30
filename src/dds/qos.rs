@@ -84,8 +84,24 @@ pub struct QosPolicyBuilder {
 }
 
 impl QosPolicyBuilder {
-  pub fn new() -> Self {
-    Self::default()
+  pub const fn new() -> Self {
+    // We can use Self::default() when it is availabel as "const"
+    Self {
+      durability: None,
+      presentation: None,
+      deadline: None,
+      latency_budget: None,
+      ownership: None,
+      liveliness: None,
+      time_based_filter: None,
+      reliability: None,
+      destination_order: None,
+      history: None,
+      resource_limits: None,
+      lifespan: None,
+      #[cfg(feature = "security")]
+      property: None,
+    }
   }
 
   #[must_use]
@@ -179,7 +195,7 @@ impl QosPolicyBuilder {
     self
   }
 
-  pub fn build(self) -> QosPolicies {
+  pub const fn build(self) -> QosPolicies {
     QosPolicies {
       durability: self.durability,
       presentation: self.presentation,
