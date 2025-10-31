@@ -1434,7 +1434,7 @@ impl Writer {
     reader_proxy: &RtpsReaderProxy,
     requested_qos: &QosPolicies,
   ) {
-    debug!("update_reader_proxy topic={:?}", self.my_topic_name);
+    debug!("update_reader_proxy topic={:?} reader_proxy={reader_proxy:?}", self.my_topic_name);
     match self.qos_policies.compliance_failure_wrt(requested_qos) {
       // matched QoS
       None => {

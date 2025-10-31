@@ -1169,6 +1169,7 @@ impl Discovery {
       if permission == NormalDiscoveryPermission::Allow {
         match d {
           Sample::Value(d) => {
+            trace!("sedp_receive_subscription - {d:?}");
             let drd = discovery_db_write(&self.discovery_db).update_subscription(&d);
             debug!(
               "sedp_receive_subscription - send_discovery_notification ReaderUpdated  {:?}",

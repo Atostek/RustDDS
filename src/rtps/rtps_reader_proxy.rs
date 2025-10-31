@@ -100,12 +100,12 @@ impl RtpsReaderProxy {
     {
       info!("Update changes Locators in ReaderProxy. topic={topic:?}");
       info!(
-        "Old: {:?}\n{:?}",
-        self.unicast_locator_list, self.multicast_locator_list
+        "Unicast:\n  Old={:?}\n  New={:?}",
+        self.unicast_locator_list, update.unicast_locator_list
       );
       info!(
-        "New: {:?}\n{:?}",
-        update.unicast_locator_list, update.multicast_locator_list
+        "Multicast:\n Old={:?}\n  New={:?}",
+        self.multicast_locator_list, update.multicast_locator_list
       );
       let mut unicasts = update.unicast_locator_list.clone();
       unicasts.retain(Self::not_loopback);
@@ -167,13 +167,18 @@ impl RtpsReaderProxy {
 
   pub fn from_reader(reader: &ReaderIngredients, domain_participant: &DomainParticipant) -> Self {
     let mut self_locators = domain_participant.self_locators(); // This clones a map of locator lists.
+    let (unicast_token, multicast_token) =
+      if reader.guid.entity_id.kind().is_user_defined() {
+        (USER_TRAFFIC_LISTENER_TOKEN, USER_TRAFFIC_MUL_LISTENER_TOKEN)
+      } else {
+        (DISCOVERY_LISTENER_TOKEN, DISCOVERY_MUL_LISTENER_TOKEN)
+      };
     let unicast_locator_list = self_locators
-      .remove(&USER_TRAFFIC_LISTENER_TOKEN)
+      .remove(&unicast_token)
       .unwrap_or_default();
     let multicast_locator_list = self_locators
-      .remove(&USER_TRAFFIC_MUL_LISTENER_TOKEN)
+      .remove(&multicast_token)
       .unwrap_or_default();
-
     Self {
       remote_reader_guid: reader.guid,
       remote_group_entity_id: EntityId::UNKNOWN, // TODO

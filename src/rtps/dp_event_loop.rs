@@ -694,6 +694,8 @@ impl DPEventLoop {
   }
 
   fn remote_reader_discovered(&mut self, remote_reader: &DiscoveredReaderData) {
+    debug!("remote_reader_discovered on {:?}",
+      remote_reader.subscription_topic_data.topic_name);
     self
       .participant_status_sender
       .try_send(DomainParticipantStatusEvent::ReaderDetected {
