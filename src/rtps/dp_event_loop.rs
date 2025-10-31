@@ -744,17 +744,18 @@ impl DPEventLoop {
             // Signal Secure discovery to exchange keys with the remote
             // TODO: do this only at first encounter with the remote / before keys have been
             // sent, not every time
-            if let Err(e) = self.discovery_command_sender.send(
-              DiscoveryCommand::StartKeyExchangeWithRemoteEndpoint {
+            self
+              .discovery_command_sender
+              .send(DiscoveryCommand::StartKeyExchangeWithRemoteEndpoint {
                 local_endpoint_guid: local_writer_guid,
                 remote_endpoint_guid: remote_reader_guid,
-              },
-            ) {
-              error!(
-                "Could not signal Secure Discovery to start the key exchange with remote reader \
-                 {remote_reader_guid:?}. Reason: {e}."
-              );
-            }
+              })
+              .unwrap_or_else(|e| {
+                error!(
+                  "Could not signal Secure Discovery to start the key exchange with remote reader \
+                   {remote_reader_guid:?}. Reason: {e}."
+                )
+              });
             true // match_to_reader
           }
         } else {

@@ -1438,12 +1438,14 @@ impl Writer {
     match self.qos_policies.compliance_failure_wrt(requested_qos) {
       // matched QoS
       None => {
-        let change = self.matched_reader_update(reader_proxy);
-        if change > 0 {
-          self.matched_readers_count_total += change;
+        let new_reader = self.matched_reader_update(reader_proxy);
+        if new_reader {
+          self.matched_readers_count_total += 1;
           self.send_status(DataWriterStatus::PublicationMatched {
-            total: CountWithChange::new(self.matched_readers_count_total, change),
-            current: CountWithChange::new(self.readers.len() as i32, change),
+            // total: How many matches have been detected ever?
+            total: CountWithChange::new(self.matched_readers_count_total, 1),
+            // current: How many readers we are matched with?
+            current: CountWithChange::new(self.readers.len() as i32, 1),
             reader: reader_proxy.remote_reader_guid,
           });
           self.send_participant_status(DomainParticipantStatusEvent::RemoteReaderMatched {
@@ -1491,17 +1493,16 @@ impl Writer {
   }
 
   // Update the given reader proxy. Preserve data we are tracking.
-  // return 0 if the reader already existed
-  // return 1 if it was new ( = count of added reader proxies)
-  fn matched_reader_update(&mut self, updated_reader_proxy: &RtpsReaderProxy) -> i32 {
-    let mut new = 0;
+  // return value: true = reader was new, false = reader was previously known
+  fn matched_reader_update(&mut self, updated_reader_proxy: &RtpsReaderProxy) -> bool {
+    let mut is_new = false;
     let is_volatile = self.qos().is_volatile(); // Get this in advance to work with the borrow checker
     self
       .readers
       .entry(updated_reader_proxy.remote_reader_guid)
       .and_modify(|rp| rp.update(updated_reader_proxy, &self.my_topic_name))
       .or_insert_with(|| {
-        new = 1;
+        is_new = true;
         let mut new_proxy = updated_reader_proxy.clone();
         if is_volatile {
           // With Durabilty::Volatile QoS we won't send the sequence numbers which existed
@@ -1511,7 +1512,7 @@ impl Writer {
         }
         new_proxy
       });
-    new
+    is_new
   }
 
   fn matched_reader_remove(&mut self, guid: GUID) -> Option<RtpsReaderProxy> {
