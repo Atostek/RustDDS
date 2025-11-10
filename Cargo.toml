@@ -65,7 +65,7 @@ thiserror = "2.0.9"
 cdr-encoding = { version="0.10" }
 cdr-encoding-size = { version="^0.5" }
 futures = "0.3"
-io-extras = "0.18.0"
+io-extras = "0.19.0"
 
 # For DDS Security:
 serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated XML config files
