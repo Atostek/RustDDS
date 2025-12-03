@@ -92,7 +92,6 @@ pub struct DPEventLoop {
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
   discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
-  #[cfg(feature = "security")]
   discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
 }
 
@@ -111,14 +110,11 @@ impl DPEventLoop {
     remove_writer_receiver: TokenReceiverPair<GUID>,
     stop_poll_receiver: mio_channel::Receiver<EventLoopCommand>,
     discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
-    _discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
+    discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
     spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     security_plugins_opt: Option<SecurityPluginsHandle>,
   ) -> Self {
-    #[cfg(not(feature = "security"))]
-    let _dummy = _discovery_command_sender;
-
     let poll = Poll::new().expect("Unable to create new poll.");
     let (acknack_sender, acknack_receiver) =
       mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(100);
@@ -226,8 +222,7 @@ impl DPEventLoop {
       ack_nack_receiver: acknack_receiver,
       discovery_update_notification_receiver,
       participant_status_sender,
-      #[cfg(feature = "security")]
-      discovery_command_sender: _discovery_command_sender,
+      discovery_command_sender,
     }
   }
 
@@ -467,7 +462,11 @@ impl DPEventLoop {
       ADD_READER_TOKEN => {
         trace!("add reader(s)");
         while let Ok(new_reader_ing) = self.add_reader_receiver.receiver.try_recv() {
+          // Add the reader locally
+          let guid = new_reader_ing.guid;
           self.add_local_reader(new_reader_ing);
+          // Inform Discovery about it
+          self.inform_discovery_about_new_local_endpoint(guid);
         }
       }
       REMOVE_READER_TOKEN => {
@@ -483,7 +482,11 @@ impl DPEventLoop {
     match event.token() {
       ADD_WRITER_TOKEN => {
         while let Ok(new_writer_ingredients) = self.add_writer_receiver.receiver.try_recv() {
+          // Add the writer locally
+          let guid = new_writer_ingredients.guid;
           self.add_local_writer(new_writer_ingredients);
+          // Inform Discovery about it
+          self.inform_discovery_about_new_local_endpoint(guid);
         }
       }
       REMOVE_WRITER_TOKEN => {
@@ -1035,6 +1038,21 @@ impl DPEventLoop {
           "Status {other:?}, in on_remote_participant_authentication_status_changed. What to do?"
         );
       }
+    }
+  }
+
+  fn inform_discovery_about_new_local_endpoint(&self, guid: GUID) {
+    let discovery_command = if guid.entity_id.kind().is_writer() {
+      DiscoveryCommand::AddLocalWriter { guid }
+    } else {
+      DiscoveryCommand::AddLocalReader { guid }
+    };
+
+    if let Err(e) = self.discovery_command_sender.try_send(discovery_command) {
+      log::error!(
+        "Failed to inform Discovery about the new endpoint: {e}. Endpoint guid: {guid:?}"
+      );
+      // Improvement TODO: that's it, just an error log entry on failing to inform discovery?
     }
   }
 }

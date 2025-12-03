@@ -11,7 +11,7 @@ use byteorder::LittleEndian;
 use log::{debug, error, info, trace, warn};
 
 use crate::{
-  create_error_dropped, create_error_internal, create_error_poisoned,
+  create_error_dropped, create_error_poisoned,
   dds::{
     adapters,
     key::Keyed,
@@ -50,7 +50,7 @@ use super::{
 };
 #[cfg(feature = "security")]
 use crate::{
-  create_error_not_allowed_by_security,
+  create_error_not_allowed_by_security, create_error_internal,
   security::{security_plugins::SecurityPluginsHandle, EndpointSecurityInfo},
 };
 #[cfg(not(feature = "security"))]
@@ -531,43 +531,19 @@ impl InnerPublisher {
       }
     }
 
-    let new_writer = WriterIngredients {
-      guid,
-      writer_command_receiver: hccc_download,
-      writer_command_receiver_waker: Arc::clone(&writer_waker),
-      topic_name: topic.name(),
-      like_stateless: writer_like_stateless,
-      qos_policies: writer_qos.clone(),
-      status_sender,
-      security_plugins: self.security_plugins_handle.clone(),
-    };
-
-    // Send writer ingredients to DP event loop, where the actual writer will be
-    // constructed
-    self
-      .add_writer_sender
-      .send(new_writer)
-      .or_else(|e| create_error_poisoned!("Adding a new writer failed: {}", e))?;
-
+    // Construct the data writer
     let data_writer = WithKeyDataWriter::<D, SA>::new(
       outer.clone(),
       topic.clone(),
-      writer_qos,
+      writer_qos.clone(),
       guid,
       dwcc_upload,
-      writer_waker,
+      Arc::clone(&writer_waker),
       self.discovery_command.clone(),
       status_receiver,
     )?;
 
-    // notify Discovery DB
-    let mut db = self
-      .discovery_db
-      .write()
-      .map_err(|e| CreateError::Poisoned {
-        reason: format!("Discovery DB: {e}"),
-      })?;
-
+    // Construct security info if needed
     #[cfg(not(feature = "security"))]
     let security_info = None;
     #[cfg(feature = "security")]
@@ -595,11 +571,19 @@ impl InnerPublisher {
       None
     };
 
-    // Update topic to DiscoveryDB & inform Discovery about it
+    // Add the topic & writer to Discovery DB
+    let mut db = self
+      .discovery_db
+      .write()
+      .map_err(|e| CreateError::Poisoned {
+        reason: format!("Discovery DB: {e}"),
+      })?;
+
     let dwd = DiscoveredWriterData::new(&data_writer, topic, &dp, security_info);
     db.update_local_topic_writer(dwd);
     db.update_topic_data_p(topic);
 
+    // Inform Discovery about the topic
     if let Err(e) = self.discovery_command.try_send(DiscoveryCommand::AddTopic {
       topic_name: topic.name(),
     }) {
@@ -612,17 +596,26 @@ impl InnerPublisher {
       );
     }
 
-    // Inform Discovery about the new writer
-    let writer_guid = self.domain_participant.guid().from_prefix(entity_id);
+    // Note: notifying Discovery about the new writer is no longer done here.
+    // Instead, it's done by the DP event loop once it has actually created the new writer.
+    // This is done to avoid data races.
+
+    // Send writer ingredients to DP event loop, where the actual writer will be constructed
+    let new_writer = WriterIngredients {
+      guid,
+      writer_command_receiver: hccc_download,
+      writer_command_receiver_waker: writer_waker,
+      topic_name: topic.name(),
+      like_stateless: writer_like_stateless,
+      qos_policies: writer_qos,
+      status_sender,
+      security_plugins: self.security_plugins_handle.clone(),
+    };
+
     self
-      .discovery_command
-      .try_send(DiscoveryCommand::AddLocalWriter { guid: writer_guid })
-      .or_else(|e| {
-        create_error_internal!(
-          "Cannot inform Discovery about the new writer {writer_guid:?}. Error: {}",
-          e
-        )
-      })?;
+      .add_writer_sender
+      .send(new_writer)
+      .or_else(|e| create_error_poisoned!("Adding a new writer failed: {}", e))?;
 
     // Return the DataWriter to user
     Ok(data_writer)
@@ -1109,6 +1102,7 @@ impl InnerSubscriber {
       }
     }
 
+    // Construct the ReaderIngredients
     let data_reader_waker = Arc::new(Mutex::new(None));
 
     let (poll_event_source, poll_event_sender) = mio_source::make_poll_channel()?;
@@ -1127,6 +1121,7 @@ impl InnerSubscriber {
       security_plugins: self.security_plugins_handle.clone(),
     };
 
+    // Construct security info if needed
     #[cfg(not(feature = "security"))]
     let security_info: Option<EndpointSecurityInfo> = None;
     #[cfg(feature = "security")]
@@ -1154,7 +1149,7 @@ impl InnerSubscriber {
       None
     };
 
-    // Update topic to DiscoveryDB & inform Discovery about it
+    // Add the topic & reader to Discovery DB
     {
       let mut db = self
         .discovery_db
@@ -1163,6 +1158,7 @@ impl InnerSubscriber {
       db.update_local_topic_reader(&dp, topic, &new_reader, security_info);
       db.update_topic_data_p(topic);
 
+      // Inform Discovery about the topic
       if let Err(e) = self.discovery_command.try_send(DiscoveryCommand::AddTopic {
         topic_name: topic.name(),
       }) {
@@ -1176,6 +1172,11 @@ impl InnerSubscriber {
       }
     }
 
+    // Note: notifying Discovery about the new reader is no longer done here.
+    // Instead, it's done by the DP event loop once it has actually created the new reader.
+    // This is done to avoid data races.
+
+    // Construct the data reader
     let datareader = with_key::SimpleDataReader::<D, SA>::new(
       outer.clone(),
       entity_id,
@@ -1196,18 +1197,6 @@ impl InnerSubscriber {
       .sender_add_reader
       .try_send(new_reader)
       .or_else(|e| create_error_poisoned!("Cannot add DataReader. Error: {}", e))?;
-
-    // Inform Discovery about the new reader
-    let reader_guid = self.domain_participant.guid().from_prefix(entity_id);
-    self
-      .discovery_command
-      .try_send(DiscoveryCommand::AddLocalReader { guid: reader_guid })
-      .or_else(|e| {
-        create_error_internal!(
-          "Cannot inform Discovery about the new reader {reader_guid:?}. Error: {}",
-          e
-        )
-      })?;
 
     // Return the DataReader to user
     Ok(datareader)

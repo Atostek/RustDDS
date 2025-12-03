@@ -868,7 +868,7 @@ impl Writer {
           // But apparently some RTPS implementations send ACKNACK with
           // reader_sn_state.base = 0 to indicate they have matched the writer,
           // so seeing these once per new writer should be ok.
-          info!(
+          debug!(
             "ACKNACK SequenceNumberSet minimum must be >= 1, got {:?} from {:?} topic {:?}",
             an.reader_sn_state.base(),
             reader_guid,
