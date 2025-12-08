@@ -50,7 +50,7 @@ use super::{
 };
 #[cfg(feature = "security")]
 use crate::{
-  create_error_not_allowed_by_security, create_error_internal,
+  create_error_internal, create_error_not_allowed_by_security,
   security::{security_plugins::SecurityPluginsHandle, EndpointSecurityInfo},
 };
 #[cfg(not(feature = "security"))]
@@ -597,10 +597,11 @@ impl InnerPublisher {
     }
 
     // Note: notifying Discovery about the new writer is no longer done here.
-    // Instead, it's done by the DP event loop once it has actually created the new writer.
-    // This is done to avoid data races.
+    // Instead, it's done by the DP event loop once it has actually created the new
+    // writer. This is done to avoid data races.
 
-    // Send writer ingredients to DP event loop, where the actual writer will be constructed
+    // Send writer ingredients to DP event loop, where the actual writer will be
+    // constructed
     let new_writer = WriterIngredients {
       guid,
       writer_command_receiver: hccc_download,
@@ -1173,8 +1174,8 @@ impl InnerSubscriber {
     }
 
     // Note: notifying Discovery about the new reader is no longer done here.
-    // Instead, it's done by the DP event loop once it has actually created the new reader.
-    // This is done to avoid data races.
+    // Instead, it's done by the DP event loop once it has actually created the new
+    // reader. This is done to avoid data races.
 
     // Construct the data reader
     let datareader = with_key::SimpleDataReader::<D, SA>::new(

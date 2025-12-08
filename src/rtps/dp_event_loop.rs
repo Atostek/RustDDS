@@ -1052,7 +1052,8 @@ impl DPEventLoop {
       log::error!(
         "Failed to inform Discovery about the new endpoint: {e}. Endpoint guid: {guid:?}"
       );
-      // Improvement TODO: that's it, just an error log entry on failing to inform discovery?
+      // Improvement TODO: that's it, just an error log entry on failing to
+      // inform discovery?
     }
   }
 }
