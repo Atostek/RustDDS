@@ -59,6 +59,12 @@ use crate::{
 #[cfg(not(feature = "security"))]
 use crate::no_security::SecurityPluginsHandle;
 
+/// Builder object to create a [`DomainParticipant`] with non-default
+/// configuration.
+///
+/// Currently, the builder is mostly for configuring security, so the
+/// functionality is very limited unless you are building RustDDS with
+/// `security` feature enabled.
 pub struct DomainParticipantBuilder {
   domain_id: u16,
 
@@ -493,6 +499,8 @@ impl DomainParticipant {
 // --------------------------------------------------------------------------
 // --------------------------------------------------------------------------
 
+/// Produces an async (or mio-pollable) stream of
+/// [`DomainParticipantStatusEvent`]s
 pub struct DomainParticipantStatusListener {
   dp_disc: Arc<Mutex<DomainParticipantDisc>>,
 }
