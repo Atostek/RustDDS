@@ -173,7 +173,7 @@ mod checked_impl;
 pub mod discovery; // to access some Discovered data in e.g. ros2-client crate
 mod messages;
 mod network;
-mod rtps;
+pub mod rtps;
 
 #[cfg(feature = "security")]
 mod security;

@@ -701,6 +701,9 @@ impl DPEventLoop {
       "remote_reader_discovered on {:?}",
       remote_reader.subscription_topic_data.topic_name
     );
+
+    let topic_name = remote_reader.subscription_topic_data.topic_name.clone();
+    let is_nav2_topic = topic_name.contains("nav2");
     self
       .participant_status_sender
       .try_send(DomainParticipantStatusEvent::ReaderDetected {
@@ -771,6 +774,10 @@ impl DPEventLoop {
         };
 
         if match_to_reader {
+          if is_nav2_topic {
+            log::warn!("Matching to remote reader on topic '{topic_name}'");
+          }
+
           // Should we check if the participant has published a QoS for the topic?
           let requested_qos = remote_reader.subscription_topic_data.qos();
           writer.update_reader_proxy(
@@ -789,6 +796,9 @@ impl DPEventLoop {
   }
 
   fn remote_writer_discovered(&mut self, remote_writer: &DiscoveredWriterData) {
+    let topic_name = remote_writer.publication_topic_data.topic_name.clone();
+    let is_nav2_topic = topic_name.contains("nav2");
+
     self
       .participant_status_sender
       .try_send(DomainParticipantStatusEvent::WriterDetected {
@@ -858,6 +868,9 @@ impl DPEventLoop {
         };
 
         if match_to_writer {
+          if is_nav2_topic {
+            log::warn!("Matching to remote writer on topic '{topic_name}'");
+          }
           let offered_qos = remote_writer.publication_topic_data.qos();
           // Should we check if the participant has published a QoS for the topic?
           reader.update_writer_proxy(
