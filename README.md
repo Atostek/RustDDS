@@ -176,6 +176,9 @@ The DDS specification specifies manual memory management in the sense that many 
 ### Version 0.11.8
 * Fix race condition in Discovery.
 
+### Version 0.11.9
+* Interoperability improvements towards CycloneDDS and FastDDS.
+
 
 ## Version 0.10.0
 The `DeserializerAdpter` interface for attaching serialization formats to RTPS was extended
