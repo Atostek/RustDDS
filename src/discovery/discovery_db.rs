@@ -424,8 +424,6 @@ impl DiscoveryDB {
   pub fn update_subscription(&mut self, data: &DiscoveredReaderData) -> DiscoveredReaderData {
     let guid = data.reader_proxy.remote_reader_guid;
 
-    self.external_topic_readers.insert(guid, data.clone());
-
     // fill in the default locators from participant, in case DRD did not provide
     // any
     let default_locator_lists = self
@@ -449,7 +447,20 @@ impl DiscoveryDB {
         }
         (Vec::default(), Vec::default())
       });
-    debug!("External reader: {data:?}");
+
+    // Build enriched data with participant's default locators filled in, so that
+    // later lookups via readers_on_topic() return usable locator information.
+    let enriched = DiscoveredReaderData {
+      reader_proxy: ReaderProxy::from(RtpsReaderProxy::from_discovered_reader_data(
+        data,
+        &default_locator_lists.0,
+        &default_locator_lists.1,
+      )),
+      ..data.clone()
+    };
+
+    self.external_topic_readers.insert(guid, enriched.clone());
+    debug!("External reader: {enriched:?}");
 
     // Now the topic update:
     let dtd = data.subscription_topic_data.to_topic_data();
@@ -463,31 +474,19 @@ impl DiscoveryDB {
     // reader update. If there is a DiscoveredVia::Topic record, use QosPolicies
     // from that record and modify by QoS given in the DRD.
 
-    // Return DiscoveredReaderData with possibly updated locators.
-    DiscoveredReaderData {
-      reader_proxy: ReaderProxy::from(RtpsReaderProxy::from_discovered_reader_data(
-        data,
-        &default_locator_lists.0,
-        &default_locator_lists.1,
-      )),
-      ..data.clone()
-    }
+    enriched
   }
 
   // TODO: This is silly. Returns one of the parameters cloned, or None
   pub fn update_publication(&mut self, data: &DiscoveredWriterData) -> DiscoveredWriterData {
     let guid = data.writer_proxy.remote_writer_guid;
 
-    self
-      .external_topic_writers
-      .insert(data.writer_proxy.remote_writer_guid, data.clone());
-
     // fill in the default locators from participant, in case DRD did not provide
     // any
     let default_locator_lists = self
       .find_participant_proxy(guid.prefix)
       .map(|pp| {
-        debug!("Added participant locators to Reader {guid:?}");
+        debug!("Added participant locators to Writer {guid:?}");
         (
           pp.default_unicast_locators.clone(),
           pp.default_multicast_locators.clone(),
@@ -506,7 +505,19 @@ impl DiscoveryDB {
         (Vec::default(), Vec::default())
       });
 
-    debug!("External writer: {data:?}");
+    // Build enriched data with participant's default locators filled in, so that
+    // later lookups via writers_on_topic() return usable locator information.
+    let enriched = DiscoveredWriterData {
+      writer_proxy: WriterProxy::from(RtpsWriterProxy::from_discovered_writer_data(
+        data,
+        &default_locator_lists.0,
+        &default_locator_lists.1,
+      )),
+      ..data.clone()
+    };
+
+    self.external_topic_writers.insert(guid, enriched.clone());
+    debug!("External writer: {enriched:?}");
 
     // Now the topic update:
     let dtd = data.publication_topic_data.to_topic_data();
@@ -516,14 +527,7 @@ impl DiscoveryDB {
       DiscoveredVia::Publication,
     );
 
-    DiscoveredWriterData {
-      writer_proxy: WriterProxy::from(RtpsWriterProxy::from_discovered_writer_data(
-        data,
-        &default_locator_lists.0,
-        &default_locator_lists.1,
-      )),
-      ..data.clone()
-    }
+    enriched
   }
 
   // This is for local participant updating the topic table

@@ -220,14 +220,12 @@ pub use dds::{
 /// CDR.
 pub use serialization::RepresentationIdentifier;
 #[doc(inline)]
-pub use serialization::{
-  CDRDeserializerAdapter, CDRSerializerAdapter, CdrDeserializer, CdrSerializer,
-};
+pub use serialization::{CDRDeserializerAdapter, CDRSerializerAdapter, CdrDeserializer, CdrSerializer};
 /// Part of RTPS DATA submessage: 4-byte header + serialized data
 pub use messages::submessages::elements::serialized_payload::SerializedPayload;
 pub use structure::{
-  duration::Duration, entity::RTPSEntity, guid::GUID, sequence_number::SequenceNumber,
-  time::Timestamp,
+  duration::Duration, entity::RTPSEntity, guid::GUID, rpc::SampleIdentity,
+  sequence_number::SequenceNumber, time::Timestamp,
 };
 // re-export from a helper crate
 /// Helper pacakge to compute the CDR-serialized size of data
