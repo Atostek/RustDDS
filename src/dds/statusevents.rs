@@ -103,7 +103,7 @@ impl<T> StatusChannelSender<T> {
         Ok(())
       }
       Err(mio_channel::TrySendError::Full(_tt)) => {
-        trace!("StatusChannelSender cannot send new status changes, channel is full.");
+        warn!("StatusChannelSender cannot send new status changes, channel is full.");
         // It is perfectly normal to fail due to full channel, because
         // no-one is required to be listening to these.
         self.signal_sender.send(); // kick the receiver anyway
