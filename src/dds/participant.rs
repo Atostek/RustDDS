@@ -226,8 +226,12 @@ impl DomainParticipantBuilder {
     let (discovery_command_sender, discovery_command_receiver) =
       mio_channel::sync_channel::<DiscoveryCommand>(64);
 
-    // Channel used to report noteworthy events to DomainParticipant
-    let (status_sender, status_receiver) = sync_status_channel(16)?;
+    // Channel used to report noteworthy events to DomainParticipant.
+    // Capacity must be large enough to absorb the SEDP burst when multiple
+    // participants are discovered at once. A single participant can expose
+    // many endpoints (e.g. ~16 in a typical ROS 2 node), so 2048 handles
+    // large deployments without silent event loss.
+    let (status_sender, status_receiver) = sync_status_channel(2048)?;
 
     #[cfg(not(feature = "security"))]
     let security_plugins_handle = None;
