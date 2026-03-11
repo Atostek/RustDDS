@@ -72,6 +72,8 @@ pub struct DomainParticipantBuilder {
   which interfaces the DomainParticipant will talk to. */
   only_networks: Option<Vec<String>>, // if specified, run RTPS only over these interfaces
 
+  socket_receive_buffer_size: usize,
+
   #[cfg(feature = "security")]
   security_plugins: Option<SecurityPlugins>,
   #[cfg(feature = "security")]
@@ -83,11 +85,19 @@ impl DomainParticipantBuilder {
     DomainParticipantBuilder {
       domain_id,
       only_networks: None,
+      socket_receive_buffer_size: Self::DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE,
       #[cfg(feature = "security")]
       security_plugins: None,
       #[cfg(feature = "security")]
       sec_properties: None,
     }
+  }
+
+  pub const DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+  pub fn socket_receive_buffer_size(mut self, size: usize) -> Self {
+    self.socket_receive_buffer_size = size;
+    self
   }
 
   #[cfg(feature = "security")]
@@ -250,6 +260,7 @@ impl DomainParticipantBuilder {
       status_sender.clone(),
       status_receiver,
       security_plugins_handle.clone(),
+      self.socket_receive_buffer_size,
     )?;
 
     // outer DP wrapper
@@ -774,6 +785,7 @@ impl DomainParticipantDisc {
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    socket_receive_buffer_size: usize,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -785,6 +797,7 @@ impl DomainParticipantDisc {
       status_sender,
       status_receiver,
       security_plugins_handle,
+      socket_receive_buffer_size,
     )?;
 
     Ok(Self {
@@ -999,16 +1012,18 @@ impl DomainParticipantInner {
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    socket_receive_buffer_size: usize,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
 
     let mut listeners = HashMap::new();
 
-    match UDPListener::new_multicast(
+    match UDPListener::new_multicast_with_buf_size(
       "0.0.0.0",
       spdp_well_known_multicast_port(domain_id),
       Ipv4Addr::new(239, 255, 0, 1),
+      socket_receive_buffer_size,
     ) {
       Ok(l) => {
         listeners.insert(DISCOVERY_MUL_LISTENER_TOKEN, l);
@@ -1023,9 +1038,10 @@ impl DomainParticipantInner {
     // Magic value 120 below is from RTPS spec 2.5 Section "9.6.2.3 Default Port
     // Numbers"
     while discovery_listener.is_none() && participant_id < 120 {
-      discovery_listener = UDPListener::new_unicast(
+      discovery_listener = UDPListener::new_unicast_with_buf_size(
         "0.0.0.0",
         spdp_well_known_unicast_port(domain_id, participant_id),
+        socket_receive_buffer_size,
       )
       .ok();
       if discovery_listener.is_none() {
@@ -1044,10 +1060,11 @@ impl DomainParticipantInner {
 
     // Now the user traffic listeners
 
-    match UDPListener::new_multicast(
+    match UDPListener::new_multicast_with_buf_size(
       "0.0.0.0",
       user_traffic_multicast_port(domain_id),
       Ipv4Addr::new(239, 255, 0, 1),
+      socket_receive_buffer_size,
     ) {
       Ok(l) => {
         listeners.insert(USER_TRAFFIC_MUL_LISTENER_TOKEN, l);
@@ -1055,20 +1072,23 @@ impl DomainParticipantInner {
       Err(e) => warn!("Cannot get multicast user traffic listener: {e:?}"),
     }
 
-    let user_traffic_listener = UDPListener::new_unicast(
+    let user_traffic_listener = UDPListener::new_unicast_with_buf_size(
       "0.0.0.0",
       user_traffic_unicast_port(domain_id, participant_id),
+      socket_receive_buffer_size,
     )
     .or_else(|e| {
       if matches!(e.kind(), ErrorKind::AddrInUse) {
         // If we do not get the preferred listening port,
         // try again, with "any" port number.
-        UDPListener::new_unicast("0.0.0.0", 0).or_else(|e| {
-          create_error_out_of_resources!(
-            "Could not open unicast user traffic listener, any port number: {:?}",
-            e
-          )
-        })
+        UDPListener::new_unicast_with_buf_size("0.0.0.0", 0, socket_receive_buffer_size).or_else(
+          |e| {
+            create_error_out_of_resources!(
+              "Could not open unicast user traffic listener, any port number: {:?}",
+              e
+            )
+          },
+        )
       } else {
         create_error_out_of_resources!("Could not open unicast user traffic listener: {e:?}")
       }

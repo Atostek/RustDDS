@@ -47,8 +47,17 @@ impl UDPListener {
     host: &str,
     port: u16,
     reuse_addr: bool,
+    recv_buffer_size: usize,
   ) -> io::Result<mio_06::net::UdpSocket> {
     let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    if recv_buffer_size > 0 {
+      raw_socket
+        .set_recv_buffer_size(recv_buffer_size)
+        .unwrap_or_else(|e| {
+          warn!("Failed to set SO_RCVBUF to {recv_buffer_size}: {e}. Using OS default.");
+        });
+    }
 
     // We set ReuseAddr so that other DomainParticipants on this host can
     // bind to the same multicast address and port.
@@ -102,8 +111,17 @@ impl UDPListener {
     }
   }
 
+  #[cfg(test)]
   pub fn new_unicast(host: &str, port: u16) -> io::Result<Self> {
-    let mio_socket = Self::new_listening_socket(host, port, false)?;
+    Self::new_unicast_with_buf_size(host, port, 0)
+  }
+
+  pub fn new_unicast_with_buf_size(
+    host: &str,
+    port: u16,
+    recv_buffer_size: usize,
+  ) -> io::Result<Self> {
+    let mio_socket = Self::new_listening_socket(host, port, false, recv_buffer_size)?;
 
     Ok(Self {
       socket: mio_socket,
@@ -112,7 +130,17 @@ impl UDPListener {
     })
   }
 
+  #[cfg(test)]
   pub fn new_multicast(host: &str, port: u16, multicast_group: Ipv4Addr) -> io::Result<Self> {
+    Self::new_multicast_with_buf_size(host, port, multicast_group, 0)
+  }
+
+  pub fn new_multicast_with_buf_size(
+    host: &str,
+    port: u16,
+    multicast_group: Ipv4Addr,
+    recv_buffer_size: usize,
+  ) -> io::Result<Self> {
     if !multicast_group.is_multicast() {
       return io::Result::Err(io::Error::new(
         io::ErrorKind::Other,
@@ -120,7 +148,7 @@ impl UDPListener {
       ));
     }
 
-    let mio_socket = Self::new_listening_socket(host, port, true)?;
+    let mio_socket = Self::new_listening_socket(host, port, true, recv_buffer_size)?;
 
     for multicast_if_ipaddr in get_local_multicast_ip_addrs()? {
       match multicast_if_ipaddr {
