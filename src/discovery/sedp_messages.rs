@@ -27,7 +27,7 @@ use crate::{
     parameter::Parameter,
     parameter_list::{ParameterList, ParameterListable},
   },
-  network::{constant::user_traffic_unicast_port, util::get_local_unicast_locators},
+  network::{constant::user_traffic_unicast_port, util::get_local_unicast_locators_filtered},
   rtps::{rtps_reader_proxy::RtpsReaderProxy, rtps_writer_proxy::RtpsWriterProxy},
   serialization::{
     pl_cdr_adapters::{
@@ -765,7 +765,8 @@ impl DiscoveredWriterData {
     security_info: Option<EndpointSecurityInfo>,
   ) -> Self {
     let unicast_port = user_traffic_unicast_port(dp.domain_id(), dp.participant_id());
-    let unicast_addresses = get_local_unicast_locators(unicast_port);
+    let only_nets = dp.only_networks();
+    let unicast_addresses = get_local_unicast_locators_filtered(unicast_port, only_nets.as_deref());
     // TODO: Why empty vector below? No multicast?
     let writer_proxy = WriterProxy::new(writer.guid(), vec![], unicast_addresses);
     let publication_topic_data = PublicationBuiltinTopicData::new_with_qos(

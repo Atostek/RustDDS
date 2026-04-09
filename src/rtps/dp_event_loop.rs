@@ -114,6 +114,7 @@ impl DPEventLoop {
     spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     security_plugins_opt: Option<SecurityPluginsHandle>,
+    only_networks: Option<Arc<[String]>>,
   ) -> Self {
     let poll = Poll::new().expect("Unable to create new poll.");
     let (acknack_sender, acknack_receiver) =
@@ -193,7 +194,8 @@ impl DPEventLoop {
       .expect("Failed to register reader update notification.");
 
     // port number 0 means OS chooses an available port number.
-    let udp_sender = UDPSender::new(0).expect("UDPSender construction fail"); // TODO
+    let udp_sender = UDPSender::new_with_networks(0, only_networks.as_deref())
+      .expect("UDPSender construction fail"); // TODO
 
     #[cfg(not(feature = "security"))]
     let security_plugins_opt = security_plugins_opt.and(None); // make sure it is None an consume value
@@ -1190,6 +1192,7 @@ mod tests {
         discovery_command_sender,
         spdp_liveness_sender,
         participant_status_sender,
+        None,
         None,
       );
       dp_event_loop

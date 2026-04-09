@@ -135,9 +135,7 @@ mod with_key {
   use mio_extras::timer::Timer;
 
   use super::{DataReaderPlCdr, DataWriterPlCdr};
-  use crate::{
-    polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind,
-  };
+  use crate::{polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
 
   pub const TOPIC_KIND: TopicKind = TopicKind::WithKey;
 

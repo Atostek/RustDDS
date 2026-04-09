@@ -11,7 +11,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(windows)]
 use local_ip_address::list_afinet_netifas;
 
-use crate::{network::util::get_local_multicast_ip_addrs, structure::locator::Locator};
+use crate::{network::util::get_local_multicast_ip_addrs_filtered, structure::locator::Locator};
 
 // We need one multicast sender socket per interface
 
@@ -22,7 +22,12 @@ pub struct UDPSender {
 }
 
 impl UDPSender {
+  #[cfg(test)]
   pub fn new(sender_port: u16) -> io::Result<Self> {
+    Self::new_with_networks(sender_port, None)
+  }
+
+  pub fn new_with_networks(sender_port: u16, only_networks: Option<&[String]>) -> io::Result<Self> {
     let unicast_socket = {
       let saddr: SocketAddr = SocketAddr::new("0.0.0.0".parse().unwrap(), sender_port);
       mio_08::net::UdpSocket::bind(saddr)?
@@ -37,7 +42,7 @@ impl UDPSender {
       });
 
     let mut multicast_sockets = Vec::with_capacity(1);
-    for multicast_if_ipaddr in get_local_multicast_ip_addrs()? {
+    for multicast_if_ipaddr in get_local_multicast_ip_addrs_filtered(only_networks)? {
       // beef: specify output interface
       trace!("UDPSender: Multicast sender on interface {multicast_if_ipaddr:?}");
 

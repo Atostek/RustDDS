@@ -68,9 +68,7 @@ use crate::no_security::SecurityPluginsHandle;
 pub struct DomainParticipantBuilder {
   domain_id: u16,
 
-  #[allow(dead_code)] /* only_networks is a placeholder for a feature to limit
-  which interfaces the DomainParticipant will talk to. */
-  only_networks: Option<Vec<String>>, // if specified, run RTPS only over these interfaces
+  only_networks: Option<Vec<String>>, // optional interface filter for discovery advertisements and multicast setup
 
   #[cfg(feature = "security")]
   security_plugins: Option<SecurityPlugins>,
@@ -88,6 +86,19 @@ impl DomainParticipantBuilder {
       #[cfg(feature = "security")]
       sec_properties: None,
     }
+  }
+
+  /// Filter which local network interfaces are used for multicast and
+  /// advertised in discovery.
+  ///
+  /// When set, multicast sockets are created only on the listed interfaces and
+  /// discovery advertises only addresses from those interfaces.
+  ///
+  /// This is not a hard transport-level ACL: unicast sockets still bind to
+  /// wildcard addresses for the selected ports.
+  pub fn with_only_networks(mut self, networks: Vec<String>) -> Self {
+    self.only_networks = Some(networks);
+    self
   }
 
   #[cfg(feature = "security")]
@@ -250,6 +261,7 @@ impl DomainParticipantBuilder {
       status_sender.clone(),
       status_receiver,
       security_plugins_handle.clone(),
+      self.only_networks,
     )?;
 
     // outer DP wrapper
@@ -431,6 +443,10 @@ impl DomainParticipant {
   /// ```
   pub fn participant_id(&self) -> u16 {
     self.dpi.lock().unwrap().participant_id()
+  }
+
+  pub(crate) fn only_networks(&self) -> Option<Arc<[String]>> {
+    self.dpi.lock().ok().and_then(|g| g.only_networks())
   }
 
   /// Gets all DiscoveredTopics from DDS network
@@ -774,6 +790,7 @@ impl DomainParticipantDisc {
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    only_networks: Option<Vec<String>>,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -785,6 +802,7 @@ impl DomainParticipantDisc {
       status_sender,
       status_receiver,
       security_plugins_handle,
+      only_networks,
     )?;
 
     Ok(Self {
@@ -860,6 +878,10 @@ impl DomainParticipantDisc {
 
   pub(crate) fn dds_cache(&self) -> Arc<RwLock<DDSCache>> {
     self.dpi.dds_cache()
+  }
+
+  pub(crate) fn only_networks(&self) -> Option<Arc<[String]>> {
+    self.dpi.only_networks()
   }
 
   #[cfg(feature = "security")] // just to avoid warning
@@ -961,6 +983,8 @@ pub(crate) struct DomainParticipantInner {
   self_locators: HashMap<mio_06::Token, Vec<Locator>>,
 
   security_plugins_handle: Option<SecurityPluginsHandle>,
+
+  only_networks: Option<Arc<[String]>>,
 }
 
 impl Drop for DomainParticipantInner {
@@ -999,16 +1023,20 @@ impl DomainParticipantInner {
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    only_networks: Option<Vec<String>>,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
 
+    let only_networks: Option<Arc<[String]>> = only_networks.map(Arc::from);
+
     let mut listeners = HashMap::new();
 
-    match UDPListener::new_multicast(
+    match UDPListener::new_multicast_with_networks(
       "0.0.0.0",
       spdp_well_known_multicast_port(domain_id),
       Ipv4Addr::new(239, 255, 0, 1),
+      only_networks.as_deref(),
     ) {
       Ok(l) => {
         listeners.insert(DISCOVERY_MUL_LISTENER_TOKEN, l);
@@ -1044,10 +1072,11 @@ impl DomainParticipantInner {
 
     // Now the user traffic listeners
 
-    match UDPListener::new_multicast(
+    match UDPListener::new_multicast_with_networks(
       "0.0.0.0",
       user_traffic_multicast_port(domain_id),
       Ipv4Addr::new(239, 255, 0, 1),
+      only_networks.as_deref(),
     ) {
       Ok(l) => {
         listeners.insert(USER_TRAFFIC_MUL_LISTENER_TOKEN, l);
@@ -1079,7 +1108,7 @@ impl DomainParticipantInner {
     // construct our own Locators
     let self_locators: HashMap<mio_06::Token, Vec<Locator>> = listeners
       .iter()
-      .map(|(t, l)| match l.to_locator_address() {
+      .map(|(t, l)| match l.to_locator_address(only_networks.as_deref()) {
         Ok(locs) => (*t, locs),
         Err(e) => {
           error!("No local network address for token {t:?}: {e:?}");
@@ -1123,6 +1152,7 @@ impl DomainParticipantInner {
     // Launch the background thread for DomainParticipant
     let disc_db_clone = discovery_db.clone();
     let security_plugins_clone = security_plugins_handle.clone();
+    let only_networks_for_ev_loop = only_networks.clone();
     let ev_loop_handle = thread::Builder::new()
       .name(format!("RustDDS Participant {participant_id} event loop"))
       .spawn(move || {
@@ -1154,6 +1184,7 @@ impl DomainParticipantInner {
           spdp_liveness_sender,
           status_sender,
           security_plugins_clone,
+          only_networks_for_ev_loop,
         );
         dp_event_loop.event_loop();
       })?;
@@ -1184,11 +1215,16 @@ impl DomainParticipantInner {
       status_receiver,
       self_locators,
       security_plugins_handle,
+      only_networks,
     })
   }
 
   pub fn dds_cache(&self) -> Arc<RwLock<DDSCache>> {
     self.dds_cache.clone()
+  }
+
+  pub(crate) fn only_networks(&self) -> Option<Arc<[String]>> {
+    self.only_networks.clone()
   }
 
   #[cfg(feature = "security")] // just to avoid warning

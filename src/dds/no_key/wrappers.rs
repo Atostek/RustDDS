@@ -2,9 +2,7 @@ use std::{marker::PhantomData, ops::Deref};
 
 use bytes::Bytes;
 
-use crate::{
-  dds::adapters::*, messages::submessages::submessages::RepresentationIdentifier, Keyed,
-};
+use crate::{dds::adapters::*, messages::submessages::submessages::RepresentationIdentifier, Keyed};
 
 // This wrapper is used to convert NO_KEY types to WITH_KEY
 // * inside the wrapper there is a NO_KEY type
