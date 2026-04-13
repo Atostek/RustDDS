@@ -662,6 +662,7 @@ impl DiscoveryDB {
       reader_proxy: ReaderProxy::from(reader_proxy),
       subscription_topic_data: subscription_data,
       content_filter,
+      user_data: Vec::new(),
     };
 
     self
@@ -943,6 +944,7 @@ mod tests {
       reader_proxy: reader1.clone(),
       subscription_topic_data: reader1sub.clone(),
       content_filter: None,
+      user_data: Vec::new(),
     };
     discovery_db.update_subscription(&dreader1);
 
@@ -954,6 +956,7 @@ mod tests {
       reader_proxy: reader2,
       subscription_topic_data: reader2sub,
       content_filter: None,
+      user_data: Vec::new(),
     };
     discovery_db.update_subscription(&dreader2);
 
@@ -963,6 +966,7 @@ mod tests {
       reader_proxy: reader3,
       subscription_topic_data: reader3sub,
       content_filter: None,
+      user_data: Vec::new(),
     };
     discovery_db.update_subscription(&dreader3);
 

@@ -395,6 +395,7 @@ pub struct EndpointDescription {
   pub topic_name: String,
   pub type_name: String,
   pub qos: QosPolicies,
+  pub user_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]

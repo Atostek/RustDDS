@@ -301,6 +301,7 @@ pub struct DiscoveredReaderData {
   pub reader_proxy: ReaderProxy,
   pub subscription_topic_data: SubscriptionBuiltinTopicData,
   pub content_filter: Option<ContentFilterProperty>,
+  pub user_data: Vec<u8>,
 }
 
 impl DiscoveredReaderData {
@@ -321,6 +322,7 @@ impl DiscoveredReaderData {
       reader_proxy,
       subscription_topic_data,
       content_filter: None,
+      user_data: Vec::new(),
     }
   }
 }
@@ -404,6 +406,12 @@ impl PlCdrDeserialize for DiscoveredReaderData {
 
     let qos = QosPolicies::from_parameter_list(ctx, &pl_map)?;
 
+    let user_data = pl_map
+      .get(&ParameterId::PID_USER_DATA)
+      .and_then(|v| v.first())
+      .map(|p| p.value.clone())
+      .unwrap_or_default();
+
     Ok(DiscoveredReaderData {
       reader_proxy: ReaderProxy::new(
         guid,
@@ -420,6 +428,7 @@ impl PlCdrDeserialize for DiscoveredReaderData {
         security_info,
       ),
       content_filter,
+      user_data,
     })
   }
 }
@@ -476,6 +485,7 @@ impl ParameterListable for DiscoveredReaderData {
           security_info,
         },
       content_filter,
+      user_data: _,
     } = self;
 
     let mut pl = ParameterList::new();
@@ -747,6 +757,7 @@ pub struct DiscoveredWriterData {
 
   pub writer_proxy: WriterProxy,
   pub publication_topic_data: PublicationBuiltinTopicData,
+  pub user_data: Vec<u8>,
 }
 
 impl Keyed for DiscoveredWriterData {
@@ -781,6 +792,7 @@ impl DiscoveredWriterData {
       last_updated: Instant::now(),
       writer_proxy,
       publication_topic_data,
+      user_data: Vec::new(),
     }
   }
 }
@@ -847,6 +859,12 @@ impl PlCdrDeserialize for DiscoveredWriterData {
 
     let qos = QosPolicies::from_parameter_list(ctx, &pl_map)?;
 
+    let user_data = pl_map
+      .get(&ParameterId::PID_USER_DATA)
+      .and_then(|v| v.first())
+      .map(|p| p.value.clone())
+      .unwrap_or_default();
+
     Ok(DiscoveredWriterData {
       last_updated: Instant::now(),
       writer_proxy: WriterProxy {
@@ -855,6 +873,7 @@ impl PlCdrDeserialize for DiscoveredWriterData {
         multicast_locator_list,
         data_max_size_serialized,
       },
+      user_data,
       publication_topic_data: PublicationBuiltinTopicData::new_with_qos(
         guid,
         participant_guid,
@@ -918,6 +937,7 @@ impl ParameterListable for DiscoveredWriterData {
           #[cfg(feature = "security")]
           security_info,
         },
+      user_data: _,
     } = self;
 
     let mut pl = ParameterList::new();
@@ -1350,6 +1370,7 @@ mod tests {
       reader_proxy,
       subscription_topic_data: sub_topic_data,
       content_filter: Some(content_filter),
+      user_data: Vec::new(),
     };
 
     // serialize
@@ -1406,6 +1427,7 @@ mod tests {
       last_updated: Instant::now(),
       writer_proxy,
       publication_topic_data: pub_topic_data,
+      user_data: Vec::new(),
     };
 
     let sdata = dwd
