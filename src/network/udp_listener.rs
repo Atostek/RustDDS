@@ -97,7 +97,7 @@ impl UDPListener {
 
   pub fn to_locator_address(
     &self,
-    only_networks: Option<&[String]>,
+    only_networks: Option<&[IpAddr]>,
   ) -> io::Result<Vec<Locator>> {
     let local_port = self.socket.local_addr()?.port();
 
@@ -128,7 +128,7 @@ impl UDPListener {
     host: &str,
     port: u16,
     multicast_group: Ipv4Addr,
-    only_networks: Option<&[String]>,
+    only_networks: Option<&[IpAddr]>,
   ) -> io::Result<Self> {
     if !multicast_group.is_multicast() {
       return io::Result::Err(io::Error::new(

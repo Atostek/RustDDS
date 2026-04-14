@@ -27,7 +27,7 @@ impl UDPSender {
     Self::new_with_networks(sender_port, None)
   }
 
-  pub fn new_with_networks(sender_port: u16, only_networks: Option<&[String]>) -> io::Result<Self> {
+  pub fn new_with_networks(sender_port: u16, only_networks: Option<&[IpAddr]>) -> io::Result<Self> {
     let unicast_socket = {
       let saddr: SocketAddr = SocketAddr::new("0.0.0.0".parse().unwrap(), sender_port);
       mio_08::net::UdpSocket::bind(saddr)?

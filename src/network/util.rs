@@ -14,17 +14,19 @@ pub fn get_local_multicast_locators(port: u16) -> Vec<Locator> {
 
 pub fn get_local_unicast_locators_filtered(
   port: u16,
-  only_networks: Option<&[String]>,
+  only_networks: Option<&[IpAddr]>,
 ) -> Vec<Locator> {
   match if_addrs::get_if_addrs() {
     Ok(ifaces) => {
       let result = get_local_unicast_locators_inner(ifaces, port, only_networks);
-      if result.is_empty() && only_networks.is_some() {
-        warn!(
-          "only_networks filter {:?} matched no unicast interfaces; this participant will be \
-           invisible to peers.",
-          only_networks.unwrap(),
-        );
+      if result.is_empty() {
+        if let Some(nets) = only_networks {
+          warn!(
+            "only_networks filter {:?} matched no unicast interfaces; this participant will be \
+             invisible to peers.",
+            nets,
+          );
+        }
       }
       result
     }
@@ -38,12 +40,11 @@ pub fn get_local_unicast_locators_filtered(
 fn get_local_unicast_locators_inner(
   ifaces: Vec<if_addrs::Interface>,
   port: u16,
-  only_networks: Option<&[String]>,
+  only_networks: Option<&[IpAddr]>,
 ) -> Vec<Locator> {
   ifaces
     .iter()
-    .filter(|ip| !ip.is_loopback())
-    .filter(|ip| only_networks.map_or(true, |nets| nets.contains(&ip.name)))
+    .filter(|ip| only_networks.map_or(true, |nets| nets.contains(&ip.ip())))
     .map(|ip| Locator::from(SocketAddr::new(ip.ip(), port)))
     .collect()
 }
@@ -51,9 +52,9 @@ fn get_local_unicast_locators_inner(
 /// Enumerates local interfaces that we may use for multicasting.
 ///
 /// The result of this function is used to set up senders and listeners.
-/// When `only_networks` is `Some`, only the named interfaces are included.
+/// When `only_networks` is `Some`, only interfaces with a matching IP are included.
 pub fn get_local_multicast_ip_addrs_filtered(
-  only_networks: Option<&[String]>,
+  only_networks: Option<&[IpAddr]>,
 ) -> io::Result<Vec<IpAddr>> {
   let interfaces = pnet::datalink::interfaces();
   Ok(get_local_multicast_ip_addrs_inner(
@@ -66,13 +67,16 @@ pub fn get_local_multicast_ip_addrs_filtered(
 /// out so tests can supply a mock interface list.
 fn get_local_multicast_ip_addrs_inner(
   interfaces: Vec<pnet::datalink::NetworkInterface>,
-  only_networks: Option<&[String]>,
+  only_networks: Option<&[IpAddr]>,
 ) -> Vec<IpAddr> {
   interfaces
     .into_iter()
-    .filter(|ifaddr| !ifaddr.is_loopback())
     .filter(|ifaddr| ifaddr.is_multicast())
-    .filter(|ifaddr| only_networks.map_or(true, |nets| nets.contains(&ifaddr.name)))
+    .filter(|ifaddr| {
+      only_networks.map_or(true, |nets| {
+        ifaddr.ips.iter().any(|ip_net| nets.contains(&ip_net.ip()))
+      })
+    })
     .flat_map(|ifaddr| ifaddr.ips)
     .map(|ip_net| ip_net.ip())
     .filter(|ip| ip.is_ipv4())
@@ -178,7 +182,7 @@ mod tests {
       ),
     ];
 
-    let only_networks = [String::from("eth1")];
+    let only_networks = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))];
     let ips = super::get_local_multicast_ip_addrs_inner(interfaces, Some(&only_networks));
 
     assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))]);
@@ -186,7 +190,7 @@ mod tests {
 
   #[test]
   fn unicast_filter_respects_only_networks() {
-    let only_networks = [String::from("eth1")];
+    let only_networks = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))];
     let ifaces = vec![
       if_addrs::Interface {
         name: "eth0".to_string(),

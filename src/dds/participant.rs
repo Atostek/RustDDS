@@ -3,7 +3,7 @@ use std::{
   collections::HashMap,
   io,
   io::ErrorKind,
-  net::Ipv4Addr,
+  net::{IpAddr, Ipv4Addr},
   pin::Pin,
   sync::{atomic, Arc, Mutex, RwLock, Weak},
   task::{Context, Poll},
@@ -68,7 +68,7 @@ use crate::no_security::SecurityPluginsHandle;
 pub struct DomainParticipantBuilder {
   domain_id: u16,
 
-  only_networks: Option<Vec<String>>, // optional interface filter for discovery advertisements and multicast setup
+  only_networks: Option<Vec<IpAddr>>, // optional IP address filter for discovery advertisements and multicast setup
 
   #[cfg(feature = "security")]
   security_plugins: Option<SecurityPlugins>,
@@ -91,13 +91,13 @@ impl DomainParticipantBuilder {
   /// Filter which local network interfaces are used for multicast and
   /// advertised in discovery.
   ///
-  /// When set, multicast sockets are created only on the listed interfaces and
-  /// discovery advertises only addresses from those interfaces.
+  /// When set, only interfaces whose IP address appears in `addrs` are used for
+  /// multicast joins, multicast sends, and unicast locator advertisement.
   ///
   /// This is not a hard transport-level ACL: unicast sockets still bind to
   /// wildcard addresses for the selected ports.
-  pub fn with_only_networks(mut self, networks: Vec<String>) -> Self {
-    self.only_networks = Some(networks);
+  pub fn with_only_networks(mut self, addrs: impl IntoIterator<Item = impl Into<IpAddr>>) -> Self {
+    self.only_networks = Some(addrs.into_iter().map(Into::into).collect());
     self
   }
 
@@ -445,7 +445,7 @@ impl DomainParticipant {
     self.dpi.lock().unwrap().participant_id()
   }
 
-  pub(crate) fn only_networks(&self) -> Option<Arc<[String]>> {
+  pub(crate) fn only_networks(&self) -> Option<Arc<[IpAddr]>> {
     self.dpi.lock().ok().and_then(|g| g.only_networks())
   }
 
@@ -790,7 +790,7 @@ impl DomainParticipantDisc {
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
-    only_networks: Option<Vec<String>>,
+    only_networks: Option<Vec<IpAddr>>,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -880,7 +880,7 @@ impl DomainParticipantDisc {
     self.dpi.dds_cache()
   }
 
-  pub(crate) fn only_networks(&self) -> Option<Arc<[String]>> {
+  pub(crate) fn only_networks(&self) -> Option<Arc<[IpAddr]>> {
     self.dpi.only_networks()
   }
 
@@ -984,7 +984,7 @@ pub(crate) struct DomainParticipantInner {
 
   security_plugins_handle: Option<SecurityPluginsHandle>,
 
-  only_networks: Option<Arc<[String]>>,
+  only_networks: Option<Arc<[IpAddr]>>,
 }
 
 impl Drop for DomainParticipantInner {
@@ -1023,12 +1023,12 @@ impl DomainParticipantInner {
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
-    only_networks: Option<Vec<String>>,
+    only_networks: Option<Vec<IpAddr>>,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
 
-    let only_networks: Option<Arc<[String]>> = only_networks.map(Arc::from);
+    let only_networks: Option<Arc<[IpAddr]>> = only_networks.map(|v| v.into());
 
     let mut listeners = HashMap::new();
 
@@ -1223,7 +1223,7 @@ impl DomainParticipantInner {
     self.dds_cache.clone()
   }
 
-  pub(crate) fn only_networks(&self) -> Option<Arc<[String]>> {
+  pub(crate) fn only_networks(&self) -> Option<Arc<[IpAddr]>> {
     self.only_networks.clone()
   }
 

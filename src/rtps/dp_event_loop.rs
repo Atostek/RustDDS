@@ -1,5 +1,6 @@
 use std::{
   collections::HashMap,
+  net::IpAddr,
   rc::Rc,
   sync::{Arc, RwLock},
   time::{Duration, Instant},
@@ -114,7 +115,7 @@ impl DPEventLoop {
     spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     security_plugins_opt: Option<SecurityPluginsHandle>,
-    only_networks: Option<Arc<[String]>>,
+    only_networks: Option<Arc<[IpAddr]>>,
   ) -> Self {
     let poll = Poll::new().expect("Unable to create new poll.");
     let (acknack_sender, acknack_receiver) =
