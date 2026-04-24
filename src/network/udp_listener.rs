@@ -95,16 +95,16 @@ impl UDPListener {
     Ok(mio_socket)
   }
 
-  pub fn to_locator_address(
-    &self,
-    only_networks: Option<&[IpAddr]>,
-  ) -> io::Result<Vec<Locator>> {
+  pub fn to_locator_address(&self, only_networks: Option<&[IpAddr]>) -> io::Result<Vec<Locator>> {
     let local_port = self.socket.local_addr()?.port();
 
     match self.multicast_group {
       Some(_ipv4_addr) if self.has_multicast_join => Ok(get_local_multicast_locators(local_port)),
       Some(_ipv4_addr) => Ok(vec![]),
-      None => Ok(get_local_unicast_locators_filtered(local_port, only_networks)),
+      None => Ok(get_local_unicast_locators_filtered(
+        local_port,
+        only_networks,
+      )),
     }
   }
 

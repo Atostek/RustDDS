@@ -52,7 +52,8 @@ fn get_local_unicast_locators_inner(
 /// Enumerates local interfaces that we may use for multicasting.
 ///
 /// The result of this function is used to set up senders and listeners.
-/// When `only_networks` is `Some`, only interfaces with a matching IP are included.
+/// When `only_networks` is `Some`, only interfaces with a matching IP are
+/// included.
 pub fn get_local_multicast_ip_addrs_filtered(
   only_networks: Option<&[IpAddr]>,
 ) -> io::Result<Vec<IpAddr>> {

@@ -68,7 +68,8 @@ use crate::no_security::SecurityPluginsHandle;
 pub struct DomainParticipantBuilder {
   domain_id: u16,
 
-  only_networks: Option<Vec<IpAddr>>, // optional IP address filter for discovery advertisements and multicast setup
+  only_networks: Option<Vec<IpAddr>>, /* optional IP address filter for discovery advertisements
+                                       * and multicast setup */
 
   #[cfg(feature = "security")]
   security_plugins: Option<SecurityPlugins>,
@@ -1108,13 +1109,15 @@ impl DomainParticipantInner {
     // construct our own Locators
     let self_locators: HashMap<mio_06::Token, Vec<Locator>> = listeners
       .iter()
-      .map(|(t, l)| match l.to_locator_address(only_networks.as_deref()) {
-        Ok(locs) => (*t, locs),
-        Err(e) => {
-          error!("No local network address for token {t:?}: {e:?}");
-          (*t, vec![])
-        }
-      })
+      .map(
+        |(t, l)| match l.to_locator_address(only_networks.as_deref()) {
+          Ok(locs) => (*t, locs),
+          Err(e) => {
+            error!("No local network address for token {t:?}: {e:?}");
+            (*t, vec![])
+          }
+        },
+      )
       .collect();
 
     // Adding readers
