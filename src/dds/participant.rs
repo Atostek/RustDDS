@@ -3,7 +3,7 @@ use std::{
   collections::HashMap,
   io,
   io::ErrorKind,
-  net::Ipv4Addr,
+  net::{IpAddr, Ipv4Addr},
   pin::Pin,
   sync::{atomic, Arc, Mutex, RwLock, Weak},
   task::{Context, Poll},
@@ -68,9 +68,8 @@ use crate::no_security::SecurityPluginsHandle;
 pub struct DomainParticipantBuilder {
   domain_id: u16,
 
-  #[allow(dead_code)] /* only_networks is a placeholder for a feature to limit
-  which interfaces the DomainParticipant will talk to. */
-  only_networks: Option<Vec<String>>, // if specified, run RTPS only over these interfaces
+  only_networks: Option<Vec<IpAddr>>, /* optional IP address filter for discovery advertisements
+                                       * and multicast setup */
 
   socket_receive_buffer_size: usize,
 
@@ -91,6 +90,19 @@ impl DomainParticipantBuilder {
       #[cfg(feature = "security")]
       sec_properties: None,
     }
+  }
+
+  /// Filter which local network interfaces are used for multicast and
+  /// advertised in discovery.
+  ///
+  /// When set, only interfaces whose IP address appears in `addrs` are used for
+  /// multicast joins, multicast sends, and unicast locator advertisement.
+  ///
+  /// This is not a hard transport-level ACL: unicast sockets still bind to
+  /// wildcard addresses for the selected ports.
+  pub fn with_only_networks(mut self, addrs: impl IntoIterator<Item = impl Into<IpAddr>>) -> Self {
+    self.only_networks = Some(addrs.into_iter().map(Into::into).collect());
+    self
   }
 
   pub const DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE: usize = 8 * 1024 * 1024;
@@ -261,6 +273,7 @@ impl DomainParticipantBuilder {
       status_receiver,
       security_plugins_handle.clone(),
       self.socket_receive_buffer_size,
+      self.only_networks,
     )?;
 
     // outer DP wrapper
@@ -442,6 +455,10 @@ impl DomainParticipant {
   /// ```
   pub fn participant_id(&self) -> u16 {
     self.dpi.lock().unwrap().participant_id()
+  }
+
+  pub(crate) fn only_networks(&self) -> Option<Arc<[IpAddr]>> {
+    self.dpi.lock().ok().and_then(|g| g.only_networks())
   }
 
   /// Gets all DiscoveredTopics from DDS network
@@ -786,6 +803,7 @@ impl DomainParticipantDisc {
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     socket_receive_buffer_size: usize,
+    only_networks: Option<Vec<IpAddr>>,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -798,6 +816,7 @@ impl DomainParticipantDisc {
       status_receiver,
       security_plugins_handle,
       socket_receive_buffer_size,
+      only_networks,
     )?;
 
     Ok(Self {
@@ -873,6 +892,10 @@ impl DomainParticipantDisc {
 
   pub(crate) fn dds_cache(&self) -> Arc<RwLock<DDSCache>> {
     self.dpi.dds_cache()
+  }
+
+  pub(crate) fn only_networks(&self) -> Option<Arc<[IpAddr]>> {
+    self.dpi.only_networks()
   }
 
   #[cfg(feature = "security")] // just to avoid warning
@@ -974,6 +997,8 @@ pub(crate) struct DomainParticipantInner {
   self_locators: HashMap<mio_06::Token, Vec<Locator>>,
 
   security_plugins_handle: Option<SecurityPluginsHandle>,
+
+  only_networks: Option<Arc<[IpAddr]>>,
 }
 
 impl Drop for DomainParticipantInner {
@@ -1013,9 +1038,12 @@ impl DomainParticipantInner {
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     socket_receive_buffer_size: usize,
+    only_networks: Option<Vec<IpAddr>>,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
+
+    let only_networks: Option<Arc<[IpAddr]>> = only_networks.map(|v| v.into());
 
     let mut listeners = HashMap::new();
 
@@ -1024,6 +1052,7 @@ impl DomainParticipantInner {
       spdp_well_known_multicast_port(domain_id),
       Ipv4Addr::new(239, 255, 0, 1),
       socket_receive_buffer_size,
+      only_networks.as_deref(),
     ) {
       Ok(l) => {
         listeners.insert(DISCOVERY_MUL_LISTENER_TOKEN, l);
@@ -1065,6 +1094,7 @@ impl DomainParticipantInner {
       user_traffic_multicast_port(domain_id),
       Ipv4Addr::new(239, 255, 0, 1),
       socket_receive_buffer_size,
+      only_networks.as_deref(),
     ) {
       Ok(l) => {
         listeners.insert(USER_TRAFFIC_MUL_LISTENER_TOKEN, l);
@@ -1099,13 +1129,15 @@ impl DomainParticipantInner {
     // construct our own Locators
     let self_locators: HashMap<mio_06::Token, Vec<Locator>> = listeners
       .iter()
-      .map(|(t, l)| match l.to_locator_address() {
-        Ok(locs) => (*t, locs),
-        Err(e) => {
-          error!("No local network address for token {t:?}: {e:?}");
-          (*t, vec![])
-        }
-      })
+      .map(
+        |(t, l)| match l.to_locator_address(only_networks.as_deref()) {
+          Ok(locs) => (*t, locs),
+          Err(e) => {
+            error!("No local network address for token {t:?}: {e:?}");
+            (*t, vec![])
+          }
+        },
+      )
       .collect();
 
     // Adding readers
@@ -1143,6 +1175,7 @@ impl DomainParticipantInner {
     // Launch the background thread for DomainParticipant
     let disc_db_clone = discovery_db.clone();
     let security_plugins_clone = security_plugins_handle.clone();
+    let only_networks_for_ev_loop = only_networks.clone();
     let ev_loop_handle = thread::Builder::new()
       .name(format!("RustDDS Participant {participant_id} event loop"))
       .spawn(move || {
@@ -1174,6 +1207,7 @@ impl DomainParticipantInner {
           spdp_liveness_sender,
           status_sender,
           security_plugins_clone,
+          only_networks_for_ev_loop,
         );
         dp_event_loop.event_loop();
       })?;
@@ -1204,11 +1238,16 @@ impl DomainParticipantInner {
       status_receiver,
       self_locators,
       security_plugins_handle,
+      only_networks,
     })
   }
 
   pub fn dds_cache(&self) -> Arc<RwLock<DDSCache>> {
     self.dds_cache.clone()
+  }
+
+  pub(crate) fn only_networks(&self) -> Option<Arc<[IpAddr]>> {
+    self.only_networks.clone()
   }
 
   #[cfg(feature = "security")] // just to avoid warning

@@ -9,7 +9,8 @@ use bytes::{Bytes, BytesMut};
 
 use crate::{
   network::util::{
-    get_local_multicast_ip_addrs, get_local_multicast_locators, get_local_unicast_locators,
+    get_local_multicast_ip_addrs_filtered, get_local_multicast_locators,
+    get_local_unicast_locators_filtered,
   },
   serialization::padding_needed_for_alignment_4,
   structure::locator::Locator,
@@ -27,6 +28,7 @@ pub struct UDPListener {
   socket: mio_06::net::UdpSocket,
   receive_buffer: BytesMut,
   multicast_group: Option<Ipv4Addr>,
+  has_multicast_join: bool,
 }
 
 impl Drop for UDPListener {
@@ -102,12 +104,16 @@ impl UDPListener {
     Ok(mio_socket)
   }
 
-  pub fn to_locator_address(&self) -> io::Result<Vec<Locator>> {
+  pub fn to_locator_address(&self, only_networks: Option<&[IpAddr]>) -> io::Result<Vec<Locator>> {
     let local_port = self.socket.local_addr()?.port();
 
     match self.multicast_group {
-      Some(_ipv4_addr) => Ok(get_local_multicast_locators(local_port)),
-      None => Ok(get_local_unicast_locators(local_port)),
+      Some(_ipv4_addr) if self.has_multicast_join => Ok(get_local_multicast_locators(local_port)),
+      Some(_ipv4_addr) => Ok(vec![]),
+      None => Ok(get_local_unicast_locators_filtered(
+        local_port,
+        only_networks,
+      )),
     }
   }
 
@@ -127,12 +133,13 @@ impl UDPListener {
       socket: mio_socket,
       receive_buffer: BytesMut::with_capacity(MESSAGE_BUFFER_ALLOCATION_CHUNK),
       multicast_group: None,
+      has_multicast_join: false,
     })
   }
 
   #[cfg(test)]
   pub fn new_multicast(host: &str, port: u16, multicast_group: Ipv4Addr) -> io::Result<Self> {
-    Self::new_multicast_with_buf_size(host, port, multicast_group, 0)
+    Self::new_multicast_with_buf_size(host, port, multicast_group, 0, None)
   }
 
   pub fn new_multicast_with_buf_size(
@@ -140,6 +147,7 @@ impl UDPListener {
     port: u16,
     multicast_group: Ipv4Addr,
     recv_buffer_size: usize,
+    only_networks: Option<&[IpAddr]>,
   ) -> io::Result<Self> {
     if !multicast_group.is_multicast() {
       return io::Result::Err(io::Error::new(
@@ -149,11 +157,15 @@ impl UDPListener {
     }
 
     let mio_socket = Self::new_listening_socket(host, port, true, recv_buffer_size)?;
+    let mut joined_multicast = false;
 
-    for multicast_if_ipaddr in get_local_multicast_ip_addrs()? {
+    for multicast_if_ipaddr in get_local_multicast_ip_addrs_filtered(only_networks)? {
       match multicast_if_ipaddr {
         IpAddr::V4(a) => mio_socket
           .join_multicast_v4(&multicast_group, &a)
+          .map(|()| {
+            joined_multicast = true;
+          })
           .unwrap_or_else(|e| {
             warn!(
               "join_multicast_v4 failed: {e:?}. multicast_group [{multicast_group:?}] interface \
@@ -162,20 +174,33 @@ impl UDPListener {
           }),
 
         IpAddr::V6(addr) => {
-          if let Err(e) = mio_socket.join_multicast_v6(&addr, 0) {
-            warn!(
-              "join_multicast_v6 failed. err: {e}. mcast group: [{multicast_group:?}], \
-               addr:[{addr:?}]"
-            );
-          }
+          mio_socket
+            .join_multicast_v6(&addr, 0)
+            .map(|()| {
+              joined_multicast = true;
+            })
+            .unwrap_or_else(|e| {
+              warn!(
+                "join_multicast_v6 failed. err: {e}. mcast group: [{multicast_group:?}], \
+                 addr:[{addr:?}]"
+              );
+            });
         }
       }
+    }
+
+    if !joined_multicast {
+      warn!(
+        "No multicast joins succeeded for group {multicast_group:?}; multicast locator will not \
+         be advertised."
+      );
     }
 
     Ok(Self {
       socket: mio_socket,
       receive_buffer: BytesMut::with_capacity(MESSAGE_BUFFER_ALLOCATION_CHUNK),
       multicast_group: Some(multicast_group),
+      has_multicast_join: joined_multicast,
     })
   }
 
