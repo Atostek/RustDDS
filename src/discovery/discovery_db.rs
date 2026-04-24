@@ -95,10 +95,8 @@ fn move_by_guid_prefix<D>(
   from: &mut BTreeMap<GUID, D>,
   to: &mut BTreeMap<GUID, D>,
 ) {
-  let to_move: Vec<GUID> = from.range(guid_prefix.range()).map(|(g, _)| *g).collect();
-  for guid in to_move {
-    from.remove(&guid).map(|d| to.insert(guid, d));
-  }
+  let to_move = from.extract_if(guid_prefix.range(), |_, _| true);
+  to.extend(to_move);
 }
 
 pub(crate) fn discovery_db_read(
@@ -258,16 +256,9 @@ impl DiscoveryDB {
   }
 
   fn remove_topic_reader_with_prefix(&mut self, guid_prefix: GuidPrefix) {
-    // TODO: Implement this using .drain_filter() in BTreeMap once it lands in
-    // stable.
-    let to_remove: Vec<GUID> = self
+    let _ = self
       .external_topic_readers
-      .range(guid_prefix.range())
-      .map(|(g, _)| *g)
-      .collect();
-    for guid in to_remove {
-      self.external_topic_readers.remove(&guid);
-    }
+      .extract_if(guid_prefix.range(), |_, _| true);
   }
 
   pub fn remove_topic_reader(&mut self, guid: GUID) {
@@ -286,16 +277,9 @@ impl DiscoveryDB {
   }
 
   fn remove_topic_writer_with_prefix(&mut self, guid_prefix: GuidPrefix) {
-    // TODO: Implement this using .drain_filter() in BTreeMap once it lands in
-    // stable.
-    let to_remove: Vec<GUID> = self
+    let _ = self
       .external_topic_writers
-      .range(guid_prefix.range())
-      .map(|(g, _)| *g)
-      .collect();
-    for guid in to_remove {
-      self.external_topic_writers.remove(&guid);
-    }
+      .extract_if(guid_prefix.range(), |_, _| true);
   }
 
   pub fn remove_topic_writer(&mut self, guid: GUID) {
