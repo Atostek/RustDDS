@@ -262,9 +262,10 @@ impl RtpsReaderProxy {
         //
         // This is logged in `writer` object.
 
-        // Ignore ACKNACK whose readerSNState.base claims ack beyond last_seq + 1 (the writer's
-        // last change sequence number). Matches reliable writer/reader semantics; a forged base
-        // would otherwise pin all_acked_before and block real ACKNACKs (issue #405).
+        // Ignore ACKNACK whose readerSNState.base claims ack beyond last_seq + 1 (the
+        // writer's last change sequence number). Matches reliable writer/reader
+        // semantics; a forged base would otherwise pin all_acked_before and
+        // block real ACKNACKs (issue #405).
         let max_plausible_acked_before = last_available.plus_1();
         if new_all_acked_before > max_plausible_acked_before {
           warn!(
@@ -479,9 +480,10 @@ impl Iterator for FragBitVecIterator {
 #[cfg(test)]
 mod acknack_tests {
   use super::*;
-  use crate::messages::submessages::{ack_nack::AckNack, submessage::AckSubmessage};
-  use crate::structure::guid::GuidPrefix;
-  use crate::structure::sequence_number::SequenceNumberSet;
+  use crate::{
+    messages::submessages::{ack_nack::AckNack, submessage::AckSubmessage},
+    structure::{guid::GuidPrefix, sequence_number::SequenceNumberSet},
+  };
 
   #[test]
   fn acknack_with_base_beyond_sent_data_does_not_advance_all_acked_before() {
