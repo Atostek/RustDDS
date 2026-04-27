@@ -262,6 +262,22 @@ impl RtpsReaderProxy {
         //
         // This is logged in `writer` object.
 
+        // Ignore ACKNACK whose readerSNState.base claims ack beyond last_seq + 1 (the writer's
+        // last change sequence number). Matches reliable writer/reader semantics; a forged base
+        // would otherwise pin all_acked_before and block real ACKNACKs (issue #405).
+        let max_plausible_acked_before = last_available.plus_1();
+        if new_all_acked_before > max_plausible_acked_before {
+          warn!(
+            "Ignoring ACKNACK: base {:?} implies ack through unsent data (last sent seq={:?}, max \
+             plausible all-acked-before {:?}) reader={:x?}",
+            new_all_acked_before,
+            last_available,
+            max_plausible_acked_before,
+            self.remote_reader_guid
+          );
+          return;
+        }
+
         // sanity check:
         if new_all_acked_before < self.all_acked_before {
           error!(
@@ -459,3 +475,47 @@ impl Iterator for FragBitVecIterator {
 //     }
 //   }
 // }
+
+#[cfg(test)]
+mod acknack_tests {
+  use super::*;
+  use crate::messages::submessages::{ack_nack::AckNack, submessage::AckSubmessage};
+  use crate::structure::guid::GuidPrefix;
+  use crate::structure::sequence_number::SequenceNumberSet;
+
+  #[test]
+  fn acknack_with_base_beyond_sent_data_does_not_advance_all_acked_before() {
+    let guid = GUID::new(GuidPrefix::UNKNOWN, EntityId::UNKNOWN);
+    let mut rp = RtpsReaderProxy::new(guid, QosPolicies::default(), false);
+    rp.all_acked_before = SequenceNumber::from(10);
+
+    let forged_base = SequenceNumber::new(4_611_686_018_427_387_993);
+    let ack = AckNack {
+      reader_id: EntityId::UNKNOWN,
+      writer_id: EntityId::UNKNOWN,
+      reader_sn_state: SequenceNumberSet::new_empty(forged_base),
+      count: 1,
+    };
+
+    rp.handle_ack_nack(&AckSubmessage::AckNack(ack), SequenceNumber::from(100));
+
+    assert_eq!(rp.all_acked_before, SequenceNumber::from(10));
+  }
+
+  #[test]
+  fn acknack_with_valid_base_updates_all_acked_before() {
+    let guid = GUID::new(GuidPrefix::UNKNOWN, EntityId::UNKNOWN);
+    let mut rp = RtpsReaderProxy::new(guid, QosPolicies::default(), false);
+
+    let ack = AckNack {
+      reader_id: EntityId::UNKNOWN,
+      writer_id: EntityId::UNKNOWN,
+      reader_sn_state: SequenceNumberSet::new_empty(SequenceNumber::from(50)),
+      count: 1,
+    };
+
+    rp.handle_ack_nack(&AckSubmessage::AckNack(ack), SequenceNumber::from(100));
+
+    assert_eq!(rp.all_acked_before, SequenceNumber::from(50));
+  }
+}
