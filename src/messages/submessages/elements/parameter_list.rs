@@ -77,6 +77,12 @@ impl<C: Context> Writable<C> for ParameterList {
 }
 
 impl<'a, C: Context> Readable<'a, C> for ParameterList {
+  /// Smallest `Parameter` header: `ParameterId` + 16-bit length.
+  #[inline]
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   #[inline]
   fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let mut parameters = Self::default();

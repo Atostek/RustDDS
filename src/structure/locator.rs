@@ -72,6 +72,13 @@ impl<'a, C: Context> Readable<'a, C> for Locator {
     let repr = repr::Locator::read_from(reader)?;
     Ok(repr.into())
   }
+
+  /// Wire size of [`repr::Locator`]. Used by `speedy` when deserializing
+  /// `Vec<Locator>` so the length prefix is checked against the remaining
+  /// buffer *before* allocating (see e.g. issue #404).
+  fn minimum_bytes_needed() -> usize {
+    std::mem::size_of::<repr::Locator>()
+  }
 }
 
 impl<C: Context> Writable<C> for Locator {
@@ -295,5 +302,14 @@ mod tests {
         .unwrap(),
       little_endian
     );
+  }
+
+  /// Regression: `Vec<Locator>` must not call `with_capacity` from a forged
+  /// length alone (issue #404).
+  #[test]
+  fn vec_rejects_length_prefix_inconsistent_with_buffer() {
+    let count_only = [0x80u8, 0x94, 0x20, 0x44];
+    let result = Vec::<Locator>::read_from_buffer_with_ctx(Endianness::LittleEndian, &count_only);
+    assert!(result.is_err());
   }
 }

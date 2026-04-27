@@ -938,6 +938,10 @@ pub mod policy {
 
   #[cfg(feature = "security")]
   impl<'a, C: Context> Readable<'a, C> for Property {
+    fn minimum_bytes_needed() -> usize {
+      4
+    }
+
     fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
       let count = reader.read_u32()?;
       let mut value = Vec::new();
@@ -1038,6 +1042,10 @@ pub mod policy {
 
   #[cfg(feature = "security")]
   impl<'a, C: Context> Readable<'a, C> for DataTag {
+    fn minimum_bytes_needed() -> usize {
+      4
+    }
+
     fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
       let count = reader.read_u32()?;
       let mut tags = Vec::new();

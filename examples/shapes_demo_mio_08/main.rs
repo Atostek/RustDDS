@@ -247,7 +247,7 @@ fn main() {
 
   while !stop_program.load(Ordering::Relaxed) {
     if let Err(e) = poll.poll(&mut events, Some(loop_delay)) {
-      println!("Poll error {e}",);
+      println!("Poll error {e}");
       return;
     }
 

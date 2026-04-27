@@ -25,6 +25,10 @@ impl From<CryptoContent> for Vec<u8> {
 //
 // TODO: Figure out if these could be done more elegantly with serde
 impl<'a, C: Context> Readable<'a, C> for CryptoContent {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
     reader
       // CDR: sequence starts with an unsigned long

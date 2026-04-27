@@ -140,6 +140,11 @@ impl<C: Context> Writable<C> for StatusInfo {
 
 impl<'a, C: Context> Readable<'a, C> for StatusInfo {
   #[inline]
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
+  #[inline]
   fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> std::result::Result<Self, C::Error> {
     reader.read_u8()?;
     reader.read_u8()?;

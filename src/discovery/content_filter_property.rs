@@ -48,6 +48,10 @@ pub struct ContentFilterProperty {
 // Note: we must align BEFORE string read, not after.
 // If string were followed by e.g. "u8", that would not have alignment applied.
 impl<'a, C: Context> Readable<'a, C> for ContentFilterProperty {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let cftn: StringWithNul = reader.read_value()?;
 

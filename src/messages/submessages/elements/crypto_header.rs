@@ -21,6 +21,10 @@ pub struct CryptoHeader {
 }
 
 impl<'a, C: Context> Readable<'a, C> for CryptoHeader {
+  fn minimum_bytes_needed() -> usize {
+    std::mem::size_of::<CryptoTransformIdentifier>() + BuiltinCryptoHeaderExtra::serialized_len()
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let transformation_id = CryptoTransformIdentifier::read_from(reader)?;
 

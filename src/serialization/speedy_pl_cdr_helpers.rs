@@ -90,6 +90,12 @@ impl<C: Context> Writable<C> for StringWithNul {
 }
 
 impl<'a, C: Context> Readable<'a, C> for StringWithNul {
+  // CDR `string`: u32 length prefix.
+  #[inline]
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   #[inline]
   fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> std::result::Result<Self, C::Error> {
     // TODO: Should align to 4 before reading string length

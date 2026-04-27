@@ -126,6 +126,10 @@ pub struct Property {
 }
 
 impl<'a, C: Context> Readable<'a, C> for Property {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let name: StringWithNul = reader.read_value()?;
 
@@ -289,6 +293,10 @@ impl BinaryProperty {
 }
 
 impl<'a, C: Context> Readable<'a, C> for BinaryProperty {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let name: StringWithNul = reader.read_value()?;
 
@@ -329,6 +337,10 @@ pub struct Tag {
 }
 
 impl<'a, C: Context> Readable<'a, C> for Tag {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let name: StringWithNul = reader.read_value()?;
 
@@ -474,6 +486,10 @@ impl DataHolder {
 }
 
 impl<'a, C: Context> Readable<'a, C> for DataHolder {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let class_id: StringWithNul = reader.read_value()?;
 
@@ -646,6 +662,10 @@ impl ParticipantSecurityAttributesMask {
 }
 
 impl<'a, C: Context> Readable<'a, C> for ParticipantSecurityAttributesMask {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let underlying_value: u32 = reader.read_value()?;
     BitFlags::<ParticipantSecurityAttributesMaskFlags>::try_from(underlying_value)
@@ -725,6 +745,10 @@ impl EndpointSecurityAttributesMask {
 }
 
 impl<'a, C: Context> Readable<'a, C> for EndpointSecurityAttributesMask {
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let underlying_value: u32 = reader.read_value()?;
     BitFlags::<EndpointSecurityAttributesMaskFlags>::try_from(underlying_value)

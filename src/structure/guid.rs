@@ -487,6 +487,11 @@ impl fmt::Debug for EntityId {
 
 impl<'a, C: Context> Readable<'a, C> for EntityId {
   #[inline]
+  fn minimum_bytes_needed() -> usize {
+    4
+  }
+
+  #[inline]
   fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
     let entity_key = [reader.read_u8()?, reader.read_u8()?, reader.read_u8()?];
     let entity_kind = EntityKind(reader.read_u8()?);
