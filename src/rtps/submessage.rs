@@ -55,8 +55,7 @@ pub struct Submessage {
 // endianness. TODO: The error type should be something better
 impl Submessage {
   pub fn read_from_buffer(buffer: &mut Bytes) -> io::Result<Option<Self>> {
-    let sub_header = SubmessageHeader::read_from_buffer(buffer)
-      .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let sub_header = SubmessageHeader::read_from_buffer(buffer).map_err(io::Error::other)?;
     // Try to figure out how large this submessage is.
     let sub_header_length = 4; // 4 bytes
     let proposed_sub_content_length = if sub_header.content_length == 0 {

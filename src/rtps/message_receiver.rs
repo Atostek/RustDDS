@@ -721,14 +721,11 @@ impl MessageReceiver {
     {
       error!(
         "{:?}",
-        std::io::Error::new(
-          std::io::ErrorKind::Other,
-          format!(
-            "Invalid DataFrag. serializedData length={} should be less than or equal to \
-             (fragments_in_submessage={}) x (fragment_size={})",
-            payload_buffer_length, datafrag.fragments_in_submessage, datafrag.fragment_size
-          ),
-        )
+        std::io::Error::other(format!(
+          "Invalid DataFrag. serializedData length={} should be less than or equal to \
+           (fragments_in_submessage={}) x (fragment_size={})",
+          payload_buffer_length, datafrag.fragments_in_submessage, datafrag.fragment_size
+        ),)
       );
       // and we're done
     } else {

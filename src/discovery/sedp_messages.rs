@@ -386,12 +386,11 @@ impl PlCdrDeserialize for DiscoveredReaderData {
       ParameterId::PID_CONTENT_FILTER_PROPERTY,
       "content filter",
     )
-    .map_err(|e| {
+    .inspect_err(|_e| {
       warn!(
         "Content filter was: {:?}",
         pl_map.get(&ParameterId::PID_CONTENT_FILTER_PROPERTY)
       );
-      e
     })?;
 
     #[cfg(not(feature = "security"))]

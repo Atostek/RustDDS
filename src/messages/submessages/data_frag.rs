@@ -114,7 +114,7 @@ impl DataFrag {
   pub fn deserialize(buffer: &Bytes, flags: BitFlags<DATAFRAG_Flags>) -> io::Result<Self> {
     let mut cursor = io::Cursor::new(&buffer);
     let endianness = endianness_flag(flags.bits());
-    let map_speedy_err = |p: Error| io::Error::new(io::ErrorKind::Other, p);
+    let map_speedy_err = |p: Error| io::Error::other(p);
 
     let _extra_flags =
       u16::read_from_stream_unbuffered_with_ctx(endianness, &mut cursor).map_err(map_speedy_err)?;
@@ -153,10 +153,9 @@ impl DataFrag {
     // Skip any possible fields we do not know about.
     let rtps_v25_header_size: u16 = 28;
     if octets_to_inline_qos < rtps_v25_header_size {
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!("DataFrag has too low octetsToInlineQos = {octets_to_inline_qos}"),
-      ));
+      return Err(io::Error::other(format!(
+        "DataFrag has too low octetsToInlineQos = {octets_to_inline_qos}"
+      )));
     }
     // condition to avoid subtract overflow
     if octets_to_inline_qos > rtps_v25_header_size {
@@ -190,8 +189,7 @@ impl DataFrag {
 
     // writer_sn strictly positive
     if writer_sn < SequenceNumber::new(1) {
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
+      return Err(io::Error::other(
         "DataFrag SequenceNumber < 1. Discarding as invalid.",
       ));
     }
@@ -203,13 +201,10 @@ impl DataFrag {
     // Sending zero-sized data may be ok, but it could be sent as zero fragments of
     // some positive size, or preferably as non-fragmented DATA submessage.
     if fragment_size < 1 || (fragment_size as u32) > data_size {
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-          "Invalid DataFrag. fragment_size={fragment_size} data_size={data_size}  Expected 1 <= \
-           fragment_size <= data_size."
-        ),
-      ));
+      return Err(io::Error::other(format!(
+        "Invalid DataFrag. fragment_size={fragment_size} data_size={data_size}  Expected 1 <= \
+         fragment_size <= data_size."
+      )));
     }
 
     // Payload should be always present, be it data or key fragments.
@@ -232,14 +227,11 @@ impl DataFrag {
 
     let expected_total = datafrag.total_number_of_fragments();
     if fragment_starting_num < FragmentNumber::new(1) || fragment_starting_num > expected_total {
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-          "DataFrag fragmentStartingNum={fragment_starting_num:?} \
-           expected_total={expected_total:?}.  Expected 1 <= fragmentStartingNum <= \
-           expected_total.  Discarding as invalid."
-        ),
-      ));
+      return Err(io::Error::other(format!(
+        "DataFrag fragmentStartingNum={fragment_starting_num:?} \
+         expected_total={expected_total:?}.  Expected 1 <= fragmentStartingNum <= expected_total.  \
+         Discarding as invalid."
+      )));
     }
 
     Ok(datafrag)

@@ -77,12 +77,7 @@ impl UDPListener {
       }
     }
 
-    let address = SocketAddr::new(
-      host
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-      port,
-    );
+    let address = SocketAddr::new(host.parse().map_err(io::Error::other)?, port);
 
     if let Err(e) = raw_socket.bind(&SockAddr::from(address)) {
       info!("new_socket - cannot bind socket: {e:?}");
@@ -150,10 +145,7 @@ impl UDPListener {
     only_networks: Option<&[IpAddr]>,
   ) -> io::Result<Self> {
     if !multicast_group.is_multicast() {
-      return io::Result::Err(io::Error::new(
-        io::ErrorKind::Other,
-        "Not a multicast address",
-      ));
+      return io::Result::Err(io::Error::other("Not a multicast address"));
     }
 
     let mio_socket = Self::new_listening_socket(host, port, true, recv_buffer_size)?;
@@ -315,10 +307,7 @@ impl UDPListener {
         .socket
         .leave_multicast_v4(address, &Ipv4Addr::UNSPECIFIED);
     }
-    io::Result::Err(io::Error::new(
-      io::ErrorKind::Other,
-      "Not a multicast address",
-    ))
+    io::Result::Err(io::Error::other("Not a multicast address"))
   }
 }
 

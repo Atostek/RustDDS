@@ -44,7 +44,7 @@ fn get_local_unicast_locators_inner(
 ) -> Vec<Locator> {
   ifaces
     .iter()
-    .filter(|ip| only_networks.map_or(true, |nets| nets.contains(&ip.ip())))
+    .filter(|ip| only_networks.is_none_or(|nets| nets.contains(&ip.ip())))
     .map(|ip| Locator::from(SocketAddr::new(ip.ip(), port)))
     .collect()
 }
@@ -74,9 +74,7 @@ fn get_local_multicast_ip_addrs_inner(
     .into_iter()
     .filter(|ifaddr| ifaddr.is_multicast())
     .filter(|ifaddr| {
-      only_networks.map_or(true, |nets| {
-        ifaddr.ips.iter().any(|ip_net| nets.contains(&ip_net.ip()))
-      })
+      only_networks.is_none_or(|nets| ifaddr.ips.iter().any(|ip_net| nets.contains(&ip_net.ip())))
     })
     .flat_map(|ifaddr| ifaddr.ips)
     .map(|ip_net| ip_net.ip())

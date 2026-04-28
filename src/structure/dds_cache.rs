@@ -254,14 +254,16 @@ impl TopicCache {
     } else {
       // This is a new (to us) SequenceNumber, this is the default processing path.
       self.insert_sn(*instant, &cache_change);
-      self.changes.insert(*instant, cache_change).map(|old_cc| {
-        // If this happens, cache changes were created at exactly same instant.
-        // This is bad, since we are using instants as keys and assume that they
-        // are unique.
-        error!("DDSHistoryCache already contained element with key {instant:?} !!!");
-        self.remove_sn(&old_cc);
-        old_cc
-      })
+      self
+        .changes
+        .insert(*instant, cache_change)
+        .inspect(|old_cc| {
+          // If this happens, cache changes were created at exactly same instant.
+          // This is bad, since we are using instants as keys and assume that they
+          // are unique.
+          error!("DDSHistoryCache already contained element with key {instant:?} !!!");
+          self.remove_sn(old_cc);
+        })
     }
   }
 

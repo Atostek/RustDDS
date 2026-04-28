@@ -57,7 +57,7 @@ impl Data {
   pub fn deserialize_data(buffer: &Bytes, flags: BitFlags<DATA_Flags>) -> io::Result<Self> {
     let mut cursor = io::Cursor::new(&buffer);
     let endianness = endianness_flag(flags.bits());
-    let map_speedy_err = |p: Error| io::Error::new(io::ErrorKind::Other, p);
+    let map_speedy_err = |p: Error| io::Error::other(p);
 
     let _extra_flags =
       u16::read_from_stream_unbuffered_with_ctx(endianness, &mut cursor).map_err(map_speedy_err)?;

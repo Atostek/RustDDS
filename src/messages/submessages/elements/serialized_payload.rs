@@ -92,10 +92,7 @@ impl SerializedPayload {
       bytes.slice(H_LEN..)
     } else {
       warn!("DATA submessage was smaller than submessage header: {bytes:?}");
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
-        "Too short DATA submessage.",
-      ));
+      return Err(io::Error::other("Too short DATA submessage."));
     };
 
     Ok(Self {

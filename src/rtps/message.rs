@@ -63,10 +63,9 @@ impl Message {
   // endianness. TODO: The error type should be something better
   pub fn read_from_buffer(buffer: &Bytes) -> io::Result<Self> {
     // The Header deserializes the same
-    let rtps_header =
-      Header::read_from_buffer(buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let rtps_header = Header::read_from_buffer(buffer).map_err(io::Error::other)?;
     if !rtps_header.valid() {
-      return Err(io::Error::new(io::ErrorKind::Other, "Invalid RTPS header"));
+      return Err(io::Error::other("Invalid RTPS header"));
     }
     let mut message = Self::new(rtps_header);
     let mut submessages_left: Bytes = buffer.slice(20..); // header is 20 bytes

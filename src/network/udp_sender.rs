@@ -194,10 +194,7 @@ impl UDPSender {
       }
       Ok(size)
     } else {
-      io::Result::Err(io::Error::new(
-        io::ErrorKind::Other,
-        "Not a multicast address",
-      ))
+      io::Result::Err(io::Error::other("Not a multicast address"))
     }
   }
 }
