@@ -155,7 +155,7 @@ impl CryptographicBuiltin {
     properties
       .iter()
       .find(|property| property.name.eq("dds.sec.crypto.keysize"))
-      .map_or(true, |property| !property.value.eq("128"))
+      .is_none_or(|property| !property.value.eq("128"))
   }
 
   fn transformation_kind(
