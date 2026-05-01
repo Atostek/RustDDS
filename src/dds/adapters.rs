@@ -125,13 +125,17 @@ pub mod no_key {
     ///
     /// `encoding` must be something given by `supported_encodings()`, or
     /// implementation may fail with Err or `panic!()`.
-    fn from_bytes_with<S>(
-      input_bytes: &[u8],
+    ///
+    /// The input slice's lifetime is tied to the deserialization lifetime
+    /// `'de`, so adapters that produce borrowed data (zero-copy) are
+    /// supported.
+    fn from_bytes_with<'de, S>(
+      input_bytes: &'de [u8],
       encoding: RepresentationIdentifier,
       decoder: S,
     ) -> Result<D, S::Error>
     where
-      S: Decode<Self::Decoded>,
+      S: Decode<'de, Self::Decoded>,
     {
       decoder
         .decode_bytes(input_bytes, encoding)
@@ -144,7 +148,10 @@ pub mod no_key {
     ///
     /// Only usable if the adapter has a default decoder, i.e. implements
     /// `DefaultDecoder`.
-    fn from_bytes(input_bytes: &[u8], encoding: RepresentationIdentifier) -> Result<D, Self::Error>
+    fn from_bytes<'de>(
+      input_bytes: &'de [u8],
+      encoding: RepresentationIdentifier,
+    ) -> Result<D, Self::Error>
     where
       Self: DefaultDecoder<D>,
     {
@@ -158,8 +165,9 @@ pub mod no_key {
     /// Type of the default decoder.
     ///
     /// The default decoder needs to be clonable to be usable for async stream
-    /// creation (as it's needed multiple times).
-    type Decoder: Decode<Self::Decoded, Error = Self::Error> + Clone;
+    /// creation (as it's needed multiple times). It must work for any input
+    /// lifetime, hence the higher-ranked `for<'de>` bound.
+    type Decoder: for<'de> Decode<'de, Self::Decoded, Error = Self::Error> + Clone;
 
     /// The default decoder value.
     ///
@@ -168,21 +176,23 @@ pub mod no_key {
     const DECODER: Self::Decoder;
   }
 
-  /// The trait `Decode` defines a decoder object that produced a value of type
-  /// `Dec` from a slice of bytes and a [`RepresentationIdentifier`].
+  /// The trait `Decode` defines a decoder object that produces a value of type
+  /// `Decoded` from a slice of bytes and a [`RepresentationIdentifier`].
   ///
-  /// Note
-  /// that `Decoded` maps to associated type `Decoded` in
-  /// `DeserializerAdapter` , not `D`.
-  pub trait Decode<Decoded> {
+  /// Note that `Decoded` maps to associated type `Decoded` in
+  /// `DeserializerAdapter`, not `D`.
+  ///
+  /// The lifetime `'de` is the deserialization lifetime: the returned
+  /// `Decoded` value may borrow from `input_bytes` for `'de`.
+  pub trait Decode<'de, Decoded> {
     /// The decoding error type returned by [`Self::decode_bytes`].
     type Error: std::error::Error;
 
-    /// Tries to decode the given byte slice to a value of type `D` using the
-    /// given encoding.
+    /// Tries to decode the given byte slice to a value of type `Decoded`
+    /// using the given encoding.
     fn decode_bytes(
       self,
-      input_bytes: &[u8],
+      input_bytes: &'de [u8],
       encoding: RepresentationIdentifier,
     ) -> Result<Decoded, Self::Error>;
   }
@@ -242,13 +252,13 @@ pub mod with_key {
     ///
     /// `encoding` must be something given by `supported_encodings()`, or
     /// implementation may fail with Err or `panic!()`.
-    fn key_from_bytes_with<S>(
-      input_bytes: &[u8],
+    fn key_from_bytes_with<'de, S>(
+      input_bytes: &'de [u8],
       encoding: RepresentationIdentifier,
       decoder: S,
     ) -> Result<D::K, S::Error>
     where
-      S: Decode<Self::Decoded, Self::DecodedKey>,
+      S: Decode<'de, Self::Decoded, Self::DecodedKey>,
     {
       decoder
         .decode_key_bytes(input_bytes, encoding)
@@ -260,8 +270,8 @@ pub mod with_key {
     /// implementation may fail with Err or `panic!()`.
     ///
     /// Only usable if the adapter has a default decoder.
-    fn key_from_bytes(
-      input_bytes: &[u8],
+    fn key_from_bytes<'de>(
+      input_bytes: &'de [u8],
       encoding: RepresentationIdentifier,
     ) -> Result<D::K, Self::Error>
     where
@@ -280,8 +290,9 @@ pub mod with_key {
     /// Type of the default decoder.
     ///
     /// The default decoder needs to be clonable to be usable for async stream
-    /// creation (as it's needed multiple times).
-    type Decoder: Decode<Self::Decoded, Self::DecodedKey, Error = Self::Error> + Clone;
+    /// creation (as it's needed multiple times). It must work for any input
+    /// lifetime, hence the higher-ranked `for<'de>` bound.
+    type Decoder: for<'de> Decode<'de, Self::Decoded, Self::DecodedKey, Error = Self::Error> + Clone;
 
     /// The default decoder value.
     ///
@@ -290,15 +301,18 @@ pub mod with_key {
     const DECODER: Self::Decoder;
   }
 
-  /// Decodes a value of type `Dec` from a slice of bytes and a
-  /// [`RepresentationIdentifier`]. Note that `Dec` maps to associated type
-  /// `Decoded` in `DeserializerAdapter` , not `D`.
-  pub trait Decode<Dec, DecKey>: no_key::Decode<Dec> {
-    /// Tries to decode the given byte slice to a value of type `D` using the
-    /// given encoding.
+  /// Decodes a value of type `Dec` (or its key `DecKey`) from a slice of
+  /// bytes and a [`RepresentationIdentifier`]. Note that `Dec` maps to
+  /// associated type `Decoded` in `DeserializerAdapter`, not `D`.
+  ///
+  /// The lifetime `'de` is the deserialization lifetime: the returned key
+  /// may borrow from `input_key_bytes` for `'de`.
+  pub trait Decode<'de, Dec, DecKey>: no_key::Decode<'de, Dec> {
+    /// Tries to decode the given byte slice to a value of type `DecKey`
+    /// using the given encoding.
     fn decode_key_bytes(
       self,
-      input_key_bytes: &[u8],
+      input_key_bytes: &'de [u8],
       encoding: RepresentationIdentifier,
     ) -> Result<DecKey, Self::Error>;
   }

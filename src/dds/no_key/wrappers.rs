@@ -2,9 +2,7 @@ use std::{marker::PhantomData, ops::Deref};
 
 use bytes::Bytes;
 
-use crate::{
-  dds::adapters::*, messages::submessages::submessages::RepresentationIdentifier, Keyed,
-};
+use crate::{dds::adapters::*, messages::submessages::submessages::RepresentationIdentifier, Keyed};
 
 // This wrapper is used to convert NO_KEY types to WITH_KEY
 // * inside the wrapper there is a NO_KEY type
@@ -144,15 +142,15 @@ impl<NoKeyDecode> DecodeWrapper<NoKeyDecode> {
 
 // re-implement no_key::Decode<Decoded> for the wrapper also. Wrapped type
 // already does it for us.
-impl<Decoded, NoKeyDecode> no_key::Decode<Decoded> for DecodeWrapper<NoKeyDecode>
+impl<'de, Decoded, NoKeyDecode> no_key::Decode<'de, Decoded> for DecodeWrapper<NoKeyDecode>
 where
-  NoKeyDecode: no_key::Decode<Decoded>,
+  NoKeyDecode: no_key::Decode<'de, Decoded>,
 {
   type Error = NoKeyDecode::Error;
 
   fn decode_bytes(
     self,
-    input_bytes: &[u8],
+    input_bytes: &'de [u8],
     encoding: RepresentationIdentifier,
   ) -> Result<Decoded, Self::Error> {
     self.no_key.decode_bytes(input_bytes, encoding)
@@ -162,13 +160,13 @@ where
 // implement with_key::Decode<Decoded> for the wrapper.
 // The key has type `()`, so the decoded value is always `()` regardless of the
 // input bytes.
-impl<Decoded, NoKeyDecode> with_key::Decode<Decoded, ()> for DecodeWrapper<NoKeyDecode>
+impl<'de, Decoded, NoKeyDecode> with_key::Decode<'de, Decoded, ()> for DecodeWrapper<NoKeyDecode>
 where
-  NoKeyDecode: no_key::Decode<Decoded>,
+  NoKeyDecode: no_key::Decode<'de, Decoded>,
 {
   fn decode_key_bytes(
     self,
-    _input_key_bytes: &[u8],
+    _input_key_bytes: &'de [u8],
     _encoding: RepresentationIdentifier,
   ) -> Result<(), Self::Error> {
     Ok(())

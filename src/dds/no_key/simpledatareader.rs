@@ -64,7 +64,7 @@ where
 
   pub fn try_take_one_with<S>(&self, decoder: S) -> ReadResult<Option<DeserializedCacheChange<D>>>
   where
-    S: Decode<DA::Decoded> + Clone,
+    S: for<'de> Decode<'de, DA::Decoded, Error = DA::Error> + Clone,
   {
     match self
       .keyed_simpledatareader
@@ -101,7 +101,7 @@ where
     decoder: S,
   ) -> impl FusedStream<Item = ReadResult<DeserializedCacheChange<D>>> + 'a
   where
-    S: Decode<DA::Decoded> + Clone + 'a,
+    S: for<'de> Decode<'de, DA::Decoded, Error = DA::Error> + Clone + 'a,
   {
     self
       .keyed_simpledatareader
