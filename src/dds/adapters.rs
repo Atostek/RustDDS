@@ -148,10 +148,7 @@ pub mod no_key {
     ///
     /// Only usable if the adapter has a default decoder, i.e. implements
     /// `DefaultDecoder`.
-    fn from_bytes<'de>(
-      input_bytes: &'de [u8],
-      encoding: RepresentationIdentifier,
-    ) -> Result<D, Self::Error>
+    fn from_bytes(input_bytes: &[u8], encoding: RepresentationIdentifier) -> Result<D, Self::Error>
     where
       Self: DefaultDecoder<D>,
     {
@@ -270,8 +267,8 @@ pub mod with_key {
     /// implementation may fail with Err or `panic!()`.
     ///
     /// Only usable if the adapter has a default decoder.
-    fn key_from_bytes<'de>(
-      input_bytes: &'de [u8],
+    fn key_from_bytes(
+      input_bytes: &[u8],
       encoding: RepresentationIdentifier,
     ) -> Result<D::K, Self::Error>
     where

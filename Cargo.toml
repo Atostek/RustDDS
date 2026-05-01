@@ -62,7 +62,8 @@ bytes = "1.11"
 static_assertions = "1.1"
 thiserror = "2.0.9"
 # cdr-encoding = { path = "../cdr-encoding"}
-cdr-encoding = { version="0.10" }
+# cdr-encoding = { version="0.10" }
+cdr-encoding = { git = "https://github.com/iblnkn/cdr-encoding/", branch="zero-copy-byte-deserialization" }
 cdr-encoding-size = { version="^0.5" }
 futures = "0.3"
 io-extras = "0.18.0"
