@@ -167,7 +167,7 @@ where
 /// Decode type based on [`PlCdrDeserialize`] implementation.
 pub struct PlCdrDeserializer<D>(PhantomData<D>);
 
-impl<D> no_key::Decode<D> for PlCdrDeserializer<D>
+impl<'de, D> no_key::Decode<'de, D> for PlCdrDeserializer<D>
 where
   D: PlCdrDeserialize,
 {
@@ -175,7 +175,7 @@ where
 
   fn decode_bytes(
     self,
-    input_bytes: &[u8],
+    input_bytes: &'de [u8],
     encoding: RepresentationIdentifier,
   ) -> Result<D, Self::Error> {
     match encoding {
@@ -189,14 +189,14 @@ where
   }
 }
 
-impl<Dec, DecKey> with_key::Decode<Dec, DecKey> for PlCdrDeserializer<Dec>
+impl<'de, Dec, DecKey> with_key::Decode<'de, Dec, DecKey> for PlCdrDeserializer<Dec>
 where
   Dec: PlCdrDeserialize,
   DecKey: PlCdrDeserialize,
 {
   fn decode_key_bytes(
     self,
-    input_bytes: &[u8],
+    input_bytes: &'de [u8],
     encoding: RepresentationIdentifier,
   ) -> Result<DecKey, Self::Error> {
     match encoding {

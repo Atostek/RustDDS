@@ -135,11 +135,12 @@ where
   }
 }
 
-/// A default decoder is available for all types that implement
-/// `serde::Deserialize`.
-impl<'de, D> no_key::DefaultDecoder<D> for CDRDeserializerAdapter<D>
+/// A default decoder is available for all owned types that implement
+/// `serde::Deserialize`. Borrowing types use `from_bytes_with` with an
+/// explicit decoder instead.
+impl<D> no_key::DefaultDecoder<D> for CDRDeserializerAdapter<D>
 where
-  D: serde::Deserialize<'de>,
+  D: DeserializeOwned,
 {
   type Decoder = CdrDeserializeDecoder<D>;
   const DECODER: Self::Decoder = CdrDeserializeDecoder(PhantomData);
@@ -157,25 +158,25 @@ where
 /// Decode type based on a `serde::Deserialize` implementation.
 pub struct CdrDeserializeDecoder<D>(PhantomData<D>);
 
-impl<'de, D> no_key::Decode<D> for CdrDeserializeDecoder<D>
+impl<'de, D> no_key::Decode<'de, D> for CdrDeserializeDecoder<D>
 where
   D: serde::Deserialize<'de>,
 {
   type Error = Error;
 
-  fn decode_bytes(self, input_bytes: &[u8], encoding: RepresentationIdentifier) -> Result<D> {
+  fn decode_bytes(self, input_bytes: &'de [u8], encoding: RepresentationIdentifier) -> Result<D> {
     deserialize_from_cdr_with_decoder_and_rep_id(input_bytes, encoding, PhantomData).map(|r| r.0)
   }
 }
 
-impl<Dec, DecKey> with_key::Decode<Dec, DecKey> for CdrDeserializeDecoder<Dec>
+impl<'de, Dec, DecKey> with_key::Decode<'de, Dec, DecKey> for CdrDeserializeDecoder<Dec>
 where
-  Dec: DeserializeOwned,
-  DecKey: DeserializeOwned,
+  Dec: serde::Deserialize<'de>,
+  DecKey: serde::Deserialize<'de>,
 {
   fn decode_key_bytes(
     self,
-    input_key_bytes: &[u8],
+    input_key_bytes: &'de [u8],
     encoding: RepresentationIdentifier,
   ) -> Result<DecKey> {
     deserialize_from_cdr_with_decoder_and_rep_id(input_key_bytes, encoding, PhantomData)
@@ -210,26 +211,27 @@ where
 }
 
 /// Decode type based on a [`serde::de::DeserializeSeed`]-based decoder.
-impl<'de, D, S, SK> no_key::Decode<D> for CdrDeserializeSeedDecoder<S, SK>
+impl<'de, D, S, SK> no_key::Decode<'de, D> for CdrDeserializeSeedDecoder<S, SK>
 where
   S: serde::de::DeserializeSeed<'de, Value = D>,
 {
   type Error = Error;
 
-  fn decode_bytes(self, input_bytes: &[u8], encoding: RepresentationIdentifier) -> Result<D> {
+  fn decode_bytes(self, input_bytes: &'de [u8], encoding: RepresentationIdentifier) -> Result<D> {
     deserialize_from_cdr_with_decoder_and_rep_id(input_bytes, encoding, self.value_seed)
       .map(|r| r.0)
   }
 }
 
-impl<'de, Dec, DecKey, S, SK> with_key::Decode<Dec, DecKey> for CdrDeserializeSeedDecoder<S, SK>
+impl<'de, Dec, DecKey, S, SK> with_key::Decode<'de, Dec, DecKey>
+  for CdrDeserializeSeedDecoder<S, SK>
 where
   S: serde::de::DeserializeSeed<'de, Value = Dec>,
   SK: serde::de::DeserializeSeed<'de, Value = DecKey>,
 {
   fn decode_key_bytes(
     self,
-    input_key_bytes: &[u8],
+    input_key_bytes: &'de [u8],
     encoding: RepresentationIdentifier,
   ) -> Result<DecKey> {
     deserialize_from_cdr_with_decoder_and_rep_id(input_key_bytes, encoding, self.key_seed)
@@ -241,7 +243,7 @@ where
 ///
 /// Returns deserialized object. Byte count is discarded.
 pub fn deserialize_from_cdr_with_rep_id<'de, T>(
-  input_bytes: &[u8],
+  input_bytes: &'de [u8],
   encoding: RepresentationIdentifier,
 ) -> Result<(T, usize)>
 where
@@ -254,7 +256,7 @@ where
 ///
 /// Returns deserialized object and byte count of stream consumed.
 pub fn deserialize_from_cdr_with_decoder_and_rep_id<'de, S>(
-  input_bytes: &[u8],
+  input_bytes: &'de [u8],
   encoding: RepresentationIdentifier,
   decoder: S,
 ) -> Result<(S::Value, usize)>
