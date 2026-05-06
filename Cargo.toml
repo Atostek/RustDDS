@@ -118,4 +118,4 @@ termion = "4.0.2"
 
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-procfs = "0.17" # for ddsperf
+procfs = "0.18" # for ddsperf
