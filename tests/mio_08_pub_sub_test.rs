@@ -90,7 +90,7 @@ fn mio_08_pub_sub_test_main() {
         READER_READY => loop {
           if let Ok(Some(sample)) = reader.take_next_sample() {
             receive_count += 1;
-            println!("Received message {}", &sample.value().clone().id);
+            println!("Received message {}", sample.value().clone().id);
             // completely arbitrary limit here
             if receive_count > 5 {
               println!("Received enough");

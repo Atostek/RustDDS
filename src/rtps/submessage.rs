@@ -280,11 +280,11 @@ impl Submessage {
         if kind >= 0x80 {
           // Kinds 0x80 - 0xFF are vendor-specific.
           trace!("Received vendor-specific submessage kind {unknown_kind:?}");
-          trace!("Submessage was {:?}", &sub_buffer);
+          trace!("Submessage was {:?}", sub_buffer);
         } else {
           // Kind is 0x00 - 0x7F, it should be in the standard.
           info!("Received unknown submessage kind {unknown_kind:?}");
-          debug!("Submessage was {:?}", &sub_buffer);
+          debug!("Submessage was {:?}", sub_buffer);
         }
         Ok(None)
       }

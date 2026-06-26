@@ -1110,7 +1110,7 @@ impl Writer {
           if unsent_sn < first_available {
             info!(
               "Reader {:?} requested too old data {:?}. I have only from {:?}. Topic {:?}",
-              &reader_proxy, unsent_sn, first_available, &self.my_topic_name
+              reader_proxy, unsent_sn, first_available, self.my_topic_name
             );
           } else {
             // we are running out of excuses
@@ -1460,9 +1460,9 @@ impl Writer {
           info!(
             "Matched new remote reader on topic={:?} reader={:?}",
             self.topic_name(),
-            &reader_proxy.remote_reader_guid
+            reader_proxy.remote_reader_guid
           );
-          debug!("Reader details: {:?}", &reader_proxy);
+          debug!("Reader details: {:?}", reader_proxy);
         }
       }
       Some(bad_policy_id) => {
@@ -1543,7 +1543,7 @@ impl Writer {
       info!(
         "reader_lost topic={:?} reader={:?}",
         self.topic_name(),
-        &guid
+        guid
       );
       self.matched_reader_remove(guid);
       // self.matched_readers_count_total -= 1; // this never decreases

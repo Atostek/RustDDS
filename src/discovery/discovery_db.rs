@@ -152,7 +152,7 @@ impl DiscoveryDB {
 
   // Returns if participant was previously unknown
   pub fn update_participant(&mut self, data: &SpdpDiscoveredParticipantData) -> bool {
-    debug!("update_participant: {:?}", &data);
+    debug!("update_participant: {:?}", data);
     let guid = data.participant_guid;
 
     // sanity check
@@ -174,7 +174,7 @@ impl DiscoveryDB {
 
     let mut new_participant = false;
     if !self.participant_proxies.contains_key(&guid.prefix) {
-      info!("New remote participant: {:?}", &data);
+      info!("New remote participant: {:?}", data);
       new_participant = true;
       if guid == self.my_guid {
         info!("Remote participant {guid:?} is myself, but some reflection is good.");
@@ -553,7 +553,7 @@ impl DiscoveryDB {
     updater: GUID,
     discovered_via: DiscoveredVia,
   ) {
-    trace!("Update topic data: {:?}", &dtd);
+    trace!("Update topic data: {:?}", dtd);
     let topic_name = dtd.topic_data.name.clone();
     let mut notify = false;
     let mut inconsistency_event_to_send = None;
@@ -571,7 +571,7 @@ impl DiscoveryDB {
           } else {
             debug!(
               "Topic {:?} update ignored from {:?}. Already have this.",
-              &topic_name, &updater
+              topic_name, updater
             );
             // TODO: Here we could warn about QoS changes.
             //

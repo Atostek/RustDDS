@@ -946,7 +946,7 @@ impl Discovery {
   pub fn spdp_receive(&mut self) {
     loop {
       let s = self.dcps_participant.reader.take_next_sample();
-      debug!("spdp_receive read {:?}", &s);
+      debug!("spdp_receive read {:?}", s);
       match s {
         Ok(Some(ds)) => {
           #[cfg(not(feature = "security"))]
@@ -971,7 +971,7 @@ impl Discovery {
           if permission == NormalDiscoveryPermission::Allow {
             match ds.value {
               Sample::Value(participant_data) => {
-                debug!("spdp_receive discovered {:?}", &participant_data);
+                debug!("spdp_receive discovered {:?}", participant_data);
                 self.process_discovered_participant_data(&participant_data);
               }
               // Sample::Dispose means that DomainParticipant was disposed
@@ -1145,7 +1145,7 @@ impl Discovery {
             let drd = discovery_db_write(&self.discovery_db).update_subscription(&d);
             debug!(
               "sedp_receive_subscription - send_discovery_notification ReaderUpdated  {:?}",
-              &drd
+              drd
             );
             self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
               discovered_reader_data: drd,
@@ -1215,13 +1215,13 @@ impl Discovery {
       if permission == NormalDiscoveryPermission::Allow {
         match d {
           Sample::Value(dwd) => {
-            trace!("sedp_receive_publication discovered {:?}", &dwd);
+            trace!("sedp_receive_publication discovered {:?}", dwd);
             let discovered_writer_data =
               discovery_db_write(&self.discovery_db).update_publication(&dwd);
             self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
               discovered_writer_data,
             });
-            debug!("Discovered Writer {:?}", &dwd);
+            debug!("Discovered Writer {:?}", dwd);
           }
           Sample::Dispose(writer_key) => {
             discovery_db_write(&self.discovery_db).remove_topic_writer(writer_key);
@@ -1282,7 +1282,7 @@ impl Discovery {
       if permission == NormalDiscoveryPermission::Allow {
         match t {
           Sample::Value((topic_data, writer)) => {
-            debug!("sedp_receive_topic_data discovered {:?}", &topic_data);
+            debug!("sedp_receive_topic_data discovered {:?}", topic_data);
             discovery_db_write(&self.discovery_db).update_topic_data(
               &topic_data,
               writer,
@@ -1299,7 +1299,7 @@ impl Discovery {
             // checks.
             let writers = discovery_db_read(&self.discovery_db)
               .writers_on_topic_and_participant(topic_data.topic_name(), writer.prefix);
-            debug!("writers {:?}", &writers);
+            debug!("writers {:?}", writers);
             for discovered_writer_data in writers {
               self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
                 discovered_writer_data,
@@ -1316,7 +1316,7 @@ impl Discovery {
           }
           // Sample::Dispose means disposed
           Sample::Dispose(key) => {
-            warn!("not implemented - Topic was disposed: {:?}", &key);
+            warn!("not implemented - Topic was disposed: {:?}", key);
           }
         }
       }

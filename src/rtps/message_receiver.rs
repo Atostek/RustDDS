@@ -231,10 +231,10 @@ impl MessageReceiver {
       {
         // TODO: Add some sensible ping message handling here.
         info!("Received RTPS PING. Do not know how to respond.");
-        debug!("Data was {:?}", &msg_bytes);
+        debug!("Data was {:?}", msg_bytes);
       } else {
         warn!("Message is shorter than RTPS header. Cannot deserialize.");
-        debug!("Data was {:?}", &msg_bytes);
+        debug!("Data was {:?}", msg_bytes);
       }
       return;
     }

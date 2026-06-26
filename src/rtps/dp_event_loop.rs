@@ -321,7 +321,7 @@ impl DPEventLoop {
                   .get_mut(&event.token())
                   .map_or_else(
                     || {
-                      error!("No listener with token {:?}", &event.token());
+                      error!("No listener with token {:?}", event.token());
                       vec![]
                     },
                     UDPListener::messages,
@@ -676,7 +676,7 @@ impl DPEventLoop {
   fn remote_participant_lost(&mut self, participant_guid_prefix: GuidPrefix) {
     info!(
       "remote_participant_lost guid_prefix={:?}",
-      &participant_guid_prefix
+      participant_guid_prefix
     );
     // Discovery has already removed Participant from Discovery DB
     // Now we have to remove any ReaderProxies and WriterProxies belonging
@@ -1250,7 +1250,7 @@ mod tests {
       };
 
       reader_guids.push(new_reader_ing.guid);
-      info!("\nSent reader number {}: {:?}\n", i, &new_reader_ing);
+      info!("\nSent reader number {}: {:?}\n", i, new_reader_ing);
       sender_add_reader.send(new_reader_ing).unwrap();
       std::thread::sleep(Duration::new(0, 100));
     }

@@ -185,7 +185,7 @@ impl FragmentAssembler {
         let serialized_data_or_key =
           SerializedPayload::from_bytes(&assembly_buffer.buffer_bytes.freeze()).map_or_else(
             |e| {
-              error!("Deserializing SerializedPayload from DATAFRAG: {:?}", &e);
+              error!("Deserializing SerializedPayload from DATAFRAG: {:?}", e);
               None
             },
             Some,

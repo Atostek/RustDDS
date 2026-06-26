@@ -313,7 +313,7 @@ fn main() {
     y_vel = r.2;
 
     // write to DDS
-    trace!("Writing shape color {}", &color);
+    trace!("Writing shape color {color}");
     match writer_opt {
       Some(ref mut writer) => {
         let now = Instant::now();

@@ -430,7 +430,7 @@ impl Reader {
         warn!("update_writer_proxy - QoS mismatch {bad_policy_id:?}");
         info!(
           "update_writer_proxy - QoS mismatch: topic={:?} requested={:?}  offered={:?}",
-          self.topic_name, &self.qos_policy, offered_qos
+          self.topic_name, self.qos_policy, offered_qos
         );
       }
     }
@@ -538,7 +538,7 @@ impl Reader {
       data.inline_qos.as_ref().and_then(|inline_qos_parameters| {
         InlineQos::related_sample_identity(inline_qos_parameters, representation_identifier)
           .unwrap_or_else(|e| {
-            error!("Deserializing related_sample_identity: {:?}", &e);
+            error!("Deserializing related_sample_identity: {:?}", e);
             None
           })
       })
@@ -604,7 +604,7 @@ impl Reader {
         .and_then(|inline_qos_parameters| {
           InlineQos::related_sample_identity(inline_qos_parameters, representation_identifier)
             .unwrap_or_else(|e| {
-              error!("Deserializing related_sample_identity: {:?}", &e);
+              error!("Deserializing related_sample_identity: {:?}", e);
               None
             })
         })
@@ -698,7 +698,7 @@ impl Reader {
   ) {
     trace!(
       "handle_data_msg from {:?} seq={:?} topic={:?} reliability={:?} stateless={:?}",
-      &writer_guid,
+      writer_guid,
       writer_sn,
       self.topic_name,
       self.reliability,
@@ -786,7 +786,7 @@ impl Reader {
         // about
         let key_hash = if let Some(h) = data.inline_qos.as_ref().and_then(|inline_qos_parameters| {
           InlineQos::key_hash(inline_qos_parameters).unwrap_or_else(|e| {
-            error!("Deserializing key_hash: {:?}", &e);
+            error!("Deserializing key_hash: {:?}", e);
             None
           })
         }) {
@@ -1156,7 +1156,7 @@ impl Reader {
     match inline_qos.as_ref().and_then(|inline_qos_parameters| {
       InlineQos::status_info(inline_qos_parameters, representation_identifier).map_or_else(
         |e| {
-          error!("Deserializing status_info: {:?}", &e);
+          error!("Deserializing status_info: {:?}", e);
           None
         },
         Some,
@@ -1412,7 +1412,7 @@ impl Reader {
     self.topic_cache.lock().unwrap_or_else(|e| {
       panic!(
         "The topic cache of topic {} is poisoned. Error: {}",
-        &self.topic_name, e
+        self.topic_name, e
       )
     })
   }

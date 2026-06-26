@@ -591,13 +591,13 @@ mod tests {
           let sdata = participant_data
             .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
             .unwrap();
-          eprintln!("message data = {:?}", &data);
+          eprintln!("message data = {:?}", data);
           eprintln!(
             "payload    = {:?}",
-            &d.unwrap_serialized_payload_value().to_vec()
+            d.unwrap_serialized_payload_value().to_vec()
           );
-          eprintln!("deserialized  = {:?}", &participant_data);
-          eprintln!("serialized = {:?}", &sdata);
+          eprintln!("deserialized  = {:?}", participant_data);
+          eprintln!("serialized = {:?}", sdata);
           // order cannot be known at this point
           // assert_eq!(
           //  sdata.len(),
@@ -611,7 +611,7 @@ mod tests {
           // but stamped during deserialization
           participant_data_2.updated_time = participant_data.updated_time;
 
-          eprintln!("again deserialized = {:?}", &participant_data_2);
+          eprintln!("again deserialized = {:?}", participant_data_2);
           let _sdata_2 = participant_data
             .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
             .unwrap();
@@ -648,12 +648,12 @@ mod tests {
               &d.unwrap_serialized_payload_value(),
               RepresentationIdentifier::PL_CDR_LE,
             );
-          eprintln!("message data = {:?}", &data);
+          eprintln!("message data = {:?}", data);
           eprintln!(
             "payload    = {:?}",
-            &d.unwrap_serialized_payload_value().to_vec()
+            d.unwrap_serialized_payload_value().to_vec()
           );
-          eprintln!("deserialized  = {:?}", &participant_data);
+          eprintln!("deserialized  = {:?}", participant_data);
         }
         SubmessageBody::Interpreter(_) => (),
         _ => continue,
@@ -684,12 +684,12 @@ mod tests {
               &d.unwrap_serialized_payload_value(),
               RepresentationIdentifier::PL_CDR_LE,
             );
-          eprintln!("message data = {:?}", &data);
+          eprintln!("message data = {:?}", data);
           eprintln!(
             "payload    = {:?}",
-            &d.unwrap_serialized_payload_value().to_vec()
+            d.unwrap_serialized_payload_value().to_vec()
           );
-          eprintln!("deserialized  = {:?}", &participant_data);
+          eprintln!("deserialized  = {:?}", participant_data);
         }
 
         SubmessageBody::Interpreter(_) => (),
@@ -729,12 +729,12 @@ mod tests {
               &d.unwrap_serialized_payload_value(),
               RepresentationIdentifier::PL_CDR_LE,
             );
-          eprintln!("message data = {:?}", &data);
+          eprintln!("message data = {:?}", data);
           eprintln!(
             "payload    = {:?}",
-            &d.unwrap_serialized_payload_value().to_vec()
+            d.unwrap_serialized_payload_value().to_vec()
           );
-          eprintln!("deserialized  = {:?}", &participant_data);
+          eprintln!("deserialized  = {:?}", participant_data);
         }
         SubmessageBody::Interpreter(_) => (),
         _ => continue,

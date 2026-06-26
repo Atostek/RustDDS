@@ -433,7 +433,7 @@ where
     self.topic_cache.lock().unwrap_or_else(|e| {
       panic!(
         "The topic cache of topic {} is poisoned. Error: {}",
-        &self.my_topic.name(),
+        self.my_topic.name(),
         e
       )
     })
