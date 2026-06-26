@@ -143,6 +143,10 @@ The DDS specification specifies manual memory management in the sense that many 
 
 # Release history
 
+## Version 0.12.0
+* Upgrade to `cdr-encoding`  v 0.11, which has an breaking API change from the previous version. This adds support for borrowing (zero-copy) deserialization.
+
+
 ## Version 0.11.0
 * `DataReaderStream` sample stream now returns full `DataSample`, including sample metadata 
 (`SampleInfo`). The old version returned only bare data value. You can access the old (simpler and faster) async stream as `BareDataReaderStream`.

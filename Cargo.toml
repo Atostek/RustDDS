@@ -1,6 +1,6 @@
 [package]
 name = "rustdds"
-version = "0.11.9" 
+version = "0.12.0" 
 authors = ["Juhana Helovuo <juhana.helovuo@atostek.com>",
   "Oiva Moisio <oiva.moisio@atostek.com>",
   "Miska Melkinen <miska.melkinen@atostek.com>",
@@ -61,9 +61,8 @@ socket2 = { version = "0.6", features = ["all"] }
 bytes = "1.11"
 static_assertions = "1.1"
 thiserror = "2.0.9"
-cdr-encoding = { path = "../cdr-encoding"}
-# cdr-encoding = { version="0.11" }
-# cdr-encoding = {  }
+# cdr-encoding = { path = "../cdr-encoding", version="0.11" }
+cdr-encoding = { version="0.11" }
 cdr-encoding-size = { version="^0.5" }
 futures = "0.3"
 io-extras = "0.18.0"
