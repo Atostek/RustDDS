@@ -23,7 +23,7 @@ use crate::{
   },
   messages::submessages::submessages::AckSubmessage,
   network::{udp_listener::UDPListener, udp_sender::UDPSender},
-  polling::new_simple_timer,
+  polling::{new_shared_timer, SharedTimer},
   //qos::HasQoSPolicy,
   rtps::{
     constant::*,
@@ -31,6 +31,7 @@ use crate::{
     reader::{Reader, ReaderIngredients},
     rtps_reader_proxy::RtpsReaderProxy,
     rtps_writer_proxy::RtpsWriterProxy,
+    timed_event::DpTimerEvent,
     writer::{Writer, WriterIngredients},
   },
   structure::{
@@ -89,6 +90,11 @@ pub struct DPEventLoop {
 
   writers: HashMap<EntityId, Writer>,
   udp_sender: Rc<UDPSender>,
+
+  // One timer shared by all Readers, Writers and the periodic loop tasks.
+  // Endpoints hold cloned handles to schedule timeouts; the loop owns it,
+  // registers it once and drains it. This replaces one OS thread per timer.
+  shared_timer: SharedTimer<DpTimerEvent>,
 
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
@@ -194,6 +200,24 @@ impl DPEventLoop {
       )
       .expect("Failed to register reader update notification.");
 
+    // The single shared timer for this event loop. Register it once here and
+    // seed the periodic loop tasks. Reader/Writer timeouts are scheduled later
+    // through cloned handles passed into Reader::new / Writer::new.
+    let shared_timer = new_shared_timer::<DpTimerEvent>();
+    poll
+      .register(
+        &*shared_timer.borrow(),
+        DPEV_TIMER_TOKEN,
+        Ready::readable(),
+        PollOpt::edge(),
+      )
+      .expect("Failed to register dp_event_loop shared timer");
+    {
+      let mut t = shared_timer.borrow_mut();
+      t.set_timeout(PREEMPTIVE_ACKNACK_PERIOD, DpTimerEvent::PreemptiveAcknack);
+      t.set_timeout(CACHE_CLEAN_PERIOD, DpTimerEvent::CacheGc);
+    }
+
     // port number 0 means OS chooses an available port number.
     let udp_sender = UDPSender::new_with_networks(0, only_networks.as_deref())
       .expect("UDPSender construction fail"); // TODO
@@ -222,6 +246,7 @@ impl DPEventLoop {
       remove_writer_receiver,
       stop_poll_receiver,
       writers: HashMap::new(),
+      shared_timer,
       ack_nack_receiver: acknack_receiver,
       discovery_update_notification_receiver,
       participant_status_sender,
@@ -232,30 +257,8 @@ impl DPEventLoop {
   pub fn event_loop(self) {
     let mut events = Events::with_capacity(16); // too small capacity just delays events to next poll
 
-    let mut acknack_timer = new_simple_timer();
-    acknack_timer.set_timeout(PREEMPTIVE_ACKNACK_PERIOD, ());
-
-    let mut cache_gc_timer = new_simple_timer();
-    cache_gc_timer.set_timeout(CACHE_CLEAN_PERIOD, ());
-
-    self
-      .poll
-      .register(
-        &acknack_timer,
-        DPEV_ACKNACK_TIMER_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      )
-      .unwrap();
-    self
-      .poll
-      .register(
-        &cache_gc_timer,
-        DPEV_CACHE_CLEAN_TIMER_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      )
-      .unwrap();
+    // The shared timer (carrying preemptive-ACKNACK and cache-GC seeds, plus all
+    // per-endpoint timeouts) was created, registered and seeded in `new()`.
     let mut poll_alive = Instant::now();
     let mut ev_wrapper = self;
     let mut preparing_to_stop = false;
@@ -380,14 +383,53 @@ impl DPEventLoop {
                   }
                 }
               }
-              DPEV_ACKNACK_TIMER_TOKEN => {
-                ev_wrapper.message_receiver.send_preemptive_acknacks();
-                acknack_timer.set_timeout(PREEMPTIVE_ACKNACK_PERIOD, ());
-              }
-              DPEV_CACHE_CLEAN_TIMER_TOKEN => {
-                debug!("Clean DDSCache on timer");
-                ev_wrapper.dds_cache.write().unwrap().garbage_collect();
-                cache_gc_timer.set_timeout(CACHE_CLEAN_PERIOD, ());
+              DPEV_TIMER_TOKEN => {
+                // Drain all expired timeouts while holding a single borrow, then
+                // release it before dispatching (handlers re-borrow the timer to
+                // reschedule, so we must not hold the borrow across dispatch).
+                let expired: Vec<DpTimerEvent> = {
+                  let mut timer = ev_wrapper.shared_timer.borrow_mut();
+                  let mut v = Vec::new();
+                  while let Some(e) = timer.poll() {
+                    v.push(e);
+                  }
+                  v
+                };
+                for timed_event in expired {
+                  match timed_event {
+                    DpTimerEvent::PreemptiveAcknack => {
+                      ev_wrapper.message_receiver.send_preemptive_acknacks();
+                      ev_wrapper
+                        .shared_timer
+                        .borrow_mut()
+                        .set_timeout(PREEMPTIVE_ACKNACK_PERIOD, DpTimerEvent::PreemptiveAcknack);
+                    }
+                    DpTimerEvent::CacheGc => {
+                      debug!("Clean DDSCache on timer");
+                      ev_wrapper.dds_cache.write().unwrap().garbage_collect();
+                      ev_wrapper
+                        .shared_timer
+                        .borrow_mut()
+                        .set_timeout(CACHE_CLEAN_PERIOD, DpTimerEvent::CacheGc);
+                    }
+                    DpTimerEvent::Reader { entity_id, event } => {
+                      // A stale timeout for an already-removed reader is harmless.
+                      if let Some(reader) = ev_wrapper.message_receiver.reader_mut(entity_id) {
+                        reader.handle_timed_event(event);
+                      } else if !preparing_to_stop {
+                        trace!("Timed event for unknown reader {entity_id:?}");
+                      }
+                    }
+                    DpTimerEvent::Writer { entity_id, event } => {
+                      // A stale timeout for an already-removed writer is harmless.
+                      if let Some(writer) = ev_wrapper.writers.get_mut(&entity_id) {
+                        writer.handle_timed_event(event);
+                      } else if !preparing_to_stop {
+                        trace!("Timed event for unknown writer {entity_id:?}");
+                      }
+                    }
+                  }
+                }
               }
 
               fixed_unknown => {
@@ -435,15 +477,12 @@ impl DPEventLoop {
               }
             }
 
-            // Timed Actions
+            // Timed actions used to be routed here via per-endpoint "alt entity"
+            // timer tokens. All timeouts now arrive through the single shared
+            // timer (DPEV_TIMER_TOKEN), so no alt-entity tokens are registered
+            // anymore. This arm should therefore be unreachable.
             TokenDecode::AltEntity(eid) => {
-              if eid.kind().is_reader() {
-                ev_wrapper.handle_reader_timed_event(eid);
-              } else if eid.kind().is_writer() {
-                ev_wrapper.handle_writer_timed_event(eid);
-              } else {
-                error!("AltEntity Event for unknown EntityKind {eid:?}");
-              }
+              error!("Unexpected AltEntity timer event for {eid:?} - all timers are now shared");
             }
           }
         } // for
@@ -498,25 +537,6 @@ impl DPEventLoop {
         }
       }
       other => error!("Expected writer action token, got {other:?}"),
-    }
-  }
-
-  /// Writer timed events can be heartbeats or cache cleaning events.
-  /// events are distinguished by TimerMessageType which is send via mio
-  /// channel. Channel token in
-  fn handle_writer_timed_event(&mut self, entity_id: EntityId) {
-    if let Some(writer) = self.writers.get_mut(&entity_id) {
-      writer.handle_timed_event();
-    } else {
-      error!("Writer was not found with {entity_id:?}");
-    }
-  }
-
-  fn handle_reader_timed_event(&mut self, entity_id: EntityId) {
-    if let Some(reader) = self.message_receiver.reader_mut(entity_id) {
-      reader.handle_timed_event();
-    } else {
-      error!("Reader was not found with {entity_id:?}");
     }
   }
 
@@ -881,21 +901,12 @@ impl DPEventLoop {
   }
 
   fn add_local_reader(&mut self, reader_ing: ReaderIngredients) {
-    let timer = new_simple_timer();
-    self
-      .poll
-      .register(
-        &timer,
-        reader_ing.alt_entity_token(),
-        Ready::readable(),
-        PollOpt::edge(),
-      )
-      .expect("Reader timer channel registration failed!");
-
+    // The reader schedules its timeouts on the loop's shared timer (already
+    // registered in `new()`), so there is no per-reader timer to register.
     let mut new_reader = Reader::new(
       reader_ing,
       self.udp_sender.clone(),
-      timer,
+      self.shared_timer.clone(),
       self.participant_status_sender.clone(),
     );
 
@@ -917,10 +928,9 @@ impl DPEventLoop {
 
   fn remove_local_reader(&mut self, reader_guid: GUID) {
     if let Some(old_reader) = self.message_receiver.remove_reader(reader_guid) {
-      self
-        .poll
-        .deregister(&old_reader.timed_event_timer)
-        .unwrap_or_else(|e| error!("Cannot deregister Reader timed_event_timer: {e:?}"));
+      // Note: the timer is shared and stays registered for the lifetime of the
+      // loop, so there is nothing per-reader to deregister here. Any timeout
+      // already scheduled for this reader is ignored on dispatch (lookup miss).
       self
         .poll
         .deregister(&old_reader.data_reader_command_receiver)
@@ -944,21 +954,12 @@ impl DPEventLoop {
   }
 
   fn add_local_writer(&mut self, writer_ing: WriterIngredients) {
-    let timer = new_simple_timer();
-    self
-      .poll
-      .register(
-        &timer,
-        writer_ing.alt_entity_token(),
-        Ready::readable(),
-        PollOpt::edge(),
-      )
-      .expect("Writer heartbeat timer channel registration failed!!");
-
+    // The writer schedules its timeouts on the loop's shared timer (already
+    // registered in `new()`), so there is no per-writer timer to register.
     let new_writer = Writer::new(
       writer_ing,
       self.udp_sender.clone(),
-      timer,
+      self.shared_timer.clone(),
       self.participant_status_sender.clone(),
     );
 
@@ -981,10 +982,9 @@ impl DPEventLoop {
         .poll
         .deregister(&w.writer_command_receiver)
         .unwrap_or_else(|e| error!("Deregister fail (writer command rec) {e:?}"));
-      self
-        .poll
-        .deregister(&w.timed_event_timer)
-        .unwrap_or_else(|e| error!("Deregister fail (writer timer) {e:?}"));
+      // The timer is shared and stays registered for the loop's lifetime; there
+      // is nothing per-writer to deregister. Stale timeouts are ignored on
+      // dispatch (lookup miss).
 
       #[cfg(feature = "security")]
       if let Some(plugins_handle) = self.security_plugins_opt.as_ref() {

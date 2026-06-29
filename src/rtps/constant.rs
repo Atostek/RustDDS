@@ -263,8 +263,20 @@ pub const DISCOVERY_TOPIC_CLEANUP_TOKEN: Token = Token(38 + PTB);
 pub const DISCOVERY_PARTICIPANT_MESSAGE_TOKEN: Token = Token(40 + PTB);
 pub const DISCOVERY_PARTICIPANT_MESSAGE_TIMER_TOKEN: Token = Token(41 + PTB);
 
+// Single shared timer for the whole discovery event loop. All periodic
+// discovery tasks (SPDP publish, participant/topic cleanup, participant message
+// publish, secure message resend) fire through this one timer (one background
+// thread), replacing the former per-topic and per-task timers.
+pub const DISCOVERY_TIMER_TOKEN: Token = Token(42 + PTB);
+
 pub const DPEV_ACKNACK_TIMER_TOKEN: Token = Token(45 + PTB);
 pub const DPEV_CACHE_CLEAN_TIMER_TOKEN: Token = Token(46 + PTB);
+
+// Single shared timer for the whole dp_event_loop. All Reader/Writer timeouts
+// plus the periodic preemptive-ACKNACK and DDSCache GC timeouts fire through
+// this one timer (and thus one background thread), replacing the former
+// per-endpoint timers and the separate acknack/cache-clean timers.
+pub const DPEV_TIMER_TOKEN: Token = Token(47 + PTB);
 
 pub const SECURE_DISCOVERY_PARTICIPANT_DATA_TOKEN: Token = Token(50 + PTB);
 // pub const DISCOVERY_PARTICIPANT_CLEANUP_TOKEN: Token = Token(51 + PTB);

@@ -8,7 +8,7 @@ use std::{
 };
 
 use mio_06::Token;
-use mio_extras::{channel as mio_channel, timer::Timer};
+use mio_extras::channel as mio_channel;
 use log::{debug, error, info, trace, warn};
 use enumflags2::BitFlags;
 use speedy::{Endianness, Writable};
@@ -39,9 +39,10 @@ use crate::{
   },
   mio_source,
   network::udp_sender::UDPSender,
+  polling::SharedTimer,
   rtps::{
     fragment_assembler::FragmentAssembler, message_receiver::MessageReceiverState,
-    rtps_writer_proxy::RtpsWriterProxy, Message,
+    rtps_writer_proxy::RtpsWriterProxy, timed_event::DpTimerEvent, Message,
   },
   structure::{
     cache_change::{CacheChange, ChangeKind},
@@ -82,12 +83,6 @@ pub(crate) struct ReaderIngredients {
   pub(crate) poll_event_sender: mio_source::PollEventSender,
 
   pub(crate) security_plugins: Option<SecurityPluginsHandle>,
-}
-
-impl ReaderIngredients {
-  pub fn alt_entity_token(&self) -> Token {
-    self.guid.entity_id.as_alt_token()
-  }
 }
 
 impl fmt::Debug for ReaderIngredients {
@@ -142,7 +137,7 @@ pub(crate) struct Reader {
   requested_deadline_missed_count: i32,
   offered_incompatible_qos_count: i32,
 
-  pub(crate) timed_event_timer: Timer<TimedEvent>,
+  pub(crate) timed_event_timer: SharedTimer<DpTimerEvent>,
   pub(crate) data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
   data_reader_waker: Arc<Mutex<Option<Waker>>>,
   poll_event_sender: mio_source::PollEventSender,
@@ -163,7 +158,7 @@ impl Reader {
   pub(crate) fn new(
     i: ReaderIngredients,
     udp_sender: Rc<UDPSender>,
-    timed_event_timer: Timer<TimedEvent>,
+    timed_event_timer: SharedTimer<DpTimerEvent>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
   ) -> Self {
     // Verify that the topic cache corresponds to the topic of the Reader
@@ -231,9 +226,13 @@ impl Reader {
         self.my_guid,
         deadline.0.to_std()
       );
-      self
-        .timed_event_timer
-        .set_timeout(deadline.0.to_std(), TimedEvent::DeadlineMissedCheck);
+      self.timed_event_timer.borrow_mut().set_timeout(
+        deadline.0.to_std(),
+        DpTimerEvent::Reader {
+          entity_id: self.my_guid.entity_id,
+          event: TimedEvent::DeadlineMissedCheck,
+        },
+      );
     } else {
       trace!(
         "GUID={:?} - no deadline policy - do not set set_requested_deadline_check_timer",
@@ -309,13 +308,13 @@ impl Reader {
     changes
   } // fn
 
-  pub fn handle_timed_event(&mut self) {
-    while let Some(e) = self.timed_event_timer.poll() {
-      match e {
-        TimedEvent::DeadlineMissedCheck => {
-          self.handle_requested_deadline_event();
-          self.set_requested_deadline_check_timer(); // re-prime timer
-        }
+  // Handle a single timed event. The shared timer is drained by the event loop,
+  // which dispatches each expired event to the addressed Reader.
+  pub fn handle_timed_event(&mut self, event: TimedEvent) {
+    match event {
+      TimedEvent::DeadlineMissedCheck => {
+        self.handle_requested_deadline_event();
+        self.set_requested_deadline_check_timer(); // re-prime timer
       }
     }
   }
@@ -1503,7 +1502,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1588,7 +1587,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1694,7 +1693,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1803,7 +1802,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1941,7 +1940,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 

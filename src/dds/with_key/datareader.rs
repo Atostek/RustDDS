@@ -1204,7 +1204,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1369,7 +1369,7 @@ mod tests {
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-      mio_extras::timer::Builder::default().build(),
+      crate::polling::new_shared_timer(),
       participant_status_sender,
     );
 

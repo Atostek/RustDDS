@@ -10,10 +10,7 @@ use core::task::Waker;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use speedy::{Endianness, Writable};
-use mio_extras::{
-  channel::{self as mio_channel, TrySendError},
-  timer::Timer,
-};
+use mio_extras::channel::{self as mio_channel, TrySendError};
 use mio_06::Token;
 
 use crate::{
@@ -31,9 +28,11 @@ use crate::{
   },
   messages::submessages::submessages::AckSubmessage,
   network::udp_sender::UDPSender,
+  polling::SharedTimer,
   rtps::{
     constant::{NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION},
     rtps_reader_proxy::RtpsReaderProxy,
+    timed_event::DpTimerEvent,
     Message, MessageBuilder,
   },
   structure::{
@@ -80,14 +79,6 @@ pub(crate) struct WriterIngredients {
   pub status_sender: StatusChannelSender<DataWriterStatus>,
 
   pub(crate) security_plugins: Option<SecurityPluginsHandle>,
-}
-
-impl WriterIngredients {
-  /// This token is used in timed event mio::channel HeartbeatHandler ->
-  /// dpEventWrapper
-  pub fn alt_entity_token(&self) -> Token {
-    self.guid.entity_id.as_alt_token()
-  }
 }
 
 struct AckWaiter {
@@ -309,7 +300,7 @@ pub(crate) struct Writer {
   /// self.heartbeat_period timed_event_handler sends notification when timer
   /// is up via mio channel to poll in Dp_eventWrapper this also handles
   /// writers cache cleaning timeouts.
-  pub(crate) timed_event_timer: Timer<TimedEvent>,
+  pub(crate) timed_event_timer: SharedTimer<DpTimerEvent>,
 
   qos_policies: QosPolicies,
 
@@ -339,7 +330,7 @@ impl Writer {
   pub fn new(
     i: WriterIngredients,
     udp_sender: Rc<UDPSender>,
-    mut timed_event_timer: Timer<TimedEvent>,
+    timed_event_timer: SharedTimer<DpTimerEvent>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
   ) -> Self {
     // If writer should behave statelessly, only BestEffort QoS is currently
@@ -375,12 +366,21 @@ impl Writer {
 
     // Start periodic Heartbeat
     if let Some(period) = heartbeat_period {
-      timed_event_timer.set_timeout(std::time::Duration::from(period), TimedEvent::Heartbeat);
+      timed_event_timer.borrow_mut().set_timeout(
+        std::time::Duration::from(period),
+        DpTimerEvent::Writer {
+          entity_id: i.guid.entity_id,
+          event: TimedEvent::Heartbeat,
+        },
+      );
     }
     // start periodic cache cleaning
-    timed_event_timer.set_timeout(
+    timed_event_timer.borrow_mut().set_timeout(
       std::time::Duration::from(cache_cleaning_period),
-      TimedEvent::CacheCleaning,
+      DpTimerEvent::Writer {
+        entity_id: i.guid.entity_id,
+        event: TimedEvent::CacheCleaning,
+      },
     );
 
     Self {
@@ -449,64 +449,75 @@ impl Writer {
   // --------------------------------------------------------------
   // --------------------------------------------------------------
 
-  pub fn handle_timed_event(&mut self) {
-    while let Some(e) = self.timed_event_timer.poll() {
-      match e {
-        TimedEvent::Heartbeat => {
-          self.handle_heartbeat_tick(false);
-          // ^^ false = This is automatic heartbeat by timer, not manual by application
-          // call.
-          if let Some(period) = self.heartbeat_period {
-            self
-              .timed_event_timer
-              .set_timeout(std::time::Duration::from(period), TimedEvent::Heartbeat);
+  // Schedule a timed event for this Writer on the event loop's shared timer.
+  // The payload is tagged with this Writer's EntityId so the event loop can
+  // route the fired event back to this Writer.
+  fn schedule_timed_event(&self, after: std::time::Duration, event: TimedEvent) {
+    self.timed_event_timer.borrow_mut().set_timeout(
+      after,
+      DpTimerEvent::Writer {
+        entity_id: self.my_guid.entity_id,
+        event,
+      },
+    );
+  }
+
+  // Handle a single timed event. The shared timer is drained by the event loop,
+  // which dispatches each expired event to the addressed Writer.
+  pub fn handle_timed_event(&mut self, event: TimedEvent) {
+    match event {
+      TimedEvent::Heartbeat => {
+        self.handle_heartbeat_tick(false);
+        // ^^ false = This is automatic heartbeat by timer, not manual by application
+        // call.
+        if let Some(period) = self.heartbeat_period {
+          self.schedule_timed_event(std::time::Duration::from(period), TimedEvent::Heartbeat);
+        }
+      }
+      TimedEvent::CacheCleaning => {
+        self.handle_cache_cleaning();
+        self.schedule_timed_event(
+          std::time::Duration::from(self.cache_cleaning_period),
+          TimedEvent::CacheCleaning,
+        );
+      }
+      TimedEvent::SendRepairData {
+        to_reader: reader_guid,
+      } => {
+        self.handle_repair_data_send(reader_guid);
+        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
+          if rp.repair_mode {
+            let delay_to_next_repair = self
+              .qos_policies
+              .deadline()
+              .map_or_else(|| Duration::from_millis(1), |dl| dl.0)
+              / 5;
+            self.schedule_timed_event(
+              std::time::Duration::from(delay_to_next_repair),
+              TimedEvent::SendRepairData {
+                to_reader: reader_guid,
+              },
+            );
           }
         }
-        TimedEvent::CacheCleaning => {
-          self.handle_cache_cleaning();
-          self.timed_event_timer.set_timeout(
-            std::time::Duration::from(self.cache_cleaning_period),
-            TimedEvent::CacheCleaning,
-          );
-        }
-        TimedEvent::SendRepairData {
-          to_reader: reader_guid,
-        } => {
-          self.handle_repair_data_send(reader_guid);
-          if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-            if rp.repair_mode {
-              let delay_to_next_repair = self
-                .qos_policies
-                .deadline()
-                .map_or_else(|| Duration::from_millis(1), |dl| dl.0)
-                / 5;
-              self.timed_event_timer.set_timeout(
-                std::time::Duration::from(delay_to_next_repair),
-                TimedEvent::SendRepairData {
-                  to_reader: reader_guid,
-                },
-              );
-            }
-          }
-        }
-        TimedEvent::SendRepairFrags {
-          to_reader: reader_guid,
-        } => {
-          self.handle_repair_frags_send(reader_guid);
-          if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-            if rp.repair_frags_requested() {
-              // more repair needed?
-              self.timed_event_timer.set_timeout(
-                self.repairfrags_continue_delay,
-                TimedEvent::SendRepairFrags {
-                  to_reader: reader_guid,
-                },
-              );
-            } // if
-          } // if let
-        } // SendRepairFrags
-      } // match
-    } // while
+      }
+      TimedEvent::SendRepairFrags {
+        to_reader: reader_guid,
+      } => {
+        self.handle_repair_frags_send(reader_guid);
+        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
+          if rp.repair_frags_requested() {
+            // more repair needed?
+            self.schedule_timed_event(
+              self.repairfrags_continue_delay,
+              TimedEvent::SendRepairFrags {
+                to_reader: reader_guid,
+              },
+            );
+          } // if
+        } // if let
+      } // SendRepairFrags
+    } // match
   } // fn
 
   /// This is called by dp_wrapper every time cacheCleaning message is received.
@@ -928,10 +939,16 @@ impl Writer {
           } else {
             reader_proxy.repair_mode = true; // TODO: Is this correct? Do we need to repair immediately?
                                              // set repair timer to fire
-            self.timed_event_timer.set_timeout(
+                                             // Note: `reader_proxy` holds a mutable borrow of `self`, so we
+                                             // cannot call the `&self` helper here; access disjoint fields
+                                             // directly instead.
+            self.timed_event_timer.borrow_mut().set_timeout(
               self.nack_response_delay,
-              TimedEvent::SendRepairData {
-                to_reader: reader_guid,
+              DpTimerEvent::Writer {
+                entity_id: self.my_guid.entity_id,
+                event: TimedEvent::SendRepairData {
+                  to_reader: reader_guid,
+                },
               },
             );
           }
@@ -963,7 +980,7 @@ impl Writer {
         if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
           reader_proxy.mark_frags_requested(nackfrag.writer_sn, &nackfrag.fragment_number_state);
         }
-        self.timed_event_timer.set_timeout(
+        self.schedule_timed_event(
           self.nackfrag_response_delay,
           TimedEvent::SendRepairFrags {
             to_reader: reader_guid,
@@ -1094,7 +1111,7 @@ impl Writer {
             reader_proxy.mark_all_frags_requested(unsent_sn, num_frags);
 
             // Set a timer to send repair frags if needed
-            self.timed_event_timer.set_timeout(
+            self.schedule_timed_event(
               self.repairfrags_continue_delay,
               TimedEvent::SendRepairFrags {
                 to_reader: reader_guid,

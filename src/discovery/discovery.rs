@@ -6,7 +6,7 @@ use std::{
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use mio_06::{Events, Poll, PollOpt, Ready};
-use mio_extras::{channel as mio_channel, timer::Timer};
+use mio_extras::channel as mio_channel;
 use pastey::paste; // token pasting macro
 
 use crate::{
@@ -31,7 +31,7 @@ use crate::{
     },
     spdp_participant_data::{Participant_GUID, SpdpDiscoveredParticipantData},
   },
-  polling::{new_simple_timer, TimerPolicy},
+  polling::{new_shared_timer, SharedTimer},
   rtps::constant::*,
   serialization::{pl_cdr_adapters::*, CDRDeserializerAdapter, CDRSerializerAdapter},
   structure::{
@@ -132,10 +132,9 @@ pub(super) type DataWriterPlCdr<D> = DataWriter<D, PlCdrSerializerAdapter<D>>;
 
 mod with_key {
   use serde::{de::DeserializeOwned, Serialize};
-  use mio_extras::timer::Timer;
 
   use super::{DataReaderPlCdr, DataWriterPlCdr};
-  use crate::{polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
+  use crate::{serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
 
   pub const TOPIC_KIND: TopicKind = TopicKind::WithKey;
 
@@ -148,7 +147,6 @@ mod with_key {
     pub topic: Topic,
     pub reader: DataReaderPlCdr<D>,
     pub writer: DataWriterPlCdr<D>,
-    pub timer: Timer<TimerPolicy>,
   }
 
   pub(super) struct DiscoveryTopicCDR<D>
@@ -160,16 +158,14 @@ mod with_key {
     pub topic: Topic,
     pub reader: crate::with_key::DataReaderCdr<D>,
     pub writer: crate::with_key::DataWriterCdr<D>,
-    pub timer: Timer<TimerPolicy>,
   }
 }
 
 #[cfg(feature = "security")] // only used with security feature for now, this is to avoid warning
 mod no_key {
   use serde::{de::DeserializeOwned, Serialize};
-  use mio_extras::timer::Timer;
 
-  use crate::{polling::TimerPolicy, Topic, TopicKind};
+  use crate::{Topic, TopicKind};
 
   pub const TOPIC_KIND: TopicKind = TopicKind::NoKey;
 
@@ -181,9 +177,24 @@ mod no_key {
     pub topic: Topic,
     pub reader: crate::no_key::DataReader<D, crate::CDRDeserializerAdapter<D>>,
     pub writer: crate::no_key::DataWriter<D, crate::CDRSerializerAdapter<D>>,
-    #[allow(dead_code)] // Timers currently not used for no_key discovery topics
-    pub timer: Timer<TimerPolicy>,
   }
+}
+
+// Payload for the single shared discovery timer. Each variant identifies a
+// periodic discovery task; the loop drains the timer and dispatches by variant.
+#[derive(Clone, Copy, Debug)]
+enum DiscoveryTimerEvent {
+  // `reschedule` distinguishes the periodic SPDP announce (true, reschedules
+  // itself at SPDP_PUBLISH_PERIOD) from a one-shot quick response to a newly
+  // discovered participant (false, does not reschedule).
+  SendParticipantInfo {
+    reschedule: bool,
+  },
+  ParticipantCleanup,
+  TopicCleanup,
+  PublishParticipantMessage,
+  #[cfg(feature = "security")]
+  CachedSecureMessageResend,
 }
 
 // Enum indicating if secure discovery allows normal discovery to process
@@ -222,7 +233,6 @@ pub(crate) struct Discovery {
   // and
   // timer to periodically announce our presence
   dcps_participant: with_key::DiscoveryTopicPlCdr<SpdpDiscoveredParticipantData>,
-  participant_cleanup_timer: Timer<()>, // garbage collection timer for dead remote participants
 
   // Topic "DCPSSubscription" - announcing and detecting Readers
   dcps_subscription: with_key::DiscoveryTopicPlCdr<DiscoveredReaderData>,
@@ -232,10 +242,14 @@ pub(crate) struct Discovery {
 
   // Topic "DCPSTopic" - announcing and detecting topics
   dcps_topic: with_key::DiscoveryTopicPlCdr<DiscoveredTopicData>,
-  topic_cleanup_timer: Timer<()>,
 
   // DCPSParticipantMessage - used by participants to communicate liveness
   dcps_participant_message: with_key::DiscoveryTopicCDR<ParticipantMessageData>,
+
+  // One timer shared by all periodic discovery tasks (replaces the former
+  // per-topic timers and the separate participant/topic cleanup and secure
+  // resend timers), so discovery uses a single timer background thread.
+  discovery_timer: SharedTimer<DiscoveryTimerEvent>,
 
   // If security is enabled, this field contains a SecureDiscovery struct, an appendix
   // which is used for Secure functionality
@@ -270,9 +284,6 @@ pub(crate) struct Discovery {
   #[cfg(feature = "security")]
   dcps_participant_volatile_message_secure:
     no_key::DiscoveryTopicCDR<ParticipantVolatileMessageSecure>, // CDR?
-
-  #[cfg(feature = "security")]
-  cached_secure_discovery_messages_resend_timer: Timer<()>,
 }
 
 impl Discovery {
@@ -382,15 +393,11 @@ impl Discovery {
           .register(&reader, $reader_token, Ready::readable(), PollOpt::edge())
           .expect("Failed to register a discovery reader to poll.");
 
-        let mut timer: Timer<TimerPolicy> = new_simple_timer();
-        let timeout_and_timer_token_opt: Option<mio_06::Token> = $timeout_and_timer_token_opt;
-        if let Some(timer_token) = timeout_and_timer_token_opt {
-          timer.set_timeout(StdDuration::from_millis(100), TimerPolicy::Repeat);
-          poll
-            .register(&timer, timer_token, Ready::readable(), PollOpt::edge())
-            .expect("Unable to register timer token. ");
-        }
-        paste! { $has_key ::[<DiscoveryTopic $repr>] { topic, reader, writer, timer } }
+        // Per-topic timers are gone; all periodic discovery tasks now share one
+        // timer registered under DISCOVERY_TIMER_TOKEN. The former timer token
+        // argument is no longer used here.
+        let _: Option<mio_06::Token> = $timeout_and_timer_token_opt;
+        paste! { $has_key ::[<DiscoveryTopic $repr>] { topic, reader, writer } }
       }}; // macro
     }
 
@@ -427,19 +434,6 @@ impl Discovery {
       DISCOVERY_PARTICIPANT_DATA_TOKEN,
       EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
       Some(DISCOVERY_SEND_PARTICIPANT_INFO_TOKEN),
-    );
-
-    // create lease duration check timer
-    let mut participant_cleanup_timer: Timer<()> = new_simple_timer();
-    participant_cleanup_timer.set_timeout(Self::PARTICIPANT_CLEANUP_PERIOD, ());
-    try_construct!(
-      poll.register(
-        &participant_cleanup_timer,
-        DISCOVERY_PARTICIPANT_CLEANUP_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Unable to create participant cleanup timer."
     );
 
     // Subscriptions: What are the Readers on the network and what are they
@@ -486,19 +480,6 @@ impl Discovery {
       DISCOVERY_TOPIC_DATA_TOKEN,
       EntityId::SEDP_BUILTIN_TOPIC_WRITER,
       None, // No timer
-    );
-
-    // create lease duration check timer
-    let mut topic_cleanup_timer: Timer<()> = new_simple_timer();
-    topic_cleanup_timer.set_timeout(Self::TOPIC_CLEANUP_PERIOD, ());
-    try_construct!(
-      poll.register(
-        &topic_cleanup_timer,
-        DISCOVERY_TOPIC_CLEANUP_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Unable to register topic cleanup timer."
     );
 
     // Participant Message Data 8.4.13
@@ -616,24 +597,44 @@ impl Discovery {
       None, // No timer.
     );
 
-    // Create a timer to periodically check whether to resend any cached security
-    // (authentication, key exchange) messages
-    #[cfg(feature = "security")]
-    let secure_message_resend_timer = {
-      let mut secure_message_resend_timer: Timer<()> = new_simple_timer();
-      secure_message_resend_timer
-        .set_timeout(Self::CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_PERIOD, ());
-      try_construct!(
-        poll.register(
-          &secure_message_resend_timer,
-          CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_TIMER_TOKEN,
-          Ready::readable(),
-          PollOpt::edge(),
-        ),
-        "Unable to create secure message resend timer."
+    // The single shared timer for the discovery loop. Register it once and seed
+    // all periodic tasks. The SPDP-publish and participant-message tasks are
+    // seeded with a short initial delay (matching the previous behaviour of
+    // their per-topic timers) so the first announcements go out quickly.
+    let discovery_timer = new_shared_timer::<DiscoveryTimerEvent>();
+    try_construct!(
+      poll.register(
+        &*discovery_timer.borrow(),
+        DISCOVERY_TIMER_TOKEN,
+        Ready::readable(),
+        PollOpt::edge(),
+      ),
+      "Unable to register discovery shared timer."
+    );
+    {
+      let mut t = discovery_timer.borrow_mut();
+      t.set_timeout(
+        StdDuration::from_millis(100),
+        DiscoveryTimerEvent::SendParticipantInfo { reschedule: true },
       );
-      secure_message_resend_timer
-    };
+      t.set_timeout(
+        Self::PARTICIPANT_CLEANUP_PERIOD,
+        DiscoveryTimerEvent::ParticipantCleanup,
+      );
+      t.set_timeout(
+        Self::TOPIC_CLEANUP_PERIOD,
+        DiscoveryTimerEvent::TopicCleanup,
+      );
+      t.set_timeout(
+        StdDuration::from_millis(100),
+        DiscoveryTimerEvent::PublishParticipantMessage,
+      );
+      #[cfg(feature = "security")]
+      t.set_timeout(
+        Self::CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_PERIOD,
+        DiscoveryTimerEvent::CachedSecureMessageResend,
+      );
+    }
 
     #[cfg(not(feature = "security"))]
     let security_opt = security_plugins_opt.and(None); // = None, but avoid warning.
@@ -664,13 +665,13 @@ impl Discovery {
 
       // discovery_subscriber,
       // discovery_publisher,
-      dcps_participant,
-      participant_cleanup_timer, // SPDP
+      dcps_participant, // SPDP
       dcps_subscription,
       dcps_publication, // SEDP
       dcps_topic,
-      topic_cleanup_timer,      // SEDP
       dcps_participant_message, // liveliness messages
+
+      discovery_timer,
 
       security_opt,
       #[cfg(feature = "security")]
@@ -685,8 +686,6 @@ impl Discovery {
       dcps_participant_stateless_message,
       #[cfg(feature = "security")]
       dcps_participant_volatile_message_secure,
-      #[cfg(feature = "security")]
-      cached_secure_discovery_messages_resend_timer: secure_message_resend_timer,
     })
   }
 
@@ -816,32 +815,63 @@ impl Discovery {
             self.spdp_receive();
           }
 
-          DISCOVERY_PARTICIPANT_CLEANUP_TOKEN => {
-            self.participant_cleanup();
-            // setting next cleanup timeout
-            self
-              .participant_cleanup_timer
-              .set_timeout(Self::PARTICIPANT_CLEANUP_PERIOD, ());
-          }
-
-          DISCOVERY_SEND_PARTICIPANT_INFO_TOKEN => {
-            if let Some(dp) = self.domain_participant.clone().upgrade() {
-              self.spdp_publish(&dp);
-            } else {
-              error!("DomainParticipant doesn't exist anymore, exiting Discovery.");
-              return;
+          DISCOVERY_TIMER_TOKEN => {
+            // Drain all expired timeouts under a single borrow, then dispatch
+            // (handlers re-borrow the timer to reschedule).
+            let expired: Vec<DiscoveryTimerEvent> = {
+              let mut timer = self.discovery_timer.borrow_mut();
+              let mut v = Vec::new();
+              while let Some(e) = timer.poll() {
+                v.push(e);
+              }
+              v
             };
-            // reschedule timer
-            while let Some(policy) = self.dcps_participant.timer.poll() {
-              match policy {
-                TimerPolicy::Repeat => {
-                  self
-                    .dcps_participant
-                    .timer
-                    .set_timeout(Self::SPDP_PUBLISH_PERIOD, TimerPolicy::Repeat);
+            for timer_event in expired {
+              match timer_event {
+                DiscoveryTimerEvent::SendParticipantInfo { reschedule } => {
+                  if let Some(dp) = self.domain_participant.clone().upgrade() {
+                    self.spdp_publish(&dp);
+                  } else {
+                    error!("DomainParticipant doesn't exist anymore, exiting Discovery.");
+                    return;
+                  };
+                  // Only the periodic announce reschedules itself; the one-shot
+                  // quick response does not.
+                  if reschedule {
+                    self.discovery_timer.borrow_mut().set_timeout(
+                      Self::SPDP_PUBLISH_PERIOD,
+                      DiscoveryTimerEvent::SendParticipantInfo { reschedule: true },
+                    );
+                  }
                 }
-                TimerPolicy::OneShot => {
-                  // Do not set again, since it was one-shot.
+                DiscoveryTimerEvent::ParticipantCleanup => {
+                  self.participant_cleanup();
+                  self.discovery_timer.borrow_mut().set_timeout(
+                    Self::PARTICIPANT_CLEANUP_PERIOD,
+                    DiscoveryTimerEvent::ParticipantCleanup,
+                  );
+                }
+                DiscoveryTimerEvent::TopicCleanup => {
+                  self.topic_cleanup();
+                  self.discovery_timer.borrow_mut().set_timeout(
+                    Self::TOPIC_CLEANUP_PERIOD,
+                    DiscoveryTimerEvent::TopicCleanup,
+                  );
+                }
+                DiscoveryTimerEvent::PublishParticipantMessage => {
+                  self.publish_participant_message();
+                  self.discovery_timer.borrow_mut().set_timeout(
+                    Self::CHECK_PARTICIPANT_MESSAGES,
+                    DiscoveryTimerEvent::PublishParticipantMessage,
+                  );
+                }
+                #[cfg(feature = "security")]
+                DiscoveryTimerEvent::CachedSecureMessageResend => {
+                  self.on_secure_discovery_message_resend_triggered();
+                  self.discovery_timer.borrow_mut().set_timeout(
+                    Self::CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_PERIOD,
+                    DiscoveryTimerEvent::CachedSecureMessageResend,
+                  );
                 }
               }
             }
@@ -855,22 +885,8 @@ impl Discovery {
           DISCOVERY_TOPIC_DATA_TOKEN => {
             self.sedp_receive_topic_data(None);
           }
-          DISCOVERY_TOPIC_CLEANUP_TOKEN => {
-            self.topic_cleanup();
-
-            self
-              .topic_cleanup_timer
-              .set_timeout(Self::TOPIC_CLEANUP_PERIOD, ());
-          }
           DISCOVERY_PARTICIPANT_MESSAGE_TOKEN | P2P_SECURE_DISCOVERY_PARTICIPANT_MESSAGE_TOKEN => {
             self.receive_participant_message();
-          }
-          DISCOVERY_PARTICIPANT_MESSAGE_TIMER_TOKEN => {
-            self.publish_participant_message();
-            self
-              .dcps_participant_message
-              .timer
-              .set_timeout(Self::CHECK_PARTICIPANT_MESSAGES, TimerPolicy::Repeat);
           }
           SPDP_LIVENESS_TOKEN => {
             while let Ok(guid_prefix) = self.spdp_liveness_receiver.try_recv() {
@@ -880,10 +896,6 @@ impl Discovery {
           P2P_PARTICIPANT_STATELESS_MESSAGE_TOKEN => {
             #[cfg(feature = "security")]
             self.receive_participant_stateless_message();
-          }
-          CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_TIMER_TOKEN => {
-            #[cfg(feature = "security")]
-            self.on_secure_discovery_message_resend_triggered();
           }
           P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_TOKEN => {
             #[cfg(feature = "security")]
@@ -1019,10 +1031,11 @@ impl Discovery {
       // But not to reply to self, because we know that we exist.
       // TODO: Maybe add some rate-limiting to this to avoid packet storms.
       if guid_prefix != self.domain_participant.guid().prefix {
-        self
-          .dcps_participant
-          .timer
-          .set_timeout(StdDuration::from_millis(10), TimerPolicy::OneShot);
+        // One-shot quick SPDP response on the shared timer (does not reschedule).
+        self.discovery_timer.borrow_mut().set_timeout(
+          StdDuration::from_millis(10),
+          DiscoveryTimerEvent::SendParticipantInfo { reschedule: false },
+        );
       }
 
       // This may be a rediscovery of a previously seen participant that
@@ -1699,11 +1712,8 @@ impl Discovery {
         &self.dcps_participant_stateless_message.writer,
         &self.dcps_participant_volatile_message_secure.writer,
       );
-
-      // Reset timer for resending security messages
-      self
-        .cached_secure_discovery_messages_resend_timer
-        .set_timeout(Self::CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_PERIOD, ());
+      // Note: the resend timer is rescheduled by the shared-timer dispatch loop
+      // after this method returns, so we must not reschedule it here.
     }
   }
 
