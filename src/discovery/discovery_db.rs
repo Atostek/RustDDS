@@ -225,29 +225,19 @@ impl DiscoveryDB {
   // active_disposal means that we received a discovery message announcing the
   // disposal of the participant. active_disposal=false means that the
   // participant timed out.
-  pub fn remove_participant(&mut self, guid_prefix: GuidPrefix, active_disposal: bool) {
+  //
+  // In both cases, remove the participant's endpoints so that Lost events fire
+  // and consumers see the endpoints disappear. If the participant comes back,
+  // SEDP rediscovery will re-add its endpoints.
+  pub fn remove_participant(&mut self, guid_prefix: GuidPrefix, _active_disposal: bool) {
     info!("removing participant {guid_prefix:?}");
     self.participant_proxies.remove(&guid_prefix);
     self.participant_last_life_signs.remove(&guid_prefix);
     #[cfg(feature = "security")]
     self.authentication_statuses.remove(&guid_prefix);
 
-    if active_disposal {
-      self.remove_topic_reader_with_prefix(guid_prefix);
-      self.remove_topic_writer_with_prefix(guid_prefix);
-    } else {
-      // move to attic
-      move_by_guid_prefix(
-        guid_prefix,
-        &mut self.external_topic_readers,
-        &mut self.external_topic_readers_attic,
-      );
-      move_by_guid_prefix(
-        guid_prefix,
-        &mut self.external_topic_writers,
-        &mut self.external_topic_writers_attic,
-      );
-    }
+    self.remove_topic_reader_with_prefix(guid_prefix);
+    self.remove_topic_writer_with_prefix(guid_prefix);
   }
 
   pub fn find_participant_proxy(
