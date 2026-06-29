@@ -1179,6 +1179,9 @@ impl Discovery {
               guid: reader_key,
               reason: LostReason::Disposed,
             });
+            // Propagate the dispose into our local SEDP cache so participants
+            // discovering us later also see the endpoint disappear.
+            self.send_endpoint_dispose_message(reader_key);
           }
         }
       }
@@ -1243,6 +1246,9 @@ impl Discovery {
               guid: writer_key,
               reason: LostReason::Disposed,
             });
+            // Propagate the dispose into our local SEDP cache so participants
+            // discovering us later also see the endpoint disappear.
+            self.send_endpoint_dispose_message(writer_key);
 
             debug!("Disposed Writer {writer_key:?}");
           }
