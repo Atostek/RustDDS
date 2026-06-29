@@ -55,7 +55,7 @@ rand = "0.9.0"
 chrono = { version = "0.4", features = ["serde"] }
 enumflags2 = { version = "0.7.7", features = ["serde"] }
 if-addrs = "0.14"
-paste = "1"
+pastey = "0.2"
 md5 = "0.8.0"
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1.11"

@@ -7,7 +7,7 @@ use std::{
 use log::{debug, error, info, trace, warn};
 use mio_06::{Events, Poll, PollOpt, Ready};
 use mio_extras::{channel as mio_channel, timer::Timer};
-use paste::paste; // token pasting macro
+use pastey::paste; // token pasting macro
 
 use crate::{
   dds::{
@@ -135,9 +135,7 @@ mod with_key {
   use mio_extras::timer::Timer;
 
   use super::{DataReaderPlCdr, DataWriterPlCdr};
-  use crate::{
-    polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind,
-  };
+  use crate::{polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
 
   pub const TOPIC_KIND: TopicKind = TopicKind::WithKey;
 
