@@ -1,17 +1,13 @@
 use std::{
   marker::PhantomData,
   pin::Pin,
-  sync::{
-    atomic::{AtomicI64, Ordering},
-    Arc, Mutex,
-  },
-  task::{Context, Poll, Waker},
+  task::{Context, Poll},
   time::{Duration, Instant},
 };
 
-use futures::{Future, Stream};
-use mio_06::{Events, PollOpt, Ready, Token};
-use mio_extras::channel::{self as mio_channel, SendError, TrySendError};
+use futures::Future;
+use mio_06::{Ready, SetReadiness};
+use mio_extras::channel::{self as mio_channel, SendError};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
@@ -19,7 +15,6 @@ use crate::{
   dds::{
     adapters::with_key::SerializerAdapter,
     ddsdata::DDSData,
-    helpers::*,
     pubsub::Publisher,
     qos::{
       policy::{Liveliness, Reliability},
@@ -31,10 +26,10 @@ use crate::{
   },
   discovery::{discovery::DiscoveryCommand, sedp_messages::SubscriptionBuiltinTopicData},
   messages::submessages::elements::serialized_payload::SerializedPayload,
-  rtps::writer::WriterCommand,
+  rtps::writer_send_buffer::{Admission, WriterSendBuffer},
   serialization::CDRSerializerAdapter,
   structure::{
-    cache_change::ChangeKind, duration, entity::RTPSEntity, guid::GUID, rpc::SampleIdentity,
+    cache_change::ChangeKind, entity::RTPSEntity, guid::GUID, rpc::SampleIdentity,
     sequence_number::SequenceNumber, time::Timestamp,
   },
   Keyed, TopicDescription,
@@ -162,11 +157,14 @@ pub struct DataWriter<D: Keyed, SA: SerializerAdapter<D> = CDRSerializerAdapter<
   my_topic: Topic,
   qos_policy: QosPolicies,
   my_guid: GUID,
-  cc_upload: mio_channel::SyncSender<WriterCommand>,
-  cc_upload_waker: Arc<Mutex<Option<Waker>>>,
+  /// Shared, flow-controlled send buffer. Admission allocates the sequence
+  /// number and stores the sample only when the reliable window has room.
+  send_buffer: WriterSendBuffer,
+  /// mio readiness "doorbell" rung after a successful admission so the event
+  /// loop wakes and transmits the sample.
+  doorbell: SetReadiness,
   discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
   status_receiver: StatusChannelReceiver<DataWriterStatus>,
-  available_sequence_number: AtomicI64,
 }
 
 impl<D, SA> Drop for DataWriter<D, SA>
@@ -206,8 +204,8 @@ where
     topic: Topic,
     qos: QosPolicies,
     guid: GUID,
-    cc_upload: mio_channel::SyncSender<WriterCommand>,
-    cc_upload_waker: Arc<Mutex<Option<Waker>>>,
+    send_buffer: WriterSendBuffer,
+    doorbell: SetReadiness,
     discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
     status_receiver: StatusChannelReceiver<DataWriterStatus>,
   ) -> CreateResult<Self> {
@@ -228,26 +226,21 @@ where
       my_topic: topic,
       qos_policy: qos,
       my_guid: guid,
-      cc_upload,
-      cc_upload_waker,
+      send_buffer,
+      doorbell,
       discovery_command,
       status_receiver,
-      available_sequence_number: AtomicI64::new(1), // valid numbering starts from 1
     })
   }
 
-  fn next_sequence_number(&self) -> SequenceNumber {
-    SequenceNumber::from(
-      self
-        .available_sequence_number
-        .fetch_add(1, Ordering::Relaxed),
-    )
-  }
-
-  fn undo_sequence_number(&self) {
-    self
-      .available_sequence_number
-      .fetch_sub(1, Ordering::Relaxed);
+  // Wake the event loop to transmit a freshly admitted sample.
+  fn ring_doorbell(&self) {
+    if let Err(e) = self.doorbell.set_readiness(Ready::readable()) {
+      warn!(
+        "Failed to ring writer doorbell: topic={:?} {e}",
+        self.my_topic.name()
+      );
+    }
   }
 
   /// Manually refreshes liveliness
@@ -353,42 +346,30 @@ where
       SA::output_encoding(),
       send_buffer,
     ));
-    let sequence_number = self.next_sequence_number();
-    let writer_command = WriterCommand::DDSData {
-      ddsdata,
-      write_options,
-      sequence_number,
-    };
 
-    let timeout = self.qos().reliable_max_blocking_time();
-
-    match try_send_timeout(&self.cc_upload, writer_command, timeout) {
-      Ok(_) => {
+    // Admission allocates the sequence number and stores the sample only if the
+    // reliable send window has room; otherwise it blocks up to
+    // `reliable_max_blocking_time` and then returns WouldBlock (back-pressure).
+    let timeout = self.qos().reliable_max_blocking_time().map(|d| d.to_std());
+    match self
+      .send_buffer
+      .admit_blocking(write_options, ddsdata, timeout)
+    {
+      Admission::Admitted(sequence_number) => {
+        self.ring_doorbell();
         self.refresh_manual_liveliness();
         Ok(SampleIdentity {
           writer_guid: self.my_guid,
           sequence_number,
         })
       }
-      Err(TrySendError::Full(_writer_command)) => {
+      Admission::WouldBlock => {
         warn!(
-          "Write timed out: topic={:?}  timeout={:?}",
+          "Write timed out (reliable send window full): topic={:?}  timeout={:?}",
           self.my_topic.name(),
           timeout,
         );
-        self.undo_sequence_number();
         Err(WriteError::WouldBlock { data })
-      }
-      Err(TrySendError::Disconnected(_)) => {
-        self.undo_sequence_number();
-        Err(WriteError::Poisoned {
-          reason: "Cannot send to Writer".to_string(),
-          data,
-        })
-      }
-      Err(TrySendError::Io(e)) => {
-        self.undo_sequence_number();
-        Err(e.into())
       }
     }
   }
@@ -440,37 +421,10 @@ where
     match &self.qos_policy.reliability {
       None | Some(Reliability::BestEffort) => Ok(true),
       Some(Reliability::Reliable { .. }) => {
-        let (acked_sender, mut acked_receiver) = sync_status_channel::<()>(1)?;
-        let poll = mio_06::Poll::new()?;
-        poll.register(
-          acked_receiver.as_status_evented(),
-          Token(0),
-          Ready::readable(),
-          PollOpt::edge(),
-        )?;
-        self
-          .cc_upload
-          .try_send(WriterCommand::WaitForAcknowledgments {
-            all_acked: acked_sender,
-          })
-          .unwrap_or_else(|e| {
-            warn!("wait_for_acknowledgments: cannot initiate waiting. This will timeout. {e}");
-          });
-
-        let mut events = Events::with_capacity(1);
-        poll.poll(&mut events, Some(max_wait))?;
-        if let Some(_event) = events.iter().next() {
-          match acked_receiver.try_recv() {
-            Ok(_) => Ok(true), // got token
-            Err(e) => {
-              warn!("wait_for_acknowledgments - Spurious poll event? - {e}");
-              Ok(false) // TODO: We could also loop here
-            }
-          }
-        } else {
-          // no token, so presumably timed out
-          Ok(false)
-        }
+        // Wait until every matched reliable reader has acknowledged everything we
+        // have written so far (the current last sequence number), or we time out.
+        let target = self.send_buffer.last_change_sequence_number();
+        Ok(self.send_buffer.wait_for_acked_through(target, max_wait))
       }
     } // match
   }
@@ -871,23 +825,18 @@ where
       ChangeKind::NotAliveDisposed,
       SerializedPayload::new_from_bytes(SA::output_encoding(), send_buffer),
     );
-    self
-      .cc_upload
-      .send(WriterCommand::DDSData {
-        ddsdata,
-        write_options: WriteOptions::from(source_timestamp),
-        sequence_number: self.next_sequence_number(),
-      })
-      .map_err(|e| {
-        self.undo_sequence_number();
-        WriteError::Serialization {
-          reason: format!("{e}"),
-          data: (),
-        }
-      })?;
-
-    self.refresh_manual_liveliness();
-    Ok(())
+    let timeout = self.qos().reliable_max_blocking_time().map(|d| d.to_std());
+    match self
+      .send_buffer
+      .admit_blocking(WriteOptions::from(source_timestamp), ddsdata, timeout)
+    {
+      Admission::Admitted(_seq) => {
+        self.ring_doorbell();
+        self.refresh_manual_liveliness();
+        Ok(())
+      }
+      Admission::WouldBlock => Err(WriteError::WouldBlock { data: () }),
+    }
   }
 }
 
@@ -946,10 +895,11 @@ where
   SA: SerializerAdapter<D>,
 {
   writer: &'a DataWriter<D, SA>,
-  writer_command: Option<WriterCommand>,
-  sequence_number: SequenceNumber,
-  timeout: Option<duration::Duration>,
+  // The (write options, serialized sample) awaiting admission into the send
+  // buffer. Taken out once the write succeeds or fails.
+  pending: Option<(WriteOptions, DDSData)>,
   timeout_instant: Instant,
+  // The original sample, returned to the caller on WouldBlock.
   sample: Option<D>,
 }
 
@@ -970,76 +920,53 @@ where
   type Output = WriteResult<SampleIdentity, D>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    match self.writer_command.take() {
-      Some(wc) => {
-        match self.writer.cc_upload.try_send(wc) {
-          Ok(()) => {
-            self.writer.refresh_manual_liveliness();
-            Poll::Ready(Ok(SampleIdentity {
-              writer_guid: self.writer.my_guid,
-              sequence_number: self.sequence_number,
-            }))
-          }
-          Err(TrySendError::Full(wc)) => {
-            *self.writer.cc_upload_waker.lock().unwrap() = Some(cx.waker().clone());
-            if Instant::now() < self.timeout_instant {
-              // Put our command back
-              self.writer_command = Some(wc);
-              Poll::Pending
-            } else {
-              // TODO: unwrap
-              Poll::Ready(Err(WriteError::WouldBlock {
-                data: self.sample.take().unwrap(),
-              }))
-            }
-          }
-          Err(other_err) => {
-            warn!(
-              "Failed to write new data: topic={:?}  reason={:?}  timeout={:?}",
-              self.writer.my_topic.name(),
-              other_err,
-              self.timeout
-            );
-            // TODO: Is this (undo) the right thing to do, if there are
-            // several futures in progress? (Can this result in confused numbering?)
-            self.writer.undo_sequence_number();
-            Poll::Ready(Err(WriteError::Poisoned {
-              reason: format!("{other_err}"),
-              data: self.sample.take().unwrap(),
-            }))
-          }
-        }
-      }
-      None => {
-        // the dog ate my homework
-        // this should not happen
-        Poll::Ready(Err(WriteError::Internal {
-          reason: "someone stole my WriterCommand".to_owned(),
+    let Some((write_options, ddsdata)) = self.pending.take() else {
+      // Polled after completion. This should not happen.
+      return Poll::Ready(Err(WriteError::Internal {
+        reason: "AsyncWrite polled after completion".to_owned(),
+      }));
+    };
+
+    // Non-blocking admission. On a full reliable window the waker is registered
+    // inside `try_admit`, so we are re-polled when room becomes available.
+    match self
+      .writer
+      .send_buffer
+      .try_admit(write_options, ddsdata, cx.waker())
+    {
+      Ok(sequence_number) => {
+        self.writer.ring_doorbell();
+        self.writer.refresh_manual_liveliness();
+        Poll::Ready(Ok(SampleIdentity {
+          writer_guid: self.writer.my_guid,
+          sequence_number,
         }))
+      }
+      Err((write_options, ddsdata)) => {
+        if Instant::now() < self.timeout_instant {
+          self.pending = Some((write_options, ddsdata));
+          Poll::Pending
+        } else {
+          Poll::Ready(Err(WriteError::WouldBlock {
+            data: self.sample.take().unwrap(),
+          }))
+        }
       }
     }
   }
 }
 
 // A future for an asynchronous operation of waiting for acknowledgements.
-// Handles both the sending of the WaitForAcknowledgments command and
-// the waiting for the acknowledgements.
+// Resolves once every matched reliable reader has acknowledged everything up to
+// `target`. There is no timeout here; use async combinators to add one.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub enum AsyncWaitForAcknowledgments<'a, D, SA>
+pub struct AsyncWaitForAcknowledgments<'a, D, SA>
 where
   D: Keyed,
   SA: SerializerAdapter<D>,
 {
-  Waiting {
-    ack_wait_receiver: StatusChannelReceiver<()>,
-  },
-  Done,
-  WaitingSendCommand {
-    writer: &'a DataWriter<D, SA>,
-    ack_wait_receiver: StatusChannelReceiver<()>,
-    ack_wait_sender: StatusChannelSender<()>,
-  },
-  Fail(WriteError<()>),
+  writer: &'a DataWriter<D, SA>,
+  target: SequenceNumber,
 }
 
 impl<D, SA> Future for AsyncWaitForAcknowledgments<'_, D, SA>
@@ -1049,79 +976,17 @@ where
 {
   type Output = WriteResult<bool, ()>;
 
-  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    match *self {
-      AsyncWaitForAcknowledgments::Done => Poll::Ready(Ok(true)),
-      AsyncWaitForAcknowledgments::Fail(_) => {
-        let mut dummy = AsyncWaitForAcknowledgments::Done;
-        core::mem::swap(&mut dummy, &mut self);
-        match dummy {
-          AsyncWaitForAcknowledgments::Fail(e) => Poll::Ready(Err(e)),
-          _ => unreachable!(),
-        }
-      }
-      AsyncWaitForAcknowledgments::Waiting {
-        ref ack_wait_receiver,
-      } => {
-        match Pin::new(&mut ack_wait_receiver.as_async_status_stream()).poll_next(cx) {
-          Poll::Pending => Poll::Pending,
-
-          // this should not really happen, but let's judge that as a "no"
-          Poll::Ready(None) => Poll::Ready(Ok(false)),
-
-          // Poll::Ready(Some(Err(_read_error)))
-          //   // RecvError means the sending side has disconnected.
-          //   // We assume this would only be because the event loop thread is dead.
-          //   => Poll::Ready(Err(WriteError::Poisoned{ reason: "RecvError".to_string(), data:()})),
-          Poll::Ready(Some(())) => Poll::Ready(Ok(true)),
-          // There is no timeout support here, so we never really
-          // return Ok(false)
-        }
-      }
-      AsyncWaitForAcknowledgments::WaitingSendCommand { .. } => {
-        let mut dummy = AsyncWaitForAcknowledgments::Done;
-        core::mem::swap(&mut dummy, &mut self);
-        let (writer, ack_wait_receiver, ack_wait_sender) = match dummy {
-          AsyncWaitForAcknowledgments::WaitingSendCommand {
-            writer,
-            ack_wait_receiver,
-            ack_wait_sender,
-          } => (writer, ack_wait_receiver, ack_wait_sender),
-          _ => unreachable!(),
-        };
-
-        match writer
-          .cc_upload
-          .try_send(WriterCommand::WaitForAcknowledgments {
-            all_acked: ack_wait_sender,
-          }) {
-          Ok(()) => {
-            *self = AsyncWaitForAcknowledgments::Waiting { ack_wait_receiver };
-            Poll::Pending
-          }
-
-          Err(TrySendError::Full(WriterCommand::WaitForAcknowledgments {
-            all_acked: ack_wait_sender,
-          })) => {
-            *self = AsyncWaitForAcknowledgments::WaitingSendCommand {
-              writer,
-              ack_wait_receiver,
-              ack_wait_sender,
-            };
-            Poll::Pending
-          }
-          Err(TrySendError::Full(_other_writer_command)) =>
-          // We are sending WaitForAcknowledgments, so the channel
-          // should return only that, if any.
-          {
-            unreachable!()
-          }
-          Err(e) => Poll::Ready(Err(WriteError::Poisoned {
-            reason: format!("{e}"),
-            data: (),
-          })),
-        }
-      }
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    if self.writer.send_buffer.is_acked_through(self.target) {
+      return Poll::Ready(Ok(true));
+    }
+    // Register to be woken when the acknowledgement frontier advances, then
+    // re-check to avoid a lost-wakeup race.
+    self.writer.send_buffer.register_ack_waker(cx.waker());
+    if self.writer.send_buffer.is_acked_through(self.target) {
+      Poll::Ready(Ok(true))
+    } else {
+      Poll::Pending
     }
   }
 }
@@ -1166,20 +1031,12 @@ where
       SA::output_encoding(),
       send_buffer,
     ));
-    let sequence_number = self.next_sequence_number();
-    let writer_command = WriterCommand::DDSData {
-      ddsdata: dds_data,
-      write_options,
-      sequence_number,
-    };
 
     let timeout = self.qos().reliable_max_blocking_time();
 
     let write_future = AsyncWrite {
       writer: self,
-      writer_command: Some(writer_command),
-      sequence_number,
-      timeout,
+      pending: Some((write_options, dds_data)),
       timeout_instant: std::time::Instant::now()
         + timeout
           .map(|t| t.to_std())
@@ -1195,18 +1052,12 @@ where
     match &self.qos_policy.reliability {
       None | Some(Reliability::BestEffort) => Ok(true),
       Some(Reliability::Reliable { .. }) => {
-        // Construct a future for an async operation to first send the
-        // WaitForAcknowledgments command and then wait for the
-        // acknowledgements. Await for this future to complete.
-
-        let (ack_wait_sender, ack_wait_receiver) = sync_status_channel::<()>(1).unwrap(); // TODO: remove unwrap
-
-        let async_ack_wait = AsyncWaitForAcknowledgments::WaitingSendCommand {
+        let target = self.send_buffer.last_change_sequence_number();
+        AsyncWaitForAcknowledgments {
           writer: self,
-          ack_wait_receiver,
-          ack_wait_sender,
-        };
-        async_ack_wait.await
+          target,
+        }
+        .await
       }
     }
   }

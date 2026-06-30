@@ -23,7 +23,10 @@ use clap::Parser;
 use futures::{pin_mut, select, FutureExt, StreamExt};
 use log::{debug, error};
 use rustdds::{
-  dds::statusevents::{DataReaderStatus, DataWriterStatus},
+  dds::{
+    result::WriteError,
+    statusevents::{DataReaderStatus, DataWriterStatus},
+  },
   policy::{Deadline, Durability, History, Lifespan, Ownership, Reliability, TimeBasedFilter},
   with_key::Sample,
   DomainParticipantBuilder, Duration, Keyed, QosPolicyBuilder, StatusEvented, TopicDescription,
@@ -390,10 +393,22 @@ fn main() {
             // next one. This makes the very first sample the initial value
             // (e.g. shapesize == 1 with `-z 0`), which the TRANSIENT_LOCAL
             // durability test relies on.
-            datawriter
-              .async_write(shape.clone(), None)
-              .await
-              .unwrap_or_else(|e| error!("DataWriter write failed: {e:?}"));
+            //
+            // Under reliable back-pressure the write can return WouldBlock when
+            // the send window is full (a slow/lagging reader). Retry with a small
+            // delay so we never drop a sample; this gives the lossless behavior
+            // the reliability/history tests expect.
+            let mut pending = Some(shape.clone());
+            while let Some(s) = pending.take() {
+              match datawriter.async_write(s, None).await {
+                Ok(()) => {}
+                Err(WriteError::WouldBlock { data }) => {
+                  pending = Some(data);
+                  Timer::after(StdDuration::from_millis(2)).await;
+                }
+                Err(e) => error!("DataWriter write failed: {e:?}"),
+              }
+            }
             if args.print_writer_samples {
               print_sample(&topic_name, shape);
             }

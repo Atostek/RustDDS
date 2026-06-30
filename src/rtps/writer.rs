@@ -3,19 +3,17 @@ use std::{
   collections::{BTreeMap, BTreeSet},
   ops::Bound::Included,
   rc::Rc,
-  sync::{atomic, Arc, Mutex},
+  sync::atomic,
 };
-use core::task::Waker;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use speedy::{Endianness, Writable};
-use mio_extras::channel::{self as mio_channel, TrySendError};
-use mio_06::Token;
+use mio_extras::channel::TrySendError;
+use mio_06::{Ready, Registration, SetReadiness, Token};
 
 use crate::{
   dds::{
-    ddsdata::DDSData,
     qos::{
       policy,
       policy::{History, Reliability},
@@ -24,7 +22,6 @@ use crate::{
     statusevents::{
       CountWithChange, DataWriterStatus, DomainParticipantStatusEvent, StatusChannelSender,
     },
-    with_key::datawriter::WriteOptions,
   },
   messages::submessages::submessages::AckSubmessage,
   network::udp_sender::UDPSender,
@@ -36,6 +33,7 @@ use crate::{
     },
     rtps_reader_proxy::RtpsReaderProxy,
     timed_event::DpTimerEvent,
+    writer_send_buffer::WriterSendBuffer,
     Message, MessageBuilder,
   },
   structure::{
@@ -74,151 +72,22 @@ pub(crate) enum TimedEvent {
 // Ingredients are sendable between threads, whereas the Writer is not.
 pub(crate) struct WriterIngredients {
   pub guid: GUID,
-  pub writer_command_receiver: mio_channel::Receiver<WriterCommand>,
-  pub writer_command_receiver_waker: Arc<Mutex<Option<Waker>>>,
+  /// Shared, flow-controlled buffer of outgoing samples. The producer end is
+  /// held by the `DataWriter`; this clone is the consumer end for the Writer.
+  pub send_buffer: WriterSendBuffer,
+  /// mio readiness "doorbell": the `DataWriter` rings it after admitting a
+  /// sample so the event loop wakes and transmits. The Writer keeps the
+  /// `Registration` end alive so it stays registered with the poll.
+  pub doorbell_registration: Registration,
+  /// A clone of the doorbell's `SetReadiness`, used by the Writer to reset the
+  /// readiness to empty before draining, so edge-triggered re-arming works.
+  pub doorbell: SetReadiness,
   pub topic_name: String,
   pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Writer)
   pub qos_policies: QosPolicies,
   pub status_sender: StatusChannelSender<DataWriterStatus>,
 
   pub(crate) security_plugins: Option<SecurityPluginsHandle>,
-}
-
-struct AckWaiter {
-  wait_until: SequenceNumber,
-  complete_channel: StatusChannelSender<()>,
-  readers_pending: BTreeSet<GUID>,
-}
-
-impl AckWaiter {
-  pub fn notify_wait_complete(&self) {
-    // it is normal for the send to fail, because receiver may have timed out
-    let _ = self.complete_channel.try_send(());
-  }
-  pub fn reader_acked_or_lost(&mut self, guid: GUID, acked_before: Option<SequenceNumber>) -> bool // true = waiting complete
-  {
-    match acked_before {
-      None => {
-        self.readers_pending.remove(&guid);
-      }
-      Some(acked_before) if self.wait_until < acked_before => {
-        self.readers_pending.remove(&guid);
-      }
-      Some(_) => (),
-    }
-
-    // if the set of waiters is empty, then wait is complete
-    self.readers_pending.is_empty()
-  }
-}
-
-// helper struct for Writer
-struct HistoryBuffer {
-  first_seq: SequenceNumber, // oldest not removed. Default is 1.
-  last_seq: SequenceNumber,  // latest added. Default is 0.
-
-  /// Maps this writers local sequence numbers to DDSHistoryCache instants.
-  /// Useful when negative acknack is received.
-  sequence_number_to_instant: BTreeMap<SequenceNumber, Timestamp>,
-
-  /// History biffer for serving late-joining Readers nad ACKNACKs.
-  /// Maintains as many samples as QoS policies History and Resource Limits
-  /// specifiy.
-  history_buffer: BTreeMap<Timestamp, CacheChange>,
-
-  // topic name is just for debugging
-  topic_name: String,
-}
-
-impl HistoryBuffer {
-  fn new(topic_name: String) -> Self {
-    HistoryBuffer {
-      first_seq: SequenceNumber::new(1),
-      last_seq: SequenceNumber::new(0), // Indicates that we have nothing yet
-      sequence_number_to_instant: BTreeMap::new(),
-      history_buffer: BTreeMap::new(),
-      topic_name,
-    }
-  }
-
-  /// Internal counter used to assign
-  /// increasing sequence number to
-  /// each change made by the Writer
-  fn last_change_sequence_number(&self) -> SequenceNumber {
-    self.last_seq
-  }
-
-  /// If samples are available in the Writer, identifies the first (lowest)
-  /// sequence number that is available in the Writer.
-  /// If no samples are available in the Writer, identifies the lowest
-  /// sequence number that is yet to be written by the Writer
-  fn first_change_sequence_number(&self) -> SequenceNumber {
-    self.first_seq
-  }
-
-  fn get_change(&self, ts: Timestamp) -> Option<&CacheChange> {
-    self.history_buffer.get(&ts)
-  }
-
-  fn get_by_sn(&self, sn: SequenceNumber) -> Option<&CacheChange> {
-    self
-      .sequence_number_to_instant
-      .get(&sn)
-      .and_then(|ts| self.get_change(*ts))
-  }
-
-  fn add_change(&mut self, timestamp: Timestamp, new_cache_change: CacheChange) {
-    let new_seq = new_cache_change.sequence_number;
-
-    // actual insert
-    let had_already_same = self.history_buffer.insert(timestamp, new_cache_change);
-    if had_already_same.is_some() {
-      // This should really not happen.
-      error!(
-        "HistoryBuffer: Tried to insert CacheChange with duplicate key. Discarding old sample."
-      );
-    }
-    // also update SeqNo map
-    self.sequence_number_to_instant.insert(new_seq, timestamp);
-
-    if new_seq > self.last_change_sequence_number() {
-      self.last_seq = new_seq;
-    } else {
-      error!("HistoryBuffer: Tried to add changes out of SequenceNumber order.");
-    }
-  }
-
-  fn remove_changes_before(&mut self, remove_before_seq: SequenceNumber) {
-    if let Some(remove_before) = self.sequence_number_to_instant.get(&remove_before_seq) {
-      let count_before = self.history_buffer.len();
-      self.history_buffer = self.history_buffer.split_off(remove_before);
-      self.sequence_number_to_instant = self
-        .sequence_number_to_instant
-        .split_off(&remove_before_seq);
-      // debug printout
-      let count_after = self.history_buffer.len();
-      debug!(
-        "HistoryBuffer: remove_changes_before. count before={} after={}, topic={}",
-        count_before, count_after, self.topic_name
-      );
-      if remove_before_seq >= self.first_seq {
-        self.first_seq = remove_before_seq; // update
-      } else {
-        error!(
-          "HistoryBuffer: Trying to remove before the first SequenceNumber. But how did we find \
-           it in the sequence_number_to_instant map? Looks like a bug."
-        );
-      }
-    } else {
-      // Number 1 is a special case. If the buffer is empty, then it is not found.
-      if remove_before_seq != SequenceNumber::new(1) {
-        warn!(
-          "HistoryBuffer: remove_changes_before. Cannot find {:?} first={:?} last={:?} topic={}",
-          remove_before_seq, self.first_seq, self.last_seq, self.topic_name
-        );
-      }
-    }
-  }
 }
 
 pub(crate) struct Writer {
@@ -273,8 +142,12 @@ pub(crate) struct Writer {
   pub data_max_size_serialized: usize,
 
   my_guid: GUID,
-  pub(crate) writer_command_receiver: mio_channel::Receiver<WriterCommand>,
-  writer_command_receiver_waker: Arc<Mutex<Option<Waker>>>,
+  /// mio readiness handle the event loop registers under `entity_token()`. The
+  /// `DataWriter` rings the paired `SetReadiness` when it admits a sample.
+  pub(crate) doorbell_registration: Registration,
+  /// Used to reset the doorbell readiness to empty before draining pending
+  /// samples (edge-triggered re-arming).
+  doorbell: SetReadiness,
 
   /// The RTPS ReaderProxy class represents the information an RTPS
   /// StatefulWriter maintains on each matched RTPS Reader
@@ -300,7 +173,12 @@ pub(crate) struct Writer {
   /// Writer can only read/write to this topic DDSHistoryCache.
   my_topic_name: String,
 
-  history_buffer: HistoryBuffer,
+  /// Shared, flow-controlled buffer of outgoing samples. Filled by the
+  /// `DataWriter` (admission + sequence numbering), drained/transmitted here.
+  send_buffer: WriterSendBuffer,
+  /// Highest sequence number this Writer has already transmitted (push mode).
+  /// Samples with `seq` in `(last_sent, send_buffer.last]` are pending send.
+  last_sent: SequenceNumber,
 
   /// Contains timer that needs to be set to timeout with duration of
   /// self.heartbeat_period timed_event_handler sends notification when timer
@@ -313,23 +191,9 @@ pub(crate) struct Writer {
   // Used for sending status info about messages sent
   status_sender: StatusChannelSender<DataWriterStatus>,
   // offered_deadline_status: OfferedDeadlineMissedStatus,
-  ack_waiter: Option<AckWaiter>,
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
   security_plugins: Option<SecurityPluginsHandle>,
-}
-
-pub enum WriterCommand {
-  // TODO: try to make this more private, like pub(crate)
-  DDSData {
-    ddsdata: DDSData,
-    write_options: WriteOptions,
-    sequence_number: SequenceNumber,
-  },
-  WaitForAcknowledgments {
-    all_acked: StatusChannelSender<()>,
-  },
-  // ResetOfferedDeadlineMissedStatus { writer_guid: GUID },
 }
 
 impl Writer {
@@ -408,20 +272,20 @@ impl Writer {
       // ^^ TODO: Maybe a smarter selection would be in order.
       // We should get the minimum over all outgoing interfaces.
       my_guid: i.guid,
-      writer_command_receiver: i.writer_command_receiver,
-      writer_command_receiver_waker: i.writer_command_receiver_waker,
+      doorbell_registration: i.doorbell_registration,
+      doorbell: i.doorbell,
       readers: BTreeMap::new(),
       matched_readers_count_total: 0,
       requested_incompatible_qos_count: 0,
       udp_sender,
-      my_topic_name: i.topic_name.clone(),
-      history_buffer: HistoryBuffer::new(i.topic_name),
+      my_topic_name: i.topic_name,
+      send_buffer: i.send_buffer,
+      last_sent: SequenceNumber::zero(),
       timed_event_timer,
       like_stateless: i.like_stateless,
       qos_policies: i.qos_policies,
       status_sender: i.status_sender,
       participant_status_sender,
-      ack_waiter: None,
 
       security_plugins: i.security_plugins,
     }
@@ -582,125 +446,77 @@ impl Writer {
     (num_frags, fragment_size as u16)
   }
 
-  // Receive new data samples from the DDS DataWriter
-  pub fn process_writer_command(&mut self) {
-    while let Ok(cc) = self.writer_command_receiver.try_recv() {
-      match cc {
-        WriterCommand::DDSData {
-          ddsdata: dds_data,
-          write_options,
-          sequence_number,
-        } => {
-          // Signal that there is now space in the DataWriter to Writer queue
-          {
-            self
-              .writer_command_receiver_waker
-              .lock()
-              .unwrap()
-              .as_ref()
-              .map(|w| w.wake_by_ref());
-          }
+  // The DataWriter has admitted one or more new samples into the shared send
+  // buffer and rung the doorbell. Transmit every sample we have not sent yet.
+  pub fn process_pending(&mut self) {
+    // Reset the doorbell to empty *before* reading the buffer state, so that any
+    // sample admitted concurrently re-arms the (edge-triggered) doorbell and we
+    // are woken again. The shared buffer's `last_seq` is the source of truth.
+    let _ = self.doorbell.set_readiness(Ready::empty());
 
-          // Insert data to local HistoryBuffer
-          let timestamp =
-            self.insert_to_history_buffer(dds_data, write_options.clone(), sequence_number);
+    let last_available = self.send_buffer.last_change_sequence_number();
+    while self.last_sent < last_available {
+      let sequence_number = self.last_sent.plus_1();
 
-          // If not acting stateless-like, notify reader proxies that there is a new
-          // sample
-          if !self.like_stateless {
-            for reader in &mut self.readers.values_mut() {
-              reader.notify_new_cache_change(sequence_number);
+      // Fetch an owned clone of the sample (cheap, Bytes-backed) so we hold the
+      // buffer lock only momentarily and can serialize/send without it.
+      let Some(cc) = self.send_buffer.get_by_sn(sequence_number) else {
+        // The sample is gone (e.g. evicted). Skip it; readers that need it will
+        // be told via GAP during repair.
+        self.last_sent = sequence_number;
+        continue;
+      };
+      let write_options = cc.write_options.clone();
 
-              // If the data is meant for a single reader only, set others as pending GAP for
-              // this sequence number.
-              if let Some(single_reader_guid) = write_options.to_single_reader() {
-                if reader.remote_reader_guid != single_reader_guid {
-                  reader.insert_pending_gap(sequence_number);
-                }
-              }
+      // If not acting stateless-like, notify reader proxies that there is a new
+      // sample.
+      if !self.like_stateless {
+        for reader in self.readers.values_mut() {
+          reader.notify_new_cache_change(sequence_number);
+
+          // If the data is meant for a single reader only, set others as pending
+          // GAP for this sequence number.
+          if let Some(single_reader_guid) = write_options.to_single_reader() {
+            if reader.remote_reader_guid != single_reader_guid {
+              reader.insert_pending_gap(sequence_number);
             }
           }
-
-          if self.push_mode {
-            // Send data (DATA or DATAFRAGs) and a Heartbeat
-            if let Some(cc) = self.history_buffer.get_change(timestamp) {
-              let target_reader_opt = match write_options.to_single_reader() {
-                Some(guid) => self.readers.get(&guid), // Sending only to this reader
-                None => None,                          // Sending to all matched readers
-              };
-
-              let send_also_heartbeat = true;
-              self.send_cache_change(cc, send_also_heartbeat, target_reader_opt);
-            } else {
-              error!("Lost the cache change that was just added?!");
-            }
-          } else {
-            // Send Heartbeat only.
-            // Readers will ask for the DATA with ACKNACK, if they are interested.
-            let final_flag = false; // false = request that readers acknowledge with ACKNACK.
-            let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
-            let hb_message = MessageBuilder::new()
-              .heartbeat_msg(
-                self.entity_id(), // from Writer
-                self.history_buffer.first_change_sequence_number(),
-                self.history_buffer.last_change_sequence_number(),
-                self.next_heartbeat_count(),
-                self.endianness,
-                EntityId::UNKNOWN, // to Reader
-                final_flag,
-                liveliness_flag,
-              )
-              .add_header_and_build(self.my_guid.prefix);
-            self.send_message_to_readers(
-              DeliveryMode::Multicast,
-              hb_message,
-              &mut self.readers.values(),
-            );
-          }
-        }
-
-        // WriterCommand::ResetOfferedDeadlineMissedStatus { writer_guid: _, } => {
-        //   self.reset_offered_deadline_missed_status();
-        // }
-        WriterCommand::WaitForAcknowledgments { all_acked } => {
-          if self.like_stateless {
-            error!(
-              "Attempted to wait for acknowledgements in a stateless Writer, which currently only \
-               supports BestEffort QoS. Ignoring. topic={:?}",
-              self.my_topic_name
-            );
-            let _ = all_acked.try_send(()); // Let the poor waiter continue.
-            return;
-          }
-
-          let wait_until = self.history_buffer.last_change_sequence_number();
-          let readers_pending: BTreeSet<_> = self
-            .readers
-            .iter()
-            .filter_map(|(guid, rp)| {
-              if rp.qos().is_reliable() && rp.all_acked_before <= wait_until {
-                Some(*guid)
-              } else {
-                None
-              }
-            })
-            .collect();
-          self.ack_waiter = if readers_pending.is_empty() {
-            // all acked already: try to signal app waiting at DataWriter
-            let _ = all_acked.try_send(());
-            // but we ignore any failure to signal, if no-one is listening
-            // since that is normal. They may have timed out and stopped waiting.
-            None
-          } else {
-            // Someone still needs to ack. Wait for them.
-            Some(AckWaiter {
-              wait_until,
-              complete_channel: all_acked,
-              readers_pending,
-            })
-          };
         }
       }
+
+      if self.push_mode {
+        // Send data (DATA or DATAFRAGs) and a Heartbeat
+        let target_reader_opt = match write_options.to_single_reader() {
+          Some(guid) => self.readers.get(&guid), // Sending only to this reader
+          None => None,                          // Sending to all matched readers
+        };
+        let send_also_heartbeat = true;
+        self.send_cache_change(&cc, send_also_heartbeat, target_reader_opt);
+      } else {
+        // Send Heartbeat only.
+        // Readers will ask for the DATA with ACKNACK, if they are interested.
+        let final_flag = false; // false = request that readers acknowledge with ACKNACK.
+        let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
+        let hb_message = MessageBuilder::new()
+          .heartbeat_msg(
+            self.entity_id(), // from Writer
+            self.send_buffer.first_change_sequence_number(),
+            self.send_buffer.last_change_sequence_number(),
+            self.next_heartbeat_count(),
+            self.endianness,
+            EntityId::UNKNOWN, // to Reader
+            final_flag,
+            liveliness_flag,
+          )
+          .add_header_and_build(self.my_guid.prefix);
+        self.send_message_to_readers(
+          DeliveryMode::Multicast,
+          hb_message,
+          &mut self.readers.values(),
+        );
+      }
+
+      self.last_sent = sequence_number;
     }
   }
 
@@ -761,27 +577,6 @@ impl Writer {
     fragmentation_needed
   }
 
-  fn insert_to_history_buffer(
-    &mut self,
-    data: DDSData,
-    write_options: WriteOptions,
-    new_sequence_number: SequenceNumber,
-  ) -> Timestamp {
-    assert!(new_sequence_number > SequenceNumber::zero());
-
-    // Create a new CacheChange from DDSData & insert to history buffer
-    // The timestamp taken here is used as a unique(!) key in the cache.
-    let new_cache_change = CacheChange::new(self.guid(), new_sequence_number, write_options, data);
-    let timestamp = Timestamp::now();
-
-    self.history_buffer.add_change(timestamp, new_cache_change);
-
-    // Do not add to Global DDS cache, as we do not necessarily have a local Reader.
-    // If we do, then we will receive the ATA packet from network.
-
-    timestamp
-  }
-
   // --------------------------------------------------------------
   // --------------------------------------------------------------
   // --------------------------------------------------------------
@@ -812,8 +607,8 @@ impl Writer {
       self.readers.len()
     );
 
-    let first_change = self.history_buffer.first_change_sequence_number();
-    let last_change = self.history_buffer.last_change_sequence_number();
+    let first_change = self.send_buffer.first_change_sequence_number();
+    let last_change = self.send_buffer.last_change_sequence_number();
 
     if self
       .readers
@@ -829,8 +624,8 @@ impl Writer {
         .ts_msg(self.endianness, Some(Timestamp::now()))
         .heartbeat_msg(
           self.entity_id(), // from Writer
-          self.history_buffer.first_change_sequence_number(),
-          self.history_buffer.last_change_sequence_number(),
+          self.send_buffer.first_change_sequence_number(),
+          self.send_buffer.last_change_sequence_number(),
           self.next_heartbeat_count(),
           self.endianness,
           EntityId::UNKNOWN, // to Reader
@@ -896,7 +691,7 @@ impl Writer {
     match ack_submessage {
       AckSubmessage::AckNack(ref an) => {
         // Update the ReaderProxy
-        let last_seq = self.history_buffer.last_change_sequence_number(); // to avoid borrow problems
+        let last_seq = self.send_buffer.last_change_sequence_number(); // to avoid borrow problems
 
         // sanity check requested sequence numbers
         if let Some(0) = an.reader_sn_state.iter().next().map(i64::from) {
@@ -922,7 +717,6 @@ impl Writer {
         }
 
         let my_topic = self.my_topic_name.clone(); // for debugging
-        self.update_ack_waiters(reader_guid, Some(an.reader_sn_state.base()));
 
         if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
           // Mark requested SNs as "unsent changes"
@@ -1022,22 +816,31 @@ impl Writer {
         );
       }
     }
+
+    // Acknowledgement frontier may have advanced: push it into the shared send
+    // buffer so any back-pressured producer (or `wait_for_acknowledgments`
+    // waiter) can make progress.
+    self.refresh_acked_frontier();
   }
 
-  // Application may be waiting that remote Readers ACK what we are sending.
-  // Notify application that the event they have been waiting for is here.
-  fn update_ack_waiters(&mut self, guid: GUID, acked_before: Option<SequenceNumber>) {
-    let completed = self
-      .ack_waiter
-      .as_mut()
-      .is_some_and(|aw| aw.reader_acked_or_lost(guid, acked_before));
-    if completed {
-      self
-        .ack_waiter
-        .as_ref()
-        .map(AckWaiter::notify_wait_complete);
-      self.ack_waiter = None;
+  // Recompute the reliable acknowledgement frontier (the smallest
+  // `all_acked_before` over all matched reliable readers) and publish it to the
+  // shared send buffer. Called whenever acknowledgements arrive or the set of
+  // matched readers changes. `None` means there are no reliable readers, so the
+  // writer is never back-pressured.
+  fn refresh_acked_frontier(&self) {
+    if self.like_stateless {
+      // Stateless-like writer is BestEffort: never throttle, never wait.
+      self.send_buffer.set_acked_frontier(None);
+      return;
     }
+    let frontier = self
+      .readers
+      .values()
+      .filter(|rp| rp.qos().is_reliable())
+      .map(RtpsReaderProxy::acked_up_to_before)
+      .min();
+    self.send_buffer.set_acked_frontier(frontier);
   }
 
   // Send out missing data
@@ -1112,7 +915,7 @@ impl Writer {
       let pending_gaps = reader_proxy.get_pending_gap();
 
       // Check what we actually have in store
-      let first_available = self.history_buffer.first_change_sequence_number();
+      let first_available = self.send_buffer.first_change_sequence_number();
       if unsent_sn < first_available {
         // Reader is requesting older than what we actually have. Notify that they are
         // gone.
@@ -1125,18 +928,11 @@ impl Writer {
       if pending_gaps.contains(&unsent_sn) || all_irrelevant_before.is_some() {
         no_longer_relevant.extend(pending_gaps);
       } else {
-        // Reader not pending gap on unsent_sn. Get the cache change from topic cache
-        if let Some(cc) = self.history_buffer.get_by_sn(unsent_sn) {
-          // // DEBUG
-          // if self.my_guid.entity_id == EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER
-          //   && reader_proxy.remote_reader_guid.prefix != self.my_guid.prefix
-          // {
-          //   info!("Publications Writer sends repair DATA {:?}", unsent_sn);
-          // }
-          // // DEBUG
-
+        // Reader not pending gap on unsent_sn. Get the cache change from the send
+        // buffer
+        if let Some(cc) = self.send_buffer.get_by_sn(unsent_sn) {
           // The cache change was found. Send it to the reader
-          let data_was_fragmented = self.send_cache_change(cc, false, Some(reader_proxy));
+          let data_was_fragmented = self.send_cache_change(&cc, false, Some(reader_proxy));
 
           if data_was_fragmented {
             // Mark the reader as having requested all frags
@@ -1227,7 +1023,7 @@ impl Writer {
       // Sanity check request
       // ^^^ TODO
 
-      if let Some(cache_change) = self.history_buffer.get_by_sn(seq_num) {
+      if let Some(cache_change) = self.send_buffer.get_by_sn(seq_num) {
         // If the data is meant for a single reader only, make sure it is the one we're
         // about to send frags to.
         if let Some(single_reader_guid) = cache_change.write_options.to_single_reader() {
@@ -1250,7 +1046,7 @@ impl Writer {
         let data_size: u32 = cache_change.data_value.payload_size() as u32; // TODO: overflow check
 
         message_builder = message_builder.data_frag_msg(
-          cache_change,
+          &cache_change,
           reader_guid.entity_id, // reader
           self.my_guid,          // writer
           frag_num,
@@ -1268,7 +1064,7 @@ impl Writer {
         );
       } else {
         error!(
-          "handle_repair_frags_send_worker: {:?} missing from history_buffer. topic={:?}",
+          "handle_repair_frags_send_worker: {:?} missing from send buffer. topic={:?}",
           seq_num, self.my_topic_name
         );
         // TODO: Should we send a GAP message then?
@@ -1302,11 +1098,11 @@ impl Writer {
       let depth_keeper = if let Some(depth) = depth {
         max(
           acked_by_all_readers - SequenceNumber::from(depth),
-          self.history_buffer.first_change_sequence_number(),
+          self.send_buffer.first_change_sequence_number(),
         )
       } else {
         // try to keep all
-        self.history_buffer.first_change_sequence_number()
+        self.send_buffer.first_change_sequence_number()
       };
       // Never evict samples that some matched (reliable) reader has not yet
       // acknowledged: clamp the keeper to at most the all-acked point so that
@@ -1318,8 +1114,8 @@ impl Writer {
       // make it explicit that it does not care about acked sequence numbers
       let depth = depth.unwrap_or(0);
       max(
-        self.history_buffer.last_change_sequence_number() - SequenceNumber::from(depth),
-        self.history_buffer.first_change_sequence_number(),
+        self.send_buffer.last_change_sequence_number() - SequenceNumber::from(depth),
+        self.send_buffer.first_change_sequence_number(),
       )
     };
     // Memory-safety backstop: never retain more than `resource_limit` samples,
@@ -1327,16 +1123,16 @@ impl Writer {
     let first_keeper = max(
       max(
         first_keeper,
-        self.history_buffer.last_change_sequence_number() - SequenceNumber::from(resource_limit),
+        self.send_buffer.last_change_sequence_number() - SequenceNumber::from(resource_limit),
       ),
       SequenceNumber::zero(),
     );
     debug!(
-      "HistoryBuffer: cleaning before {first_keeper:?} topic={:?}",
+      "WriterSendBuffer: cleaning before {first_keeper:?} topic={:?}",
       self.topic_name()
     );
     // actual cleaning
-    self.history_buffer.remove_changes_before(first_keeper);
+    self.send_buffer.remove_changes_before(first_keeper);
   }
 
   pub(crate) fn next_heartbeat_count(&self) -> i32 {
@@ -1500,6 +1296,9 @@ impl Writer {
       // matched QoS
       None => {
         let new_reader = self.matched_reader_update(reader_proxy);
+        // A (possibly new) reliable reader changes the acknowledgement frontier
+        // and thus the back-pressure window.
+        self.refresh_acked_frontier();
         if new_reader {
           self.matched_readers_count_total += 1;
           self.send_status(DataWriterStatus::PublicationMatched {
@@ -1569,7 +1368,7 @@ impl Writer {
           // With Durabilty::Volatile QoS we won't send the sequence numbers which existed
           // before matching with this reader. Therefore we set the reader as pending GAP
           // for all existing sequence numbers
-          new_proxy.set_pending_gap_up_to(self.history_buffer.last_change_sequence_number());
+          new_proxy.set_pending_gap_up_to(self.send_buffer.last_change_sequence_number());
         }
         new_proxy
       });
@@ -1611,8 +1410,9 @@ impl Writer {
         reader: guid,
       });
     }
-    // also remember to remove reader from ack_waiter
-    self.update_ack_waiters(guid, None);
+    // A matched reader going away may complete a pending wait_for_acknowledgments
+    // and may relax back-pressure: recompute the acknowledgement frontier.
+    self.refresh_acked_frontier();
   }
 
   // Entire remote participant was lost.
@@ -1807,8 +1607,8 @@ impl<'a> Iterator for FragmentationIter<'a> {
               let hb_msg = MessageBuilder::new()
                 .heartbeat_msg(
                   writer.entity_id(), // from Writer
-                  writer.history_buffer.first_change_sequence_number(),
-                  writer.history_buffer.last_change_sequence_number(),
+                  writer.send_buffer.first_change_sequence_number(),
+                  writer.send_buffer.last_change_sequence_number(),
                   writer.next_heartbeat_count(),
                   writer.endianness,
                   reader_entity_id, // to Reader
@@ -1864,8 +1664,8 @@ impl<'a> Iterator for FragmentationIter<'a> {
                                        // writing new data.
           message_builder = message_builder.heartbeat_msg(
             writer.entity_id(),
-            writer.history_buffer.first_change_sequence_number(),
-            writer.history_buffer.last_change_sequence_number(),
+            writer.send_buffer.first_change_sequence_number(),
+            writer.send_buffer.last_change_sequence_number(),
             writer.next_heartbeat_count(),
             writer.endianness,
             reader_entity_id, // to Reader

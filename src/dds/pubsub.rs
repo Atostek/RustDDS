@@ -34,8 +34,8 @@ use crate::{
   },
   mio_source,
   rtps::{
-    reader::ReaderIngredients,
-    writer::{WriterCommand, WriterIngredients},
+    constant::DEFAULT_WRITER_MAX_SAMPLES, reader::ReaderIngredients, writer::WriterIngredients,
+    writer_send_buffer::WriterSendBuffer,
   },
   serialization::{CDRDeserializerAdapter, CDRSerializerAdapter},
   structure::{
@@ -455,9 +455,6 @@ impl InnerPublisher {
     D: Keyed,
     SA: adapters::with_key::SerializerAdapter<D>,
   {
-    // Data samples from DataWriter to HistoryCache
-    let (dwcc_upload, hccc_download) = mio_channel::sync_channel::<WriterCommand>(16);
-    let writer_waker = Arc::new(Mutex::new(None));
     // Status reports back from Writer to DataWriter.
     let (status_sender, status_receiver) = sync_status_channel(4)?;
 
@@ -481,6 +478,35 @@ impl InnerPublisher {
       .or_else(|e| create_error_dropped!("Where is my DomainParticipant? {}", e))?;
 
     let guid = GUID::new_with_prefix_and_id(dp.guid().prefix, entity_id);
+
+    // Shared, flow-controlled send buffer between the DataWriter (producer) and
+    // the RTPS Writer (consumer). The reliable send window is derived from the
+    // writer's History / ResourceLimits QoS.
+    let window_limit = {
+      let resource_max = writer_qos
+        .resource_limits()
+        .map(|rl| rl.max_samples)
+        .filter(|&m| m > 0)
+        .map(|m| m as usize);
+      match writer_qos.history() {
+        Some(policy::History::KeepLast { depth }) => {
+          let d = depth as usize;
+          resource_max.map_or(d, |r| d.min(r))
+        }
+        _ => resource_max.unwrap_or(DEFAULT_WRITER_MAX_SAMPLES),
+      }
+    };
+    let send_buffer = WriterSendBuffer::new(
+      guid,
+      topic.name(),
+      writer_qos.is_reliable(),
+      guid.entity_id.entity_kind.is_built_in(),
+      window_limit,
+    );
+    // mio readiness "doorbell": the DataWriter rings `doorbell` after admitting a
+    // sample; the event loop registers `doorbell_registration` under the writer's
+    // entity token and wakes to transmit.
+    let (doorbell_registration, doorbell) = mio_06::Registration::new2();
 
     #[cfg(feature = "security")]
     if let Some(sec_handle) = self.security_plugins_handle.as_ref() {
@@ -537,8 +563,8 @@ impl InnerPublisher {
       topic.clone(),
       writer_qos.clone(),
       guid,
-      dwcc_upload,
-      Arc::clone(&writer_waker),
+      send_buffer.clone(),
+      doorbell.clone(),
       self.discovery_command.clone(),
       status_receiver,
     )?;
@@ -604,8 +630,9 @@ impl InnerPublisher {
     // constructed
     let new_writer = WriterIngredients {
       guid,
-      writer_command_receiver: hccc_download,
-      writer_command_receiver_waker: writer_waker,
+      send_buffer,
+      doorbell_registration,
+      doorbell,
       topic_name: topic.name(),
       like_stateless: writer_like_stateless,
       qos_policies: writer_qos,

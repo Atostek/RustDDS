@@ -462,8 +462,9 @@ impl DPEventLoop {
                     vec![]
                   }
                   Some(writer) => {
-                    // Writer will record data to DDSCache and send it out.
-                    writer.process_writer_command();
+                    // The DataWriter admitted new samples into the shared send
+                    // buffer and rang the doorbell; transmit them.
+                    writer.process_pending();
                     writer.local_readers()
                   }
                 };
@@ -966,12 +967,12 @@ impl DPEventLoop {
     self
       .poll
       .register(
-        &new_writer.writer_command_receiver,
+        &new_writer.doorbell_registration,
         new_writer.entity_token(),
         Ready::readable(),
         PollOpt::edge(),
       )
-      .expect("Writer command channel registration failed!!");
+      .expect("Writer doorbell registration failed!!");
 
     self.writers.insert(new_writer.guid().entity_id, new_writer);
   }
@@ -980,8 +981,8 @@ impl DPEventLoop {
     if let Some(w) = self.writers.remove(&writer_guid.entity_id) {
       self
         .poll
-        .deregister(&w.writer_command_receiver)
-        .unwrap_or_else(|e| error!("Deregister fail (writer command rec) {e:?}"));
+        .deregister(&w.doorbell_registration)
+        .unwrap_or_else(|e| error!("Deregister fail (writer doorbell) {e:?}"));
       // The timer is shared and stays registered for the loop's lifetime; there
       // is nothing per-writer to deregister. Stale timeouts are ignored on
       // dispatch (lookup miss).
