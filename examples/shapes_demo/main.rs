@@ -301,7 +301,7 @@ fn main() {
                 match reader.take_next_sample() {
                   Ok(Some(sample)) => match sample.into_value() {
                     Sample::Value(sample) => println!(
-                      "{:10.10} {:10.10} {:3.3} {:3.3} [{}]",
+                      "{:10.10} {:10.10} {} {} [{}]",
                       topic.name(),
                       sample.color,
                       sample.x,
