@@ -1,5 +1,5 @@
 use std::{
-  cmp::max,
+  cmp::{max, min},
   collections::{BTreeMap, BTreeSet},
   ops::Bound::Included,
   rc::Rc,
@@ -30,7 +30,10 @@ use crate::{
   network::udp_sender::UDPSender,
   polling::SharedTimer,
   rtps::{
-    constant::{NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION},
+    constant::{
+      DEFAULT_WRITER_MAX_SAMPLES, HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW,
+      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION,
+    },
     rtps_reader_proxy::RtpsReaderProxy,
     timed_event::DpTimerEvent,
     Message, MessageBuilder,
@@ -236,6 +239,9 @@ pub(crate) struct Writer {
   /// availability of data by sending a
   /// Heartbeat Message.
   pub heartbeat_period: Option<Duration>,
+  /// Faster Heartbeat period used while some matched reader still has
+  /// unacknowledged samples. `None` for BestEffort (no periodic Heartbeat).
+  pub heartbeat_period_fast: Option<Duration>,
   /// duration to launch cache change remove from DDSCache
   pub cache_cleaning_period: Duration,
   /// Protocol tuning parameter that
@@ -344,7 +350,7 @@ impl Writer {
       .reliability
       .and_then(|reliability| {
         if matches!(reliability, Reliability::Reliable { .. }) {
-          Some(Duration::from_secs(1))
+          Some(HEARTBEAT_PERIOD_SLOW)
         } else {
           None
         }
@@ -360,6 +366,10 @@ impl Writer {
           hbp
         }
       });
+
+    // Faster Heartbeat period used while some reader is still behind. Never
+    // slower than the (possibly liveliness-shortened) slow period.
+    let heartbeat_period_fast = heartbeat_period.map(|slow| min(HEARTBEAT_PERIOD_FAST, slow));
 
     // TODO: Configuration value
     let cache_cleaning_period = Duration::from_secs(6);
@@ -388,6 +398,7 @@ impl Writer {
       heartbeat_message_counter: atomic::AtomicI32::new(1),
       push_mode: true,
       heartbeat_period,
+      heartbeat_period_fast,
       cache_cleaning_period,
       nack_response_delay: NACK_RESPONSE_DELAY, // default value from dp_event_loop
       nackfrag_response_delay: NACK_RESPONSE_DELAY, // default value from dp_event_loop
@@ -467,10 +478,18 @@ impl Writer {
   pub fn handle_timed_event(&mut self, event: TimedEvent) {
     match event {
       TimedEvent::Heartbeat => {
-        self.handle_heartbeat_tick(false);
+        let readers_behind = self.handle_heartbeat_tick(false);
         // ^^ false = This is automatic heartbeat by timer, not manual by application
         // call.
-        if let Some(period) = self.heartbeat_period {
+        // Adaptive period: reschedule sooner (fast) while some reader still has
+        // unacknowledged data so repair is prompted quickly, and back off to the
+        // slow period once everyone is caught up to keep idle traffic low.
+        let next_period = if readers_behind {
+          self.heartbeat_period_fast.or(self.heartbeat_period)
+        } else {
+          self.heartbeat_period
+        };
+        if let Some(period) = next_period {
           self.schedule_timed_event(std::time::Duration::from(period), TimedEvent::Heartbeat);
         }
       }
@@ -522,11 +541,19 @@ impl Writer {
 
   /// This is called by dp_wrapper every time cacheCleaning message is received.
   fn handle_cache_cleaning(&mut self) {
-    let resource_limit = 32;
-    // TODO: This limit should be obtained
-    // from Topic and Writer QoS. There should be some reasonable default limit
-    // in case some supplied QoS setting does not specify a larger value.
-    // In any case, there has to be some limit to avoid memory leak.
+    // Upper bound on retained samples. Use the Writer QoS ResourceLimits if it
+    // specifies a positive max_samples; otherwise fall back to a generous
+    // default so that a reliable Writer keeps unacknowledged samples available
+    // for repair instead of evicting them eagerly. This is only a memory-safety
+    // backstop, not a normal operating limit.
+    let resource_limit = self
+      .qos_policies
+      .resource_limits()
+      .map(|rl| rl.max_samples)
+      .filter(|&max_samples| max_samples > 0)
+      .map_or(DEFAULT_WRITER_MAX_SAMPLES, |max_samples| {
+        max_samples as usize
+      });
 
     match self.qos_policies.history {
       None => {
@@ -760,14 +787,19 @@ impl Writer {
   // --------------------------------------------------------------
 
   /// This is called periodically.
-  pub fn handle_heartbeat_tick(&mut self, is_manual_assertion: bool) {
+  ///
+  /// Returns `true` if some matched reader still has unacknowledged data (i.e.
+  /// a HEARTBEAT was sent to prompt repair), so the caller can reschedule the
+  /// next periodic heartbeat sooner. Returns `false` when all readers are
+  /// caught up.
+  pub fn handle_heartbeat_tick(&mut self, is_manual_assertion: bool) -> bool {
     if self.like_stateless {
       info!(
         "Ignoring handling heartbeat tick in a stateless-like Writer, since it currently supports \
          only BestEffort QoS. topic={:?}",
         self.my_topic_name
       );
-      return;
+      return false;
     }
     // Reliable Stateful Writer (that tracks Readers by ReaderProxy) will not set
     // the final flag.
@@ -789,6 +821,7 @@ impl Writer {
       .all(|rp| last_change < rp.all_acked_before)
     {
       trace!("heartbeat tick: all readers have all available data.");
+      false
     } else {
       // the interface to .heartbeat_msg is silly: we give ref to ourself
       // and that function then queries us.
@@ -836,6 +869,7 @@ impl Writer {
           &mut self.readers.values(),
         );
       }
+      true
     }
   }
 
@@ -1265,7 +1299,7 @@ impl Writer {
         .unwrap_or_else(SequenceNumber::zero);
       // If all readers have acked all up to before 5, and depth is 5, we need
       // to keep samples 0..4, i.e. from acked_up_to_before - depth .
-      if let Some(depth) = depth {
+      let depth_keeper = if let Some(depth) = depth {
         max(
           acked_by_all_readers - SequenceNumber::from(depth),
           self.history_buffer.first_change_sequence_number(),
@@ -1273,7 +1307,12 @@ impl Writer {
       } else {
         // try to keep all
         self.history_buffer.first_change_sequence_number()
-      }
+      };
+      // Never evict samples that some matched (reliable) reader has not yet
+      // acknowledged: clamp the keeper to at most the all-acked point so that
+      // unacknowledged samples remain available for repair. The resource-limit
+      // backstop below still bounds memory if a reader falls hopelessly behind.
+      min(depth_keeper, acked_by_all_readers)
     } else {
       // Stateless-like writer currently supports only BestEffort behavior, so here we
       // make it explicit that it does not care about acked sequence numbers
@@ -1283,6 +1322,8 @@ impl Writer {
         self.history_buffer.first_change_sequence_number(),
       )
     };
+    // Memory-safety backstop: never retain more than `resource_limit` samples,
+    // even if that forces eviction of still-unacknowledged data.
     let first_keeper = max(
       max(
         first_keeper,

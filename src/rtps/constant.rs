@@ -21,6 +21,26 @@ pub const CACHE_CLEAN_PERIOD: Duration = Duration::from_secs(4);
 pub const NACK_RESPONSE_DELAY: Duration = Duration::from_millis(200);
 pub const NACK_SUPPRESSION_DURATION: Duration = Duration::from_millis(0);
 
+// Periodic HEARTBEAT period for reliable Writers. The period is adaptive: while
+// some matched reader is behind (has unacknowledged samples), heartbeats are
+// sent at the FAST period to prompt prompt repair (some peers rely on a
+// standalone HEARTBEAT, not the one piggybacked on DATA). Once all readers have
+// acknowledged everything, the writer backs off to the SLOW period to keep
+// idle-traffic low.
+// Note: these use the RTPS `Duration` type (not `std::time::Duration`) to match
+// the Writer's `heartbeat_period` field.
+pub const HEARTBEAT_PERIOD_SLOW: crate::structure::duration::Duration =
+  crate::structure::duration::Duration::from_secs(1);
+pub const HEARTBEAT_PERIOD_FAST: crate::structure::duration::Duration =
+  crate::structure::duration::Duration::from_millis(100);
+
+// Fallback upper bound on the number of CacheChanges a Writer retains in its
+// history when the Writer QoS does not specify ResourceLimits.max_samples. This
+// is only a memory-safety backstop: for reliable Writers, samples that matched
+// reliable readers have not yet acknowledged are retained up to this bound (so
+// they remain available for repair) rather than being evicted eagerly.
+pub const DEFAULT_WRITER_MAX_SAMPLES: usize = 8192;
+
 // Helper list for initializing remote standard (non-secure) built-in readers
 // Structure is (builtin_writer_entity_id, builtin_reader_entity_id,
 // reader_as_BuiltinEndpointSet)
