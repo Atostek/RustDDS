@@ -359,10 +359,19 @@ impl QosPolicies {
   }
 
   fn compliance_failure_wrt_impl(&self, other: &Self) -> Option<QosPolicyId> {
-    // TODO: Check for cases where policy is requested, but not offered (None)
+    // A QoS policy that is absent from an endpoint's discovery data must be
+    // treated as that policy's DDS default value (DDS spec v1.4 §2.2.3): the
+    // remote endpoint is in fact using the default, it just omitted the
+    // (default-valued) policy from the wire. Comparing only when *both* sides
+    // are `Some` would miss incompatibilities where one side omitted a
+    // default-valued policy (e.g. a writer that does not announce the default
+    // VOLATILE durability), causing incompatible endpoints to match.
 
     // check Durability: Offered must be better than or equal to Requested.
-    if let (Some(off), Some(req)) = (self.durability, other.durability) {
+    // Default: VOLATILE (the lowest).
+    {
+      let off = self.durability.unwrap_or(policy::Durability::Volatile);
+      let req = other.durability.unwrap_or(policy::Durability::Volatile);
       if off < req {
         return Some(QosPolicyId::Durability);
       }
@@ -372,7 +381,15 @@ impl QosPolicies {
     // * If coherent_access is requested, it must be offered also. AND
     // * Same for ordered_access. AND
     // * Offered access scope is broader than requested.
-    if let (Some(off), Some(req)) = (self.presentation, other.presentation) {
+    // Default: INSTANCE scope, no coherent access, no ordered access.
+    {
+      let default = policy::Presentation {
+        access_scope: policy::PresentationAccessScope::Instance,
+        coherent_access: false,
+        ordered_access: false,
+      };
+      let off = self.presentation.unwrap_or(default);
+      let req = other.presentation.unwrap_or(default);
       if (req.coherent_access && !off.coherent_access)
         || (req.ordered_access && !off.ordered_access)
         || (req.access_scope > off.access_scope)
@@ -381,24 +398,37 @@ impl QosPolicies {
       }
     }
 
-    // check Deadline: offered period <= requested period
-    if let (Some(off), Some(req)) = (self.deadline, other.deadline) {
+    // check Deadline: offered period <= requested period. Default: INFINITE.
+    {
+      let off = self
+        .deadline
+        .unwrap_or(policy::Deadline(Duration::INFINITE));
+      let req = other
+        .deadline
+        .unwrap_or(policy::Deadline(Duration::INFINITE));
       if off.0 > req.0 {
         return Some(QosPolicyId::Deadline);
       }
     }
 
-    // check Latency Budget:
-    // offered duration <= requested duration
-    if let (Some(off), Some(req)) = (self.latency_budget, other.latency_budget) {
+    // check Latency Budget: offered duration <= requested duration.
+    // Default: zero.
+    {
+      let off = self.latency_budget.unwrap_or(policy::LatencyBudget {
+        duration: Duration::ZERO,
+      });
+      let req = other.latency_budget.unwrap_or(policy::LatencyBudget {
+        duration: Duration::ZERO,
+      });
       if off.duration > req.duration {
         return Some(QosPolicyId::LatencyBudget);
       }
     }
 
-    // check Ownership:
-    // offered kind == requested kind
-    if let (Some(off), Some(req)) = (self.ownership, other.ownership) {
+    // check Ownership: offered kind == requested kind. Default: SHARED.
+    {
+      let off = self.ownership.unwrap_or(policy::Ownership::Shared);
+      let req = other.ownership.unwrap_or(policy::Ownership::Shared);
       if off != req {
         return Some(QosPolicyId::Ownership);
       }
@@ -408,9 +438,15 @@ impl QosPolicies {
     // offered kind >= requested kind
     // Definition: AUTOMATIC < MANUAL_BY_PARTICIPANT < MANUAL_BY_TOPIC
     // AND offered lease_duration <= requested lease_duration
+    // Default: AUTOMATIC with INFINITE lease duration.
     //
     // See Ord implementation on Liveliness.
-    if let (Some(off), Some(req)) = (self.liveliness, other.liveliness) {
+    {
+      let default = policy::Liveliness::Automatic {
+        lease_duration: Duration::INFINITE,
+      };
+      let off = self.liveliness.unwrap_or(default);
+      let req = other.liveliness.unwrap_or(default);
       if off < req {
         return Some(QosPolicyId::Liveliness);
       }
@@ -419,7 +455,13 @@ impl QosPolicies {
     // check Reliability
     // offered kind >= requested kind
     // kind ranking: BEST_EFFORT < RELIABLE
-    if let (Some(off), Some(req)) = (self.reliability, other.reliability) {
+    // Default differs by entity: a DataWriter (offered) defaults to RELIABLE,
+    // a DataReader (requested) defaults to BEST_EFFORT.
+    {
+      let off = self.reliability.unwrap_or(policy::Reliability::Reliable {
+        max_blocking_time: Duration::ZERO,
+      });
+      let req = other.reliability.unwrap_or(policy::Reliability::BestEffort);
       if off < req {
         return Some(QosPolicyId::Reliability);
       }
@@ -428,7 +470,14 @@ impl QosPolicies {
     // check Destination Order
     // offered kind >= requested kind
     // kind ranking: BY_RECEPTION_TIMESTAMP < BY_SOURCE_TIMESTAMP
-    if let (Some(off), Some(req)) = (self.destination_order, other.destination_order) {
+    // Default: BY_RECEPTION_TIMESTAMP (the lowest).
+    {
+      let off = self
+        .destination_order
+        .unwrap_or(policy::DestinationOrder::ByReceptionTimestamp);
+      let req = other
+        .destination_order
+        .unwrap_or(policy::DestinationOrder::ByReceptionTimestamp);
       if off < req {
         return Some(QosPolicyId::DestinationOrder);
       }
