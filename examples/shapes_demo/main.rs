@@ -155,10 +155,11 @@ fn main() {
     "QoS policy Ownership Strength is not yet implemented."
   );
 
-  assert!(
-    !matches.contains_id("representation"),
-    "QoS policy Representation is not yet implemented."
-  );
+  // The interoperability test harness always passes -x (data representation).
+  // RustDDS does not expose representation as a selectable QoS, so we accept the
+  // flag for CLI compatibility but do not act on it (the default wire encoding is
+  // used). Plain ShapeType encodes identically under XCDR1/XCDR2.
+  let _ = matches.get_one::<String>("representation");
 
   let qos = qos_b.build();
 
@@ -179,7 +180,6 @@ fn main() {
   if is_auto_test {
     // Make automation tests happy
     println!("Create topic: {}", topic.name());
-    println!("Create reader for topic: {}", topic.name());
   } else {
     println!(
       "Topic name is {}. Type is {}.",
@@ -226,6 +226,10 @@ fn main() {
         PollOpt::edge(),
       )
       .unwrap();
+    if is_auto_test {
+      // Make automation tests happy (publisher role)
+      println!("Create writer for topic: {}", topic.name());
+    }
     Some(writer)
   } else {
     None
@@ -249,6 +253,10 @@ fn main() {
       )
       .unwrap();
     debug!("Created DataReader");
+    if is_auto_test {
+      // Make automation tests happy (subscriber role)
+      println!("Create reader for topic: {}", topic.name());
+    }
     Some(reader)
   } else {
     None
