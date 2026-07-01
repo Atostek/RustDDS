@@ -24,10 +24,17 @@
 use std::{
   collections::BTreeMap,
   net::{IpAddr, SocketAddr},
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 use crate::structure::{guid::GuidPrefix, locator::Locator};
+
+/// Hysteresis margin for switching a remote participant's chosen multicast
+/// egress interface. Once an interface is chosen it stays chosen until we have
+/// not heard from it for at least this long *and* the participant's traffic is
+/// arriving on a different interface. This keeps the route stable across
+/// occasional stray packets on a secondary interface.
+pub(crate) const STICKY_SWITCH_MARGIN: Duration = Duration::from_secs(30);
 
 /// Identifies a local network interface to use as the egress for multicast.
 ///
@@ -80,6 +87,10 @@ pub enum RouteKey {
 #[derive(Clone, Debug)]
 pub struct InterfaceObservation {
   pub last_seen: Instant,
+  /// Number of packets observed on this interface. Retained for diagnostics and
+  /// possible future selection policies; the current sticky heuristic decides
+  /// switches purely on `last_seen`.
+  #[allow(dead_code)]
   pub count: u64,
   pub source: Option<SocketAddr>,
 }
@@ -92,13 +103,28 @@ pub struct ObservedRoutes {
   /// Most recent source socket address seen for this participant, regardless of
   /// whether the receiving interface could be determined.
   last_source: Option<SocketAddr>,
+  /// The interface currently chosen for multicast egress to this participant.
+  /// Updated with hysteresis (see [`STICKY_SWITCH_MARGIN`]) so it does not flip
+  /// on a single stray packet arriving on another interface.
+  current_interface: Option<InterfaceSelector>,
 }
 
 impl ObservedRoutes {
   fn record(&mut self, iface: Option<InterfaceSelector>, source: SocketAddr) {
+    self.record_at(iface, source, Instant::now(), STICKY_SWITCH_MARGIN);
+  }
+
+  /// Testable core of [`Self::record`]: `now` and `margin` are injected so the
+  /// hysteresis can be exercised deterministically.
+  fn record_at(
+    &mut self,
+    iface: Option<InterfaceSelector>,
+    source: SocketAddr,
+    now: Instant,
+    margin: Duration,
+  ) {
     self.last_source = Some(source);
     if let Some(iface) = iface {
-      let now = Instant::now();
       self
         .by_iface
         .entry(iface)
@@ -112,6 +138,25 @@ impl ObservedRoutes {
           count: 1,
           source: Some(source),
         });
+
+      // Sticky choice: a switch is only ever triggered by receiving on a
+      // non-current interface (the challenger, whose `last_seen` is `now`).
+      // Displace the current interface only if we have not heard from it for at
+      // least `margin`; otherwise the current interface stays chosen. A current
+      // interface that keeps receiving traffic is thus never displaced.
+      match self.current_interface {
+        None => self.current_interface = Some(iface),
+        Some(cur) if cur == iface => { /* refreshed the current choice; keep */ }
+        Some(cur) => {
+          let displace = self
+            .by_iface
+            .get(&cur)
+            .is_none_or(|o| now.saturating_duration_since(o.last_seen) >= margin);
+          if displace {
+            self.current_interface = Some(iface);
+          }
+        }
+      }
     }
   }
 
@@ -120,19 +165,15 @@ impl ObservedRoutes {
     self.last_source
   }
 
-  /// The "best" local interface to reach this participant: the most recently
-  /// observed one, breaking ties by observation count. `None` if we have never
-  /// determined a receiving interface for it.
+  /// The local interface currently chosen to reach this participant.
+  ///
+  /// This is sticky: it stays on the previously chosen interface until the
+  /// participant's traffic has been arriving on a different interface and the
+  /// old one has been silent for at least [`STICKY_SWITCH_MARGIN`] (see
+  /// [`Self::record_at`]). `None` if we have never determined a receiving
+  /// interface for this participant.
   pub fn best_interface(&self) -> Option<InterfaceSelector> {
-    self
-      .by_iface
-      .iter()
-      .max_by(|(_, a), (_, b)| {
-        a.last_seen
-          .cmp(&b.last_seen)
-          .then_with(|| a.count.cmp(&b.count))
-      })
-      .map(|(iface, _)| *iface)
+    self.current_interface
   }
 
   /// Number of distinct local interfaces this participant has been seen on.
@@ -392,7 +433,9 @@ mod tests {
   }
 
   #[test]
-  fn observations_track_best_interface() {
+  fn observations_sticky_within_margin() {
+    // Recording A, A, then B microseconds apart (default 30s margin) must NOT
+    // flip the chosen interface: A was seen well within the margin.
     let mut obs = InterfaceObservations::new();
     let p = GuidPrefix::UNKNOWN;
     obs.record(p, Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
@@ -400,7 +443,78 @@ mod tests {
     obs.record(p, Some(iface([192, 168, 1, 1])), sockaddr([192, 168, 1, 5], 7410));
     let recorded = obs.get(p).unwrap();
     assert_eq!(recorded.interface_count(), 2);
-    // Most recent wins (the 192.168 one recorded last).
-    assert_eq!(recorded.best_interface(), Some(iface([192, 168, 1, 1])));
+    // Sticky: the first-chosen interface stays.
+    assert_eq!(recorded.best_interface(), Some(iface([10, 0, 0, 1])));
+  }
+
+  #[test]
+  fn sticky_first_observation_is_chosen() {
+    let mut obs = ObservedRoutes::default();
+    let t0 = Instant::now();
+    obs.record_at(
+      Some(iface([10, 0, 0, 1])),
+      sockaddr([10, 0, 0, 5], 7410),
+      t0,
+      Duration::from_secs(30),
+    );
+    assert_eq!(obs.best_interface(), Some(iface([10, 0, 0, 1])));
+  }
+
+  #[test]
+  fn sticky_does_not_switch_within_margin() {
+    let mut obs = ObservedRoutes::default();
+    let margin = Duration::from_secs(30);
+    let t0 = Instant::now();
+    obs.record_at(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410), t0, margin);
+    // Challenger arrives before the current interface has been silent for the
+    // full margin -> no switch.
+    obs.record_at(
+      Some(iface([192, 168, 1, 1])),
+      sockaddr([192, 168, 1, 5], 7410),
+      t0 + Duration::from_secs(29),
+      margin,
+    );
+    assert_eq!(obs.best_interface(), Some(iface([10, 0, 0, 1])));
+  }
+
+  #[test]
+  fn sticky_switches_past_margin() {
+    let mut obs = ObservedRoutes::default();
+    let margin = Duration::from_secs(30);
+    let t0 = Instant::now();
+    obs.record_at(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410), t0, margin);
+    // Current interface has been silent for >= margin when the challenger is
+    // heard -> switch.
+    obs.record_at(
+      Some(iface([192, 168, 1, 1])),
+      sockaddr([192, 168, 1, 5], 7410),
+      t0 + Duration::from_secs(30),
+      margin,
+    );
+    assert_eq!(obs.best_interface(), Some(iface([192, 168, 1, 1])));
+  }
+
+  #[test]
+  fn sticky_busy_current_never_displaced() {
+    let mut obs = ObservedRoutes::default();
+    let margin = Duration::from_secs(30);
+    let t0 = Instant::now();
+    let current = iface([10, 0, 0, 1]);
+    let challenger = iface([192, 168, 1, 1]);
+    obs.record_at(Some(current), sockaddr([10, 0, 0, 5], 7410), t0, margin);
+    // Interleave: the current interface keeps receiving every 10s, while an
+    // intermittent challenger also shows up. The current interface is never
+    // silent for a full margin, so it is never displaced.
+    for k in 1..=6 {
+      let t = t0 + Duration::from_secs(10 * k);
+      obs.record_at(Some(challenger), sockaddr([192, 168, 1, 5], 7410), t, margin);
+      obs.record_at(
+        Some(current),
+        sockaddr([10, 0, 0, 5], 7410),
+        t + Duration::from_secs(1),
+        margin,
+      );
+    }
+    assert_eq!(obs.best_interface(), Some(current));
   }
 }
