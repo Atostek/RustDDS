@@ -2079,7 +2079,16 @@ impl Discovery {
   pub const fn create_participant_volatile_message_secure_qos() -> QosPolicies {
     // See Table 18 – Non-default Qos policies for
     // BuiltinParticipantVolatileMessageSecureWriter of the Security spec
-    QosPolicyBuilder::new()
+    //
+    // Base this on builtin_subscriber_qos_builder() (like the other built-in
+    // QoS) so that the fabricated remote writer proxy carries the same
+    // presentation/deadline/ownership/etc. policies as the locally created
+    // volatile reader (whose effective QoS inherits them from the built-in
+    // Subscriber). Using an empty QosPolicyBuilder here left presentation unset
+    // on the proxy while the reader required PresentationAccessScope::Topic,
+    // causing a spurious QoS incompatibility that prevented the volatile
+    // endpoints from matching and blocked all secure key exchange.
+    Self::builtin_subscriber_qos_builder()
       .reliability(Reliability::Reliable {
         max_blocking_time: Duration::from_std(StdDuration::from_millis(100)),
       })
