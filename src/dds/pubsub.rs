@@ -496,12 +496,17 @@ impl InnerPublisher {
         _ => resource_max.unwrap_or(DEFAULT_WRITER_MAX_SAMPLES),
       }
     };
+    // nonblocking-transmit: the unsent-backlog limit bounds how many admitted
+    // samples may await transmission when the network socket is congested. We
+    // reuse the same capacity as the reliable window.
+    let backlog_limit = window_limit;
     let send_buffer = WriterSendBuffer::new(
       guid,
       topic.name(),
       writer_qos.is_reliable(),
       guid.entity_id.entity_kind.is_built_in(),
       window_limit,
+      backlog_limit,
     );
     // mio readiness "doorbell": the DataWriter rings `doorbell` after admitting a
     // sample; the event loop registers `doorbell_registration` under the writer's

@@ -9,6 +9,7 @@ use crate::{
     discovery::Discovery,
     sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
   },
+  rtps::outbound::SocketId,
   structure::guid::{EntityId, EntityKind, GuidPrefix, GUID},
   QosPolicies,
 };
@@ -307,6 +308,35 @@ pub const P2P_SECURE_DISCOVERY_PARTICIPANT_MESSAGE_TOKEN: Token = Token(60 + PTB
 pub const P2P_PARTICIPANT_STATELESS_MESSAGE_TOKEN: Token = Token(62 + PTB);
 pub const CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_TIMER_TOKEN: Token = Token(63 + PTB);
 pub const P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_TOKEN: Token = Token(64 + PTB);
+
+// nonblocking-transmit: write-readiness tokens for the sender sockets. The
+// unicast socket uses SENDER_WRITABLE_BASE; each multicast interface socket i
+// uses SENDER_WRITABLE_BASE + 1 + i. These are fixed poll tokens and must stay
+// within the PTB+79 maximum, so at most 13 multicast sender sockets are
+// supported (in practice one per multicast-capable local interface).
+// (see src/rtps/nonblocking_transmit_design.md)
+pub const SENDER_WRITABLE_BASE: usize = 65 + PTB;
+pub const SENDER_WRITABLE_MAX: usize = 79 + PTB;
+
+/// The fixed poll token used to watch a sender socket for write readiness.
+pub fn sender_writable_token(id: SocketId) -> Token {
+  match id {
+    SocketId::Unicast => Token(SENDER_WRITABLE_BASE),
+    SocketId::Multicast(i) => Token(SENDER_WRITABLE_BASE + 1 + i),
+  }
+}
+
+/// Decode a fixed poll token back into the sender socket it watches, if any.
+pub fn sender_writable_socket_id(token: Token) -> Option<SocketId> {
+  if token.0 < SENDER_WRITABLE_BASE || token.0 > SENDER_WRITABLE_MAX {
+    return None;
+  }
+  if token.0 == SENDER_WRITABLE_BASE {
+    Some(SocketId::Unicast)
+  } else {
+    Some(SocketId::Multicast(token.0 - SENDER_WRITABLE_BASE - 1))
+  }
+}
 
 // See note about maximum allowed number above.
 

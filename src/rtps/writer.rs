@@ -32,6 +32,7 @@ use crate::{
       DEFAULT_WRITER_MAX_SAMPLES, HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW,
       NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION,
     },
+    outbound::{SocketId, TrafficClass},
     rtps_reader_proxy::RtpsReaderProxy,
     timed_event::DpTimerEvent,
     transmit::{DefaultRouteSelector, InterfaceObservations, RouteKey},
@@ -60,6 +61,35 @@ use crate::no_security::SecurityPluginsHandle;
 pub enum DeliveryMode {
   Unicast,
   Multicast,
+}
+
+/// nonblocking-transmit: how far into the current push-mode sample we have
+/// transmitted. Lets a large (fragmented) sample resume from the exact point
+/// where the socket last returned WouldBlock, instead of restarting.
+/// (see src/rtps/nonblocking_transmit_design.md)
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum SampleCursor {
+  /// Nothing of this sample has been transmitted yet (fresh DATA, or the first
+  /// DATAFRAG together with any leading GAP).
+  Fresh,
+  /// Resume DATAFRAG transmission starting at this fragment number, then the
+  /// trailing HEARTBEAT.
+  Frag(FragmentNumber),
+  /// All fragments sent; only the trailing HEARTBEAT of a fragmented sample
+  /// remains.
+  Heartbeat,
+}
+
+/// nonblocking-transmit: outcome of a resumable bulk send of one cache change.
+pub(crate) enum SendProgress {
+  /// The whole sample (all fragments + trailing HEARTBEAT) was transmitted.
+  Complete,
+  /// A socket returned WouldBlock. `cursor` is where to resume, `blocked` names
+  /// the sockets to arm for write readiness.
+  Blocked {
+    cursor: SampleCursor,
+    blocked: BTreeSet<SocketId>,
+  },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,9 +213,17 @@ pub(crate) struct Writer {
   /// Shared, flow-controlled buffer of outgoing samples. Filled by the
   /// `DataWriter` (admission + sequence numbering), drained/transmitted here.
   send_buffer: WriterSendBuffer,
-  /// Highest sequence number this Writer has already transmitted (push mode).
+  /// Highest sequence number this Writer has fully transmitted (push mode).
   /// Samples with `seq` in `(last_sent, send_buffer.last]` are pending send.
   last_sent: SequenceNumber,
+  /// nonblocking-transmit: transmit progress within the sample `last_sent + 1`
+  /// (the one currently being pushed). `Fresh` unless a large sample was
+  /// interrupted mid-way by a full socket.
+  sample_cursor: SampleCursor,
+  /// nonblocking-transmit: sockets on which the last push attempt hit
+  /// WouldBlock. Drained by the event loop, which enqueues this writer on those
+  /// sockets' round-robin queues and arms write readiness.
+  blocked_sockets: BTreeSet<SocketId>,
 
   /// Contains timer that needs to be set to timeout with duration of
   /// self.heartbeat_period timed_event_handler sends notification when timer
@@ -290,6 +328,8 @@ impl Writer {
       my_topic_name: i.topic_name,
       send_buffer: i.send_buffer,
       last_sent: SequenceNumber::zero(),
+      sample_cursor: SampleCursor::Fresh,
+      blocked_sockets: BTreeSet::new(),
       timed_event_timer,
       like_stateless: i.like_stateless,
       qos_policies: i.qos_policies,
@@ -457,14 +497,23 @@ impl Writer {
 
   // The DataWriter has admitted one or more new samples into the shared send
   // buffer and rung the doorbell. Transmit every sample we have not sent yet.
+  //
+  // nonblocking-transmit: this is also the resume entry point. When a socket
+  // returns WouldBlock mid-way, we stop and remember exactly where (`last_sent`
+  // + `sample_cursor`); the event loop re-invokes us on write readiness. Large
+  // (fragmented) samples resume from the exact fragment, never restart. Blocked
+  // sockets are recorded in `blocked_sockets` for the event loop to schedule.
   pub fn process_pending(&mut self) {
     // Reset the doorbell to empty *before* reading the buffer state, so that any
     // sample admitted concurrently re-arms the (edge-triggered) doorbell and we
     // are woken again. The shared buffer's `last_seq` is the source of truth.
     let _ = self.doorbell.set_readiness(Ready::empty());
 
-    let last_available = self.send_buffer.last_change_sequence_number();
-    while self.last_sent < last_available {
+    loop {
+      let last_available = self.send_buffer.last_change_sequence_number();
+      if self.last_sent >= last_available {
+        break;
+      }
       let sequence_number = self.last_sent.plus_1();
 
       // Fetch an owned clone of the sample (cheap, Bytes-backed) so we hold the
@@ -473,13 +522,14 @@ impl Writer {
         // The sample is gone (e.g. evicted). Skip it; readers that need it will
         // be told via GAP during repair.
         self.last_sent = sequence_number;
+        self.sample_cursor = SampleCursor::Fresh;
+        self.send_buffer.set_sent_frontier(sequence_number);
         continue;
       };
       let write_options = cc.write_options.clone();
 
-      // If not acting stateless-like, notify reader proxies that there is a new
-      // sample.
-      if !self.like_stateless {
+      // Notify reader proxies once per sample (only when starting it fresh).
+      if self.sample_cursor == SampleCursor::Fresh && !self.like_stateless {
         for reader in self.readers.values_mut() {
           reader.notify_new_cache_change(sequence_number);
 
@@ -494,15 +544,34 @@ impl Writer {
       }
 
       if self.push_mode {
-        // Send data (DATA or DATAFRAGs) and a Heartbeat
-        let target_reader_opt = match write_options.to_single_reader() {
-          Some(guid) => self.readers.get(&guid), // Sending only to this reader
-          None => None,                          // Sending to all matched readers
+        // Send data (DATA or DATAFRAGs) and a Heartbeat, resuming from the
+        // current fragment cursor. Compute the send in an inner scope so the
+        // immutable borrow of `self.readers` (target reader) is released before
+        // we mutate our cursor/frontier below.
+        let cursor = self.sample_cursor;
+        let (_fragmented, progress) = {
+          let target_reader_opt = match write_options.to_single_reader() {
+            Some(guid) => self.readers.get(&guid), // Sending only to this reader
+            None => None,                          // Sending to all matched readers
+          };
+          self.send_cache_change_from(&cc, true, target_reader_opt, cursor)
         };
-        let send_also_heartbeat = true;
-        self.send_cache_change(&cc, send_also_heartbeat, target_reader_opt);
+        match progress {
+          SendProgress::Complete => {
+            self.last_sent = sequence_number;
+            self.sample_cursor = SampleCursor::Fresh;
+            self.send_buffer.set_sent_frontier(sequence_number);
+          }
+          SendProgress::Blocked { cursor, blocked } => {
+            // Stop here; resume on write readiness. Back-pressure to the
+            // application follows from `sent_frontier` not advancing.
+            self.sample_cursor = cursor;
+            self.blocked_sockets.extend(blocked);
+            return;
+          }
+        }
       } else {
-        // Send Heartbeat only.
+        // Send Heartbeat only (control).
         // Readers will ask for the DATA with ACKNACK, if they are interested.
         let final_flag = false; // false = request that readers acknowledge with ACKNACK.
         let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
@@ -522,23 +591,48 @@ impl Writer {
           DeliveryMode::Multicast,
           hb_message,
           &mut self.readers.values(),
+          TrafficClass::Control,
         );
+        self.last_sent = sequence_number;
+        self.sample_cursor = SampleCursor::Fresh;
+        self.send_buffer.set_sent_frontier(sequence_number);
       }
-
-      self.last_sent = sequence_number;
     }
   }
 
-  // Returns a boolean telling if the data had to be fragmented
+  /// nonblocking-transmit: drain and return the sockets on which the last push
+  /// attempt hit WouldBlock, so the event loop can enqueue this writer for a
+  /// round-robin resume on write readiness.
+  pub fn take_blocked_sockets(&mut self) -> BTreeSet<SocketId> {
+    std::mem::take(&mut self.blocked_sockets)
+  }
+
+  // Returns a boolean telling if the data had to be fragmented. This one-shot
+  // wrapper is used by the repair path: on WouldBlock the datagram is dropped
+  // (the reader will re-NACK), so repair never buffers or stalls.
   fn send_cache_change(
     &self,
     cc: &CacheChange,
     send_also_heartbeat: bool,
-    target_reader_opt: Option<&RtpsReaderProxy>, /* if present, we are asked to send the cache
-                                                  * change only to the target reader */
+    target_reader_opt: Option<&RtpsReaderProxy>,
   ) -> bool {
-    // First make sure that if the data is meant for a single reader only, we do not
-    // accidentally send it to everyone
+    let (fragmentation_needed, _progress) =
+      self.send_cache_change_from(cc, send_also_heartbeat, target_reader_opt, SampleCursor::Fresh);
+    fragmentation_needed
+  }
+
+  // Resumable bulk send of one cache change starting at `cursor`. Returns
+  // whether the sample is fragmented and how far the send got (Complete, or
+  // Blocked with the cursor to resume from and the sockets that blocked).
+  fn send_cache_change_from(
+    &self,
+    cc: &CacheChange,
+    send_also_heartbeat: bool,
+    target_reader_opt: Option<&RtpsReaderProxy>,
+    cursor: SampleCursor,
+  ) -> (bool, SendProgress) {
+    // First make sure that if the data is meant for a single reader only, we do
+    // not accidentally send it to everyone.
     if let Some(single_reader_guid) = cc.write_options.to_single_reader() {
       match target_reader_opt {
         None => {
@@ -546,44 +640,53 @@ impl Writer {
             "Data is meant for the single reader {single_reader_guid:?} but a proxy for this \
              reader was not provided. Not sending anything."
           );
-          return false;
+          return (false, SendProgress::Complete);
         }
         Some(target_reader) => {
-          // Make the data is meant for the target reader
           if single_reader_guid != target_reader.remote_reader_guid {
             error!(
               "We were asked to send data meant for the reader {single_reader_guid:?} to a \
                different reader {:?}. Not gonna happen.",
               target_reader.remote_reader_guid
             );
-            return false;
+            return (false, SendProgress::Complete);
           }
         }
       }
     }
 
-    let messages_to_send = FragmentationIter::new(self, cc, target_reader_opt, send_also_heartbeat);
+    let messages_to_send =
+      FragmentationIter::new_resume(self, cc, target_reader_opt, send_also_heartbeat, cursor);
     let fragmentation_needed = messages_to_send.fragmentation_needed();
 
-    // Send the messages, either to all readers or just one
-    for msg in messages_to_send {
-      match target_reader_opt {
-        None => {
-          // To all
-          self.send_message_to_readers(DeliveryMode::Multicast, msg, &mut self.readers.values());
-        }
-        Some(reader_proxy) => {
-          // To one
-          self.send_message_to_readers(
-            DeliveryMode::Unicast,
-            msg,
-            &mut std::iter::once(reader_proxy),
-          );
-        }
+    // Send the messages, either to all readers or just one, stopping at the
+    // first message that a socket could not accept.
+    for (resume_cursor, msg) in messages_to_send {
+      let blocked = match target_reader_opt {
+        None => self.send_message_to_readers(
+          DeliveryMode::Multicast,
+          msg,
+          &mut self.readers.values(),
+          TrafficClass::Bulk,
+        ),
+        Some(reader_proxy) => self.send_message_to_readers(
+          DeliveryMode::Unicast,
+          msg,
+          &mut std::iter::once(reader_proxy),
+          TrafficClass::Bulk,
+        ),
+      };
+      if !blocked.is_empty() {
+        return (
+          fragmentation_needed,
+          SendProgress::Blocked {
+            cursor: resume_cursor,
+            blocked,
+          },
+        );
       }
     }
-    // The return value tells if the data had to be fragmented
-    fragmentation_needed
+    (fragmentation_needed, SendProgress::Complete)
   }
 
   // --------------------------------------------------------------
@@ -658,7 +761,7 @@ impl Writer {
           if last_change < rp.all_acked_before {
             // Everything we have has been acknowledged already. Do nothing.
           } else {
-            self.send_message_to_readers(
+            self.send_control_to_readers(
               DeliveryMode::Unicast,
               hb_message.clone(),
               &mut std::iter::once(rp),
@@ -667,7 +770,7 @@ impl Writer {
         }
       } else {
         // Normal case
-        self.send_message_to_readers(
+        self.send_control_to_readers(
           DeliveryMode::Multicast,
           hb_message,
           &mut self.readers.values(),
@@ -799,10 +902,10 @@ impl Writer {
                 reader_proxy.get_pending_gap(),
                 self.my_guid.entity_id,
                 self.endianness,
-                reader_guid,
-              )
-              .add_header_and_build(self.my_guid.prefix);
-            self.send_message_to_readers(
+              reader_guid,
+            )
+            .add_header_and_build(self.my_guid.prefix);
+            self.send_control_to_readers(
               DeliveryMode::Unicast,
               gap_message,
               &mut std::iter::once(reader_proxy),
@@ -1003,7 +1106,7 @@ impl Writer {
         }
         let gap_msg = gap_msg.add_header_and_build(self.my_guid.prefix);
 
-        self.send_message_to_readers(
+        self.send_control_to_readers(
           DeliveryMode::Unicast,
           gap_msg,
           &mut std::iter::once(&*reader_proxy),
@@ -1065,11 +1168,14 @@ impl Writer {
           self.security_plugins.as_ref(),
         );
 
-        // TODO: some sort of queuing is needed
-        self.send_message_to_readers(
+        // nonblocking-transmit: repair frags are bulk. On WouldBlock we simply
+        // drop; the reader will re-NACK, so repair is self-healing and never
+        // buffers or stalls.
+        let _blocked = self.send_message_to_readers(
           DeliveryMode::Unicast,
           message_builder.add_header_and_build(self.my_guid.prefix),
           &mut std::iter::once(&*reader_proxy),
+          TrafficClass::Bulk,
         );
       } else {
         error!(
@@ -1203,12 +1309,18 @@ impl Writer {
     }
   }
 
+  // nonblocking-transmit: `class` selects the queueing policy. `Control`
+  // datagrams go through the never-dropped per-socket control queue; `Bulk`
+  // datagrams are attempted non-blocking and the sockets that returned
+  // WouldBlock are returned so the caller can stop and arm write readiness.
+  // Returns the set of blocked sockets (always empty for `Control`).
   fn send_message_to_readers(
     &self,
     preferred_mode: DeliveryMode,
     message: Message,
     readers: &mut dyn Iterator<Item = &RtpsReaderProxy>,
-  ) {
+    class: TrafficClass,
+  ) -> BTreeSet<SocketId> {
     // Interface-aware transmit (see src/rtps/transmit_design.md): each reader
     // carries a pre-resolved `SendRoute`. When the route is known we emit a
     // single datagram per distinct destination (`RouteKey`), targeting one
@@ -1217,6 +1329,8 @@ impl Writer {
     // so reachability is preserved.
 
     let readers = readers.collect::<Vec<_>>(); // clone iterator
+
+    let mut blocked: BTreeSet<SocketId> = BTreeSet::new();
 
     #[cfg(feature = "security")]
     let encoded = self.security_encode(message, &readers);
@@ -1235,9 +1349,16 @@ impl Writer {
         macro_rules! emit_multicast {
           ($mc:expr, $iface:expr) => {
             if sent_routes.insert(RouteKey::Multicast($mc, $iface)) {
-              self
-                .udp_sender
-                .send_to_multicast_locator_via(&buffer, &$mc, &$iface);
+              match class {
+                TrafficClass::Control => self
+                  .udp_sender
+                  .send_to_multicast_locator_via(&buffer, &$mc, &$iface),
+                TrafficClass::Bulk => blocked.extend(
+                  self
+                    .udp_sender
+                    .try_send_to_multicast_locator_via(&buffer, &$mc, &$iface),
+                ),
+              }
             } else {
               trace!("Already sent to multicast {:?} via {:?}", $mc, $iface);
             }
@@ -1246,7 +1367,12 @@ impl Writer {
         macro_rules! emit_unicast {
           ($uc:expr) => {
             if sent_routes.insert(RouteKey::Unicast($uc)) {
-              self.udp_sender.send_to_locator(&buffer, &$uc);
+              match class {
+                TrafficClass::Control => self.udp_sender.send_to_locator(&buffer, &$uc),
+                TrafficClass::Bulk => {
+                  blocked.extend(self.udp_sender.try_send_to_locator(&buffer, &$uc));
+                }
+              }
             } else {
               trace!("Already sent to unicast {:?}", $uc);
             }
@@ -1256,7 +1382,12 @@ impl Writer {
           ($locs:expr) => {
             for loc in $locs.iter() {
               if sent_legacy.insert(*loc) {
-                self.udp_sender.send_to_locator(&buffer, loc);
+                match class {
+                  TrafficClass::Control => self.udp_sender.send_to_locator(&buffer, loc),
+                  TrafficClass::Bulk => {
+                    blocked.extend(self.udp_sender.try_send_to_locator(&buffer, loc));
+                  }
+                }
               } else {
                 trace!("Already sent to {:?}", loc);
               }
@@ -1304,6 +1435,28 @@ impl Writer {
       }
       Err(e) => error!("Failed to send message to readers. Encoding failed: {e:?}"),
     }
+    blocked
+  }
+
+  // Kept for readability at call sites that fire a single control message and
+  // do not care about back-pressure (heartbeats, GAPs, repair control).
+  fn send_control_to_readers(
+    &self,
+    preferred_mode: DeliveryMode,
+    message: Message,
+    readers: &mut dyn Iterator<Item = &RtpsReaderProxy>,
+  ) {
+    let _ = self.send_message_to_readers(preferred_mode, message, readers, TrafficClass::Control);
+  }
+
+  #[allow(dead_code)] // symmetry with send_control_to_readers; reserved for future direct bulk sends
+  fn send_bulk_to_readers(
+    &self,
+    preferred_mode: DeliveryMode,
+    message: Message,
+    readers: &mut dyn Iterator<Item = &RtpsReaderProxy>,
+  ) -> BTreeSet<SocketId> {
+    self.send_message_to_readers(preferred_mode, message, readers, TrafficClass::Bulk)
   }
 
   // Send status to DataWriter or however is listening
@@ -1541,11 +1694,17 @@ struct FragmentationIter<'a> {
 }
 
 impl<'a> FragmentationIter<'a> {
-  fn new(
+  // nonblocking-transmit: build an iterator that resumes at `cursor`. `Fresh`
+  // yields everything (leading GAP for a single reader, all DATAFRAGs, trailing
+  // HEARTBEAT, or a single DATA for an unfragmented sample). `Frag(n)` skips the
+  // GAP and earlier fragments and resumes at fragment `n`. `Heartbeat` yields
+  // only the trailing HEARTBEAT.
+  fn new_resume(
     writer: &'a Writer,
     cache_change: &'a CacheChange,
     target_reader_opt: Option<&'a RtpsReaderProxy>,
     send_heartbeat: bool,
+    cursor: SampleCursor,
   ) -> Self {
     // The EntityId of the destination
     let reader_entity_id =
@@ -1555,7 +1714,18 @@ impl<'a> FragmentationIter<'a> {
     let fragmentation_needed = data_size > writer.data_max_size_serialized;
 
     let state = if fragmentation_needed {
-      FragmentationIterState::Fragmented(FragmentedState::TargetReader, data_size)
+      let fragmented = match cursor {
+        SampleCursor::Fresh => FragmentedState::TargetReader,
+        SampleCursor::Frag(start) => {
+          let (num_frags, fragment_size) = writer.num_frags_and_frag_size(data_size);
+          FragmentedState::Fragments(
+            FragmentNumber::range_inclusive(start, FragmentNumber::new(num_frags)),
+            fragment_size,
+          )
+        }
+        SampleCursor::Heartbeat => FragmentedState::Heartbeat,
+      };
+      FragmentationIterState::Fragmented(fragmented, data_size)
     } else {
       FragmentationIterState::Unfragmented
     };
@@ -1588,7 +1758,9 @@ enum FragmentedState {
 }
 
 impl<'a> Iterator for FragmentationIter<'a> {
-  type Item = Message;
+  // nonblocking-transmit: each item carries the cursor to resume from should
+  // this message be the one that a socket cannot accept.
+  type Item = (SampleCursor, Message);
   fn next(&mut self) -> Option<Self::Item> {
     if self.finished {
       return None;
@@ -1626,7 +1798,8 @@ impl<'a> Iterator for FragmentationIter<'a> {
                     reader.remote_reader_guid,
                   )
                   .add_header_and_build(writer.my_guid.prefix);
-                return Some(gap_msg);
+                // Leading GAP: if it blocks, resume from Fresh (re-send GAP too).
+                return Some((SampleCursor::Fresh, gap_msg));
               }
             }
             self.next()
@@ -1658,7 +1831,8 @@ impl<'a> Iterator for FragmentationIter<'a> {
               );
 
               let datafrag_msg = message_builder.add_header_and_build(writer.my_guid.prefix);
-              return Some(datafrag_msg);
+              // If this fragment blocks, resume exactly here next time.
+              return Some((SampleCursor::Frag(frag_num), datafrag_msg));
             }
             *state = FragmentedState::Heartbeat;
             self.next()
@@ -1683,7 +1857,8 @@ impl<'a> Iterator for FragmentationIter<'a> {
                   liveliness_flag,
                 )
                 .add_header_and_build(writer.my_guid.prefix);
-              return Some(hb_msg);
+              // Trailing HEARTBEAT: if it blocks, resume from Heartbeat only.
+              return Some((SampleCursor::Heartbeat, hb_msg));
             }
             None
           }
@@ -1743,7 +1918,8 @@ impl<'a> Iterator for FragmentationIter<'a> {
 
         let data_message = message_builder.add_header_and_build(writer.my_guid.prefix);
         self.finished = true;
-        Some(data_message)
+        // Unfragmented DATA (+HEARTBEAT): if it blocks, resume from Fresh.
+        Some((SampleCursor::Fresh, data_message))
       }
     }
   }

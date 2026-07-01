@@ -46,6 +46,17 @@ struct Inner {
   acked_before: SequenceNumber,
   reliable_readers_present: bool,
 
+  // nonblocking-transmit: the unsent backlog limit. The Writer advances
+  // `sent_frontier` as it actually transmits samples; when the network socket
+  // congests, `sent_frontier` stalls, the backlog `(sent_frontier, last_seq]`
+  // fills, and admission blocks -- back-pressure reaching the application.
+  // Applies to reliable *and* best-effort writers; built-in/discovery are
+  // exempt so discovery never stalls.
+  // (see src/rtps/nonblocking_transmit_design.md)
+  backlog_limit: usize,
+  // Highest sequence number the Writer has actually put on the wire.
+  sent_frontier: SequenceNumber,
+
   // Wakers of async producers / ack-waiters parked because the window was full
   // or acknowledgements were still pending. Drained (woken) on any advance.
   wakers: Vec<Waker>,
@@ -83,6 +94,7 @@ impl WriterSendBuffer {
     reliable_writer: bool,
     is_builtin: bool,
     window_limit: usize,
+    backlog_limit: usize,
   ) -> Self {
     Self {
       shared: Arc::new(Shared {
@@ -93,6 +105,8 @@ impl WriterSendBuffer {
           window_limit: window_limit.max(1),
           acked_before: SequenceNumber::new(1),
           reliable_readers_present: false,
+          backlog_limit: backlog_limit.max(1),
+          sent_frontier: SequenceNumber::new(0),
           wakers: Vec::new(),
         }),
         progress: Condvar::new(),
@@ -108,13 +122,25 @@ impl WriterSendBuffer {
 
   // Is there room to admit one more sample right now?
   fn has_room(shared: &Shared, inner: &Inner) -> bool {
-    if !shared.reliable_writer || shared.is_builtin || !inner.reliable_readers_present {
-      // Best-effort, built-in (discovery) and "no reliable reader yet" writers
-      // are never throttled: discovery and best-effort must not stall, and there
-      // is no one whose acknowledgement we would be waiting for.
+    if shared.is_builtin {
+      // Built-in (discovery) writers must never stall.
       return true;
     }
-    // Number of samples in [acked_before, last_seq].
+
+    // nonblocking-transmit: unsent-backlog limit. Applies to reliable *and*
+    // best-effort writers -- when the socket cannot drain, the application is
+    // back-pressured instead of dropping. Samples in (sent_frontier, last_seq].
+    let unsent = i64::from(inner.last_seq) - i64::from(inner.sent_frontier);
+    if unsent >= inner.backlog_limit as i64 {
+      return false;
+    }
+
+    if !shared.reliable_writer || !inner.reliable_readers_present {
+      // Best-effort and "no reliable reader yet" writers have no acknowledgement
+      // window to wait on; the backlog limit above is their only throttle.
+      return true;
+    }
+    // Number of unacknowledged samples in [acked_before, last_seq].
     let unacked = i64::from(inner.last_seq) - i64::from(inner.acked_before) + 1;
     unacked < inner.window_limit as i64
   }
@@ -229,6 +255,18 @@ impl WriterSendBuffer {
     }
   }
 
+  /// nonblocking-transmit: advance the "actually transmitted" frontier. Called
+  /// by the Writer as it puts samples on the wire. Wakes producers parked on a
+  /// full unsent backlog when the frontier advances.
+  pub fn set_sent_frontier(&self, sent_frontier: SequenceNumber) {
+    let shared = &*self.shared;
+    let mut inner = shared.inner.lock().unwrap();
+    if sent_frontier > inner.sent_frontier {
+      inner.sent_frontier = sent_frontier;
+      Self::wake_all(&mut inner, &shared.progress);
+    }
+  }
+
   /// The sequence number of the latest allocated sample (0 if none yet).
   pub fn last_change_sequence_number(&self) -> SequenceNumber {
     self.shared.inner.lock().unwrap().last_seq
@@ -307,5 +345,72 @@ impl WriterSendBuffer {
 fn register_waker(wakers: &mut Vec<Waker>, waker: &Waker) {
   if !wakers.iter().any(|w| w.will_wake(waker)) {
     wakers.push(waker.clone());
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration as StdDuration;
+
+  use super::*;
+  use crate::{
+    dds::ddsdata::DDSData,
+    messages::submessages::elements::serialized_payload::SerializedPayload,
+    structure::guid::GUID, RepresentationIdentifier,
+  };
+
+  fn sample() -> DDSData {
+    DDSData::new(SerializedPayload::new(
+      RepresentationIdentifier::CDR_LE,
+      vec![0u8; 8],
+    ))
+  }
+
+  fn admit_now(buf: &WriterSendBuffer) -> bool {
+    matches!(
+      buf.admit_blocking(WriteOptions::default(), sample(), Some(StdDuration::ZERO)),
+      Admission::Admitted(_)
+    )
+  }
+
+  // nonblocking-transmit: a best-effort writer (no ack window) is throttled by
+  // the unsent-backlog limit once the socket stops draining, and released when
+  // the Writer advances the sent frontier.
+  #[test]
+  fn backlog_limit_backpressures_best_effort() {
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      /* reliable_writer */ false,
+      /* is_builtin */ false,
+      /* window_limit */ 1000,
+      /* backlog_limit */ 2,
+    );
+
+    // Nothing sent yet: backlog fills after two admissions.
+    assert!(admit_now(&buf)); // seq 1
+    assert!(admit_now(&buf)); // seq 2
+    assert!(!admit_now(&buf)); // backlog full (2 unsent, limit 2)
+
+    // The Writer transmits seq 1; backlog drops to 1, room opens for one more.
+    buf.set_sent_frontier(SequenceNumber::new(1));
+    assert!(admit_now(&buf)); // seq 3
+    assert!(!admit_now(&buf)); // full again (2 unsent: seq 2,3)
+  }
+
+  // Built-in (discovery) writers must never be throttled by the backlog.
+  #[test]
+  fn backlog_limit_exempts_builtin() {
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      false,
+      /* is_builtin */ true,
+      1000,
+      /* backlog_limit */ 1,
+    );
+    assert!(admit_now(&buf));
+    assert!(admit_now(&buf));
+    assert!(admit_now(&buf)); // still admitted despite tiny backlog limit
   }
 }
