@@ -563,11 +563,23 @@ impl Writer {
             self.send_buffer.set_sent_frontier(sequence_number);
           }
           SendProgress::Blocked { cursor, blocked } => {
-            // Stop here; resume on write readiness. Back-pressure to the
-            // application follows from `sent_frontier` not advancing.
-            self.sample_cursor = cursor;
-            self.blocked_sockets.extend(blocked);
-            return;
+            // Reliable writers always back-pressure. Best-effort writers only if
+            // this sample opted in via `best_effort_may_block`; otherwise the
+            // DDS default applies and we drop the (rest of the) sample and move
+            // on to fresher data (spec v1.4 2.2.2.4.2.11).
+            if self.is_reliable() || write_options.best_effort_may_block() {
+              // Stop here; resume on write readiness. Back-pressure to the
+              // application follows from `sent_frontier` not advancing.
+              self.sample_cursor = cursor;
+              self.blocked_sockets.extend(blocked);
+              return;
+            }
+            // Drop: advance past this sample without recording blocked sockets,
+            // so no write-readiness back-pressure is applied. The unsent
+            // remainder is discarded and later evicted by cache cleaning.
+            self.last_sent = sequence_number;
+            self.sample_cursor = SampleCursor::Fresh;
+            self.send_buffer.set_sent_frontier(sequence_number);
           }
         }
       } else {

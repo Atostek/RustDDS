@@ -171,11 +171,29 @@ the unsent backlog fills, and `admit_blocking` / `try_admit` block or return
 `WouldBlock` -- back-pressure reaching `DataWriter::write()` with **no new
 application-facing API**.
 
-This covers best-effort writers too (today never throttled): the choice is to
-prefer back-pressure over dropping. Note the backlog is counted in **samples**,
-so a single giant fragmented sample counts as one unsent sample but holds
-`sent_frontier` back until all its fragments flush; even `backlog_limit = 1`
-makes the next `write()` wait until the giant sample is fully on the wire.
+Note the backlog is counted in **samples**, so a single giant fragmented sample
+counts as one unsent sample but holds `sent_frontier` back until all its
+fragments flush; even `backlog_limit = 1` makes the next `write()` wait until the
+giant sample is fully on the wire.
+
+### 6.1 Best-effort is opt-in (`WriteOptions::best_effort_may_block`)
+
+DDS v1.4 section 2.2.2.4.2.11 ("write") does not permit `write` to block for
+best-effort reliability. Applying the backlog back-pressure unconditionally to
+best-effort writers would violate that, so it is **opt-in** per write:
+
+- `WriteOptions::best_effort_may_block == false` (the default): a best-effort
+  write is never throttled at admission (`has_room` returns true regardless of
+  the backlog), and when the send socket returns `WouldBlock` the Writer
+  **drops** the (rest of the) sample and advances (`process_pending` does not
+  record blocked sockets, so no write-readiness back-pressure is armed). This is
+  the spec-compliant, pre-back-pressure behavior.
+- `WriteOptions::best_effort_may_block == true`: the backlog limit and the
+  resume-on-writable back-pressure apply to this best-effort write exactly as for
+  reliable writers, so `write()` may block until the socket drains.
+
+Reliable writers always back-pressure regardless of this flag (their
+`may_block = shared.reliable_writer || write_options.best_effort_may_block()`).
 
 ## 7. Event-loop and portability impact
 
@@ -238,7 +256,11 @@ The implementation follows this design with a few deliberate simplifications:
 - `backlog_limit` is set equal to the reliable `window_limit`
   (`src/dds/pubsub.rs`). For reliable writers the ack window is normally the
   binding constraint; the backlog is the binding constraint for best-effort
-  writers and under socket congestion.
+  writers (that opted into blocking) and under socket congestion.
+- Best-effort back-pressure is opt-in via `WriteOptions::best_effort_may_block`
+  (default `false`, see section 6.1). By default best-effort writes never block
+  at admission and drop the sample on socket `WouldBlock` instead of holding it;
+  the flag has no effect on reliable writers.
 - NACK-driven repair (`handle_repair_data_send_worker`,
   `handle_repair_frags_send_worker`) sends DATA/DATAFRAG as bulk but simply
   drops on WouldBlock: the reader re-NACKs, so repair is self-healing and never

@@ -121,15 +121,27 @@ impl WriterSendBuffer {
   // --- predicates (must be called while holding the lock) ---
 
   // Is there room to admit one more sample right now?
-  fn has_room(shared: &Shared, inner: &Inner) -> bool {
+  //
+  // `may_block` is `true` for reliable writers and for best-effort writes that
+  // opted in via `WriteOptions::best_effort_may_block`. When `false` (a
+  // best-effort write that must not block, the DDS default) admission is never
+  // throttled: congested samples are dropped later at the socket instead.
+  fn has_room(shared: &Shared, inner: &Inner, may_block: bool) -> bool {
     if shared.is_builtin {
       // Built-in (discovery) writers must never stall.
       return true;
     }
 
-    // nonblocking-transmit: unsent-backlog limit. Applies to reliable *and*
-    // best-effort writers -- when the socket cannot drain, the application is
-    // back-pressured instead of dropping. Samples in (sent_frontier, last_seq].
+    if !may_block {
+      // Best-effort write that must not block (DDS v1.4 2.2.2.4.2.11 default).
+      // Never throttle admission.
+      return true;
+    }
+
+    // nonblocking-transmit: unsent-backlog limit. Applies to reliable writers
+    // and to best-effort writers that opted in -- when the socket cannot drain,
+    // the application is back-pressured instead of dropping. Samples in
+    // (sent_frontier, last_seq].
     let unsent = i64::from(inner.last_seq) - i64::from(inner.sent_frontier);
     if unsent >= inner.backlog_limit as i64 {
       return false;
@@ -169,9 +181,13 @@ impl WriterSendBuffer {
     let shared = &*self.shared;
     let mut inner = shared.inner.lock().unwrap();
 
+    // Reliable writers always back-pressure; best-effort only if this write
+    // opted in via `best_effort_may_block`.
+    let may_block = shared.reliable_writer || write_options.best_effort_may_block();
+
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
-      if Self::has_room(shared, &inner) {
+      if Self::has_room(shared, &inner, may_block) {
         let seq = Self::insert_locked(shared, &mut inner, write_options, data);
         return Admission::Admitted(seq);
       }
@@ -205,7 +221,8 @@ impl WriterSendBuffer {
   ) -> Result<SequenceNumber, (WriteOptions, DDSData)> {
     let shared = &*self.shared;
     let mut inner = shared.inner.lock().unwrap();
-    if Self::has_room(shared, &inner) {
+    let may_block = shared.reliable_writer || write_options.best_effort_may_block();
+    if Self::has_room(shared, &inner, may_block) {
       Ok(Self::insert_locked(shared, &mut inner, write_options, data))
     } else {
       register_waker(&mut inner.wakers, waker);
@@ -354,7 +371,7 @@ mod tests {
 
   use super::*;
   use crate::{
-    dds::ddsdata::DDSData,
+    dds::{ddsdata::DDSData, with_key::datawriter::WriteOptionsBuilder},
     messages::submessages::elements::serialized_payload::SerializedPayload,
     structure::guid::GUID, RepresentationIdentifier,
   };
@@ -366,18 +383,23 @@ mod tests {
     ))
   }
 
-  fn admit_now(buf: &WriterSendBuffer) -> bool {
+  fn admit_now(buf: &WriterSendBuffer, opts: WriteOptions) -> bool {
     matches!(
-      buf.admit_blocking(WriteOptions::default(), sample(), Some(StdDuration::ZERO)),
+      buf.admit_blocking(opts, sample(), Some(StdDuration::ZERO)),
       Admission::Admitted(_)
     )
   }
 
-  // nonblocking-transmit: a best-effort writer (no ack window) is throttled by
-  // the unsent-backlog limit once the socket stops draining, and released when
-  // the Writer advances the sent frontier.
+  fn may_block_opts() -> WriteOptions {
+    WriteOptionsBuilder::new().best_effort_may_block(true).build()
+  }
+
+  // nonblocking-transmit: a best-effort writer that opted in via
+  // `best_effort_may_block` is throttled by the unsent-backlog limit once the
+  // socket stops draining, and released when the Writer advances the sent
+  // frontier.
   #[test]
-  fn backlog_limit_backpressures_best_effort() {
+  fn backlog_limit_backpressures_best_effort_when_may_block() {
     let buf = WriterSendBuffer::new(
       GUID::GUID_UNKNOWN,
       "t".to_string(),
@@ -388,14 +410,33 @@ mod tests {
     );
 
     // Nothing sent yet: backlog fills after two admissions.
-    assert!(admit_now(&buf)); // seq 1
-    assert!(admit_now(&buf)); // seq 2
-    assert!(!admit_now(&buf)); // backlog full (2 unsent, limit 2)
+    assert!(admit_now(&buf, may_block_opts())); // seq 1
+    assert!(admit_now(&buf, may_block_opts())); // seq 2
+    assert!(!admit_now(&buf, may_block_opts())); // backlog full (2 unsent, limit 2)
 
     // The Writer transmits seq 1; backlog drops to 1, room opens for one more.
     buf.set_sent_frontier(SequenceNumber::new(1));
-    assert!(admit_now(&buf)); // seq 3
-    assert!(!admit_now(&buf)); // full again (2 unsent: seq 2,3)
+    assert!(admit_now(&buf, may_block_opts())); // seq 3
+    assert!(!admit_now(&buf, may_block_opts())); // full again (2 unsent: seq 2,3)
+  }
+
+  // By default (`best_effort_may_block == false`, DDS v1.4 2.2.2.4.2.11) a
+  // best-effort write is never throttled at admission, even when the backlog is
+  // already full -- congested samples are dropped later at the socket instead.
+  #[test]
+  fn backlog_limit_ignored_for_best_effort_by_default() {
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      /* reliable_writer */ false,
+      /* is_builtin */ false,
+      /* window_limit */ 1000,
+      /* backlog_limit */ 1,
+    );
+    // Default WriteOptions => best_effort_may_block == false => never blocks.
+    assert!(admit_now(&buf, WriteOptions::default()));
+    assert!(admit_now(&buf, WriteOptions::default()));
+    assert!(admit_now(&buf, WriteOptions::default())); // still admitted despite full backlog
   }
 
   // Built-in (discovery) writers must never be throttled by the backlog.
@@ -409,8 +450,8 @@ mod tests {
       1000,
       /* backlog_limit */ 1,
     );
-    assert!(admit_now(&buf));
-    assert!(admit_now(&buf));
-    assert!(admit_now(&buf)); // still admitted despite tiny backlog limit
+    assert!(admit_now(&buf, may_block_opts()));
+    assert!(admit_now(&buf, may_block_opts()));
+    assert!(admit_now(&buf, may_block_opts())); // still admitted despite tiny backlog limit
   }
 }
