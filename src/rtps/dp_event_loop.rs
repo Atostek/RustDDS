@@ -1,4 +1,5 @@
 use std::{
+  cell::RefCell,
   collections::HashMap,
   net::IpAddr,
   rc::Rc,
@@ -32,6 +33,7 @@ use crate::{
     rtps_reader_proxy::RtpsReaderProxy,
     rtps_writer_proxy::RtpsWriterProxy,
     timed_event::DpTimerEvent,
+    transmit::InterfaceObservations,
     writer::{Writer, WriterIngredients},
   },
   structure::{
@@ -90,6 +92,10 @@ pub struct DPEventLoop {
 
   writers: HashMap<EntityId, Writer>,
   udp_sender: Rc<UDPSender>,
+
+  // Interface-aware transmit: per-remote observed receive interfaces/addresses,
+  // shared (intra-thread) with the MessageReceiver that populates it.
+  interface_observations: Rc<RefCell<InterfaceObservations>>,
 
   // One timer shared by all Readers, Writers and the periodic loop tasks.
   // Endpoints hold cloned handles to schedule timeouts; the loop owns it,
@@ -225,6 +231,8 @@ impl DPEventLoop {
     #[cfg(not(feature = "security"))]
     let security_plugins_opt = security_plugins_opt.and(None); // make sure it is None an consume value
 
+    let interface_observations = Rc::new(RefCell::new(InterfaceObservations::new()));
+
     Self {
       domain_info,
       poll,
@@ -237,7 +245,9 @@ impl DPEventLoop {
         acknack_sender,
         spdp_liveness_sender,
         security_plugins_opt.clone(),
+        Rc::clone(&interface_observations),
       ),
+      interface_observations,
       #[cfg(feature = "security")]
       security_plugins_opt,
       add_reader_receiver,
@@ -329,8 +339,10 @@ impl DPEventLoop {
                     },
                     UDPListener::messages,
                   );
-                for packet in udp_messages {
-                  ev_wrapper.message_receiver.handle_received_packet(&packet);
+                for (packet, origin) in udp_messages {
+                  ev_wrapper
+                    .message_receiver
+                    .handle_received_packet(&packet, origin);
                 }
               }
               ADD_READER_TOKEN | REMOVE_READER_TOKEN => {
@@ -691,6 +703,14 @@ impl DPEventLoop {
       }
     } // for
 
+    // Fresh SPDP traffic from this participant may have updated our interface
+    // observations; refresh the interface-aware send routes of any writers that
+    // already have matched readers behind this participant. Access `writers`
+    // directly (not via &mut self) so it stays disjoint from the `db` borrow.
+    for writer in self.writers.values_mut() {
+      writer.recompute_routes_for(participant_guid_prefix);
+    }
+
     debug!("update_participant - finished for {participant_guid_prefix:?}");
   }
 
@@ -710,6 +730,12 @@ impl DPEventLoop {
     for reader in self.message_receiver.available_readers.values_mut() {
       reader.participant_lost(participant_guid_prefix);
     }
+
+    // Forget interface observations for the departed participant.
+    self
+      .interface_observations
+      .borrow_mut()
+      .remove(participant_guid_prefix);
 
     #[cfg(feature = "security")]
     if let Some(security_plugins_handle) = &self.security_plugins_opt {
@@ -962,6 +988,7 @@ impl DPEventLoop {
       self.udp_sender.clone(),
       self.shared_timer.clone(),
       self.participant_status_sender.clone(),
+      Rc::clone(&self.interface_observations),
     );
 
     self

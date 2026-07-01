@@ -8,6 +8,7 @@ pub(crate) mod reader;
 pub(crate) mod rtps_reader_proxy;
 pub(crate) mod rtps_writer_proxy;
 pub(crate) mod timed_event;
+pub(crate) mod transmit;
 pub(crate) mod writer;
 pub(crate) mod writer_send_buffer;
 

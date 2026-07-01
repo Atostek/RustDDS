@@ -1,4 +1,5 @@
 use std::{
+  collections::HashMap,
   io,
   net::{IpAddr, Ipv4Addr, SocketAddr},
 };
@@ -9,12 +10,34 @@ use bytes::{Bytes, BytesMut};
 
 use crate::{
   network::util::{
-    get_local_multicast_ip_addrs_filtered, get_local_multicast_locators,
-    get_local_unicast_locators_filtered,
+    build_ifindex_to_interface_map, get_local_multicast_ip_addrs_filtered,
+    get_local_multicast_locators, get_local_unicast_locators_filtered,
   },
+  rtps::transmit::InterfaceSelector,
   serialization::padding_needed_for_alignment_4,
   structure::locator::Locator,
 };
+
+/// Metadata captured about where a received datagram came from and how it
+/// reached us.
+#[derive(Clone, Copy, Debug)]
+pub struct PacketOrigin {
+  /// Remote source socket address, if it could be determined.
+  pub source: Option<SocketAddr>,
+  /// Local interface the datagram was received on, if it could be determined
+  /// (requires `IP_PKTINFO`; `None` on platforms/paths where it is
+  /// unavailable).
+  pub local_if: Option<InterfaceSelector>,
+}
+
+impl PacketOrigin {
+  /// An origin with no captured metadata (forces the legacy send fallback).
+  #[allow(dead_code)] // Used by tests and the loopback path; harmless if unused in a given build.
+  pub const UNKNOWN: Self = Self {
+    source: None,
+    local_if: None,
+  };
+}
 
 const MAX_MESSAGE_SIZE: usize = 64 * 1024; // This is max we can get from UDP.
 const MESSAGE_BUFFER_ALLOCATION_CHUNK: usize = 256 * 1024; // must be >= MAX_MESSAGE_SIZE
@@ -29,6 +52,9 @@ pub struct UDPListener {
   receive_buffer: BytesMut,
   multicast_group: Option<Ipv4Addr>,
   has_multicast_join: bool,
+  // Cached OS interface-index -> local interface map, used to resolve the
+  // receiving interface reported by IP_PKTINFO. Built once at construction.
+  ifindex_map: HashMap<u32, InterfaceSelector>,
 }
 
 impl Drop for UDPListener {
@@ -74,6 +100,23 @@ impl UDPListener {
     {
       if reuse_addr {
         raw_socket.set_reuse_port(true)?;
+      }
+    }
+
+    // Ask the kernel to attach IP_PKTINFO to received datagrams so we can learn
+    // which local interface each one arrived on. Best-effort: if it fails we
+    // simply lose interface metadata and fall back to the legacy send path.
+    #[cfg(unix)]
+    {
+      if let Err(e) = nix::sys::socket::setsockopt(
+        &raw_socket,
+        nix::sys::socket::sockopt::Ipv4PacketInfo,
+        &true,
+      ) {
+        warn!(
+          "Could not enable IP_PKTINFO on listener socket: {e}. Interface-aware transmit disabled \
+           for this socket."
+        );
       }
     }
 
@@ -129,6 +172,7 @@ impl UDPListener {
       receive_buffer: BytesMut::with_capacity(MESSAGE_BUFFER_ALLOCATION_CHUNK),
       multicast_group: None,
       has_multicast_join: false,
+      ifindex_map: build_ifindex_to_interface_map(),
     })
   }
 
@@ -193,6 +237,7 @@ impl UDPListener {
       receive_buffer: BytesMut::with_capacity(MESSAGE_BUFFER_ALLOCATION_CHUNK),
       multicast_group: Some(multicast_group),
       has_multicast_join: joined_multicast,
+      ifindex_map: build_ifindex_to_interface_map(),
     })
   }
 
@@ -239,8 +284,9 @@ impl UDPListener {
     panic!("test helper didn't recv message after ten attempts.");
   }
 
-  /// Get all messages waiting in the socket.
-  pub fn messages(&mut self) -> Vec<Bytes> {
+  /// Get all messages waiting in the socket, each paired with its
+  /// [`PacketOrigin`] (source address + receiving interface, when available).
+  pub fn messages(&mut self) -> Vec<(Bytes, PacketOrigin)> {
     let mut messages = Vec::with_capacity(4);
 
     loop {
@@ -263,16 +309,16 @@ impl UDPListener {
         "ensure_receive_buffer_capacity - {} bytes left",
         self.receive_buffer.capacity()
       );
-      let nbytes = match self.socket.recv(&mut self.receive_buffer) {
-        Ok(n) => n,
+      let (nbytes, origin) = match self.recv_one() {
+        Ok(Some(received)) => received,
+        Ok(None) => {
+          // WouldBlock: nothing (more) to read.
+          self.receive_buffer.clear();
+          return messages;
+        }
         Err(e) => {
-          self.receive_buffer.clear(); // since nothing was received
-          if e.kind() == io::ErrorKind::WouldBlock {
-            // This is the normal case.
-          } else {
-            warn!("socket recv() error: {e:?}");
-          }
-          // In any case, we stop trying and return.
+          self.receive_buffer.clear();
+          warn!("socket recv() error: {e:?}");
           return messages;
         }
       };
@@ -293,11 +339,83 @@ impl UDPListener {
       // Now split away the used portion.
       let mut message = self.receive_buffer.split_to(self.receive_buffer.len());
       message.truncate(nbytes); // discard (hide) padding
-      messages.push(Bytes::from(message)); // freeze bytes and push
+      messages.push((Bytes::from(message), origin)); // freeze bytes and push
     } // loop
 
     // unreachable!(); // But why does this cause a warning? (rustc 1.66.0)
     // Answer: https://github.com/rust-lang/rust/issues/46500
+  }
+
+  /// Receive a single datagram into `self.receive_buffer`, capturing its
+  /// [`PacketOrigin`]. Returns `Ok(None)` when the socket would block.
+  #[cfg(unix)]
+  fn recv_one(&mut self) -> io::Result<Option<(usize, PacketOrigin)>> {
+    use std::{io::IoSliceMut, os::unix::io::AsRawFd};
+
+    use nix::{
+      errno::Errno,
+      sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrStorage},
+    };
+
+    let fd = self.socket.as_raw_fd();
+    let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo);
+
+    // Read the datagram and pull out the Copy metadata; the borrow of
+    // `receive_buffer` (through `iov`) ends when this block ends.
+    let (nbytes, source, ifindex, spec_dst) = {
+      let mut iov = [IoSliceMut::new(
+        &mut self.receive_buffer[..MAX_MESSAGE_SIZE],
+      )];
+      let msg =
+        match recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty()) {
+          Ok(m) => m,
+          Err(Errno::EAGAIN) => return Ok(None),
+          Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+        };
+
+      let nbytes = msg.bytes;
+      let source = msg.address.and_then(sockaddr_storage_to_socketaddr);
+
+      let mut ifindex = 0u32;
+      let mut spec_dst: Option<IpAddr> = None;
+      for cmsg in msg.cmsgs()? {
+        if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
+          ifindex = info.ipi_ifindex as u32;
+          let addr = Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr));
+          if !addr.is_unspecified() {
+            spec_dst = Some(IpAddr::V4(addr));
+          }
+        }
+      }
+      (nbytes, source, ifindex, spec_dst)
+    };
+
+    // Prefer the exact local destination address (matches sender interface
+    // keys directly); otherwise resolve the interface index.
+    let local_if = spec_dst
+      .map(InterfaceSelector::Ip)
+      .or_else(|| self.ifindex_map.get(&ifindex).copied());
+
+    Ok(Some((nbytes, PacketOrigin { source, local_if })))
+  }
+
+  /// Non-Unix fallback: capture the source address only (no interface info).
+  #[cfg(not(unix))]
+  fn recv_one(&mut self) -> io::Result<Option<(usize, PacketOrigin)>> {
+    match self
+      .socket
+      .recv_from(&mut self.receive_buffer[..MAX_MESSAGE_SIZE])
+    {
+      Ok((nbytes, source)) => Ok(Some((
+        nbytes,
+        PacketOrigin {
+          source: Some(source),
+          local_if: None,
+        },
+      ))),
+      Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+      Err(e) => Err(e),
+    }
   }
 
   #[cfg(test)] // normally done in .drop()
@@ -308,6 +426,23 @@ impl UDPListener {
         .leave_multicast_v4(address, &Ipv4Addr::UNSPECIFIED);
     }
     io::Result::Err(io::Error::other("Not a multicast address"))
+  }
+}
+
+#[cfg(unix)]
+fn sockaddr_storage_to_socketaddr(addr: nix::sys::socket::SockaddrStorage) -> Option<SocketAddr> {
+  use std::net::{SocketAddrV4, SocketAddrV6};
+  if let Some(v4) = addr.as_sockaddr_in() {
+    Some(SocketAddr::V4(SocketAddrV4::new(v4.ip(), v4.port())))
+  } else {
+    addr.as_sockaddr_in6().map(|v6| {
+      SocketAddr::V6(SocketAddrV6::new(
+        v6.ip(),
+        v6.port(),
+        v6.flowinfo(),
+        v6.scope_id(),
+      ))
+    })
   }
 }
 

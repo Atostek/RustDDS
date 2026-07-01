@@ -1,4 +1,8 @@
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::{
+  cell::RefCell,
+  collections::{btree_map::Entry, BTreeMap},
+  rc::Rc,
+};
 
 use enumflags2::BitFlags;
 use mio_extras::{channel as mio_channel, channel::TrySendError};
@@ -8,7 +12,8 @@ use bytes::Bytes;
 
 use crate::{
   messages::{protocol_version::ProtocolVersion, submessages::submessages::*, vendor_id::VendorId},
-  rtps::{reader::Reader, Message, Submessage, SubmessageBody},
+  network::udp_listener::PacketOrigin,
+  rtps::{reader::Reader, transmit::InterfaceObservations, Message, Submessage, SubmessageBody},
   structure::{
     entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
@@ -113,6 +118,11 @@ pub(crate) struct MessageReceiver {
   spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
   security_plugins: Option<SecurityPluginsHandle>,
 
+  // Per-remote-participant record of which local interface / source address we
+  // have observed their traffic on. Shared (intra-thread) with DPEventLoop,
+  // which consumes it to resolve interface-aware send routes.
+  interface_observations: Rc<RefCell<InterfaceObservations>>,
+
   own_guid_prefix: GuidPrefix,
   pub source_version: ProtocolVersion,
   pub source_vendor_id: VendorId,
@@ -138,12 +148,14 @@ impl MessageReceiver {
     acknack_sender: mio_channel::SyncSender<(GuidPrefix, AckSubmessage)>,
     spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
     security_plugins: Option<SecurityPluginsHandle>,
+    interface_observations: Rc<RefCell<InterfaceObservations>>,
   ) -> Self {
     Self {
       available_readers: BTreeMap::new(),
       acknack_sender,
       spdp_liveness_sender,
       security_plugins,
+      interface_observations,
       own_guid_prefix: participant_guid_prefix,
 
       source_version: ProtocolVersion::THIS_IMPLEMENTATION,
@@ -221,7 +233,7 @@ impl MessageReceiver {
     self.available_readers.get_mut(&reader_id)
   }
 
-  pub fn handle_received_packet(&mut self, msg_bytes: &Bytes) {
+  pub fn handle_received_packet(&mut self, msg_bytes: &Bytes, origin: PacketOrigin) {
     // Check for RTPS ping message. At least RTI implementation sends these.
     // What should we do with them? The spec does not say.
     if msg_bytes.len() < RTPS_MESSAGE_HEADER_SIZE {
@@ -267,8 +279,28 @@ impl MessageReceiver {
       }
     };
 
+    // Record how this remote participant's traffic reaches us, so route
+    // resolution can later narrow sends to the observed interface/address.
+    self.record_observation(rtps_message.header.guid_prefix, origin);
+
     // And process message
     self.handle_parsed_message(rtps_message);
+  }
+
+  /// Note the interface/source a packet from `source_prefix` arrived on.
+  /// Ignores our own traffic and packets without any usable origin metadata.
+  fn record_observation(&self, source_prefix: GuidPrefix, origin: PacketOrigin) {
+    if source_prefix == GuidPrefix::UNKNOWN || source_prefix == self.own_guid_prefix {
+      return;
+    }
+    let Some(source) = origin.source else {
+      // Without a source address there is nothing actionable to record.
+      return;
+    };
+    self
+      .interface_observations
+      .borrow_mut()
+      .record(source_prefix, origin.local_if, source);
   }
 
   // This is also called directly from dp_event_loop in case of loopback messages.
@@ -1147,6 +1179,7 @@ mod tests {
       acknack_sender,
       spdp_liveness_sender,
       None,
+      Rc::new(RefCell::new(InterfaceObservations::new())),
     );
 
     // Create a reader to process the message
@@ -1208,7 +1241,7 @@ mod tests {
     // Add reader to message reader and process the bytes message
     message_receiver.add_reader(new_reader);
 
-    message_receiver.handle_received_packet(&udp_bits1);
+    message_receiver.handle_received_packet(&udp_bits1, PacketOrigin::UNKNOWN);
 
     // Verify the message reader has recorded the right amount of submessages
     assert_eq!(message_receiver.submessage_count, 4);
@@ -1269,13 +1302,18 @@ mod tests {
     let (acknack_sender, _acknack_receiver) =
       mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(10);
     let (spdp_liveness_sender, _spdp_liveness_receiver) = mio_channel::sync_channel(8);
-    let mut message_receiver =
-      MessageReceiver::new(guid_new.prefix, acknack_sender, spdp_liveness_sender, None);
+    let mut message_receiver = MessageReceiver::new(
+      guid_new.prefix,
+      acknack_sender,
+      spdp_liveness_sender,
+      None,
+      Rc::new(RefCell::new(InterfaceObservations::new())),
+    );
 
-    message_receiver.handle_received_packet(&udp_bits1);
+    message_receiver.handle_received_packet(&udp_bits1, PacketOrigin::UNKNOWN);
     assert_eq!(message_receiver.submessage_count, 4);
 
-    message_receiver.handle_received_packet(&udp_bits2);
+    message_receiver.handle_received_packet(&udp_bits2, PacketOrigin::UNKNOWN);
     assert_eq!(message_receiver.submessage_count, 2);
   }
 

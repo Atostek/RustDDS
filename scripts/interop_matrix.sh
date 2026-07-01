@@ -20,13 +20,21 @@
 #            <dds-rtps>/executables/rustdds-0.12.0_shape_main_linux
 #
 # Usage:
-#   scripts/interop_matrix.sh
+#   scripts/interop_matrix.sh            # detaches into its own session and returns
+#
+# By default the script re-execs itself under `setsid`, fully detached from the
+# launching terminal, so the multi-hour run survives terminal close / launch
+# interruption. It prints the background PID and the console log path, then
+# returns immediately. Progress is in <results>/MATRIX.log and SUMMARY.csv.
 #
 # Environment overrides (defaults in parentheses):
-#   DDS_RTPS_DIR   path to the dds-rtps checkout (/home/juhe/cursor/dds-rtps)
-#   RUST_EXE       RustDDS shape_main, relative to DDS_RTPS_DIR
-#                  (executables/rustdds-0.12.0_shape_main_linux)
-#   PAIR_TIMEOUT   hard cap per pair, seconds (2400 = 40 min)
+#   DDS_RTPS_DIR       path to the dds-rtps checkout (/home/juhe/cursor/dds-rtps)
+#   RUST_EXE           RustDDS shape_main, relative to DDS_RTPS_DIR
+#                      (executables/rustdds-0.12.0_shape_main_linux)
+#   PAIR_TIMEOUT       hard cap per pair, seconds (2400 = 40 min)
+#   MATRIX_NO_DETACH   set to 1 to run in the foreground (no setsid re-exec)
+#   MATRIX_CONSOLE_LOG console log path for the detached run
+#                      (/tmp/interop_matrix_<timestamp>.log)
 #
 # Results are written under <dds-rtps>/results/matrix_<timestamp>/:
 #   MATRIX.log    high-level progress log
@@ -35,6 +43,19 @@
 #   logs/<tag>.log full stdout/stderr per pair
 
 set -u
+
+# Survive the launching shell/terminal. Re-exec once in a brand-new session
+# (setsid) detached from the controlling terminal, so closing the terminal or
+# interrupting the launch command cannot reap the (long) run. Opt out with
+# MATRIX_NO_DETACH=1 to run in the foreground.
+if [ -z "${MATRIX_DETACHED:-}" ] && [ -z "${MATRIX_NO_DETACH:-}" ]; then
+  export MATRIX_DETACHED=1
+  CONSOLE_LOG="${MATRIX_CONSOLE_LOG:-/tmp/interop_matrix_$(date +%Y%m%d_%H%M%S).log}"
+  setsid bash "$0" "$@" </dev/null >"$CONSOLE_LOG" 2>&1 &
+  echo "interop matrix detached into its own session (PID $!)"
+  echo "console log: $CONSOLE_LOG"
+  exit 0
+fi
 
 DDS_RTPS_DIR="${DDS_RTPS_DIR:-/home/juhe/cursor/dds-rtps}"
 RUST="${RUST_EXE:-executables/rustdds-0.12.0_shape_main_linux}"
