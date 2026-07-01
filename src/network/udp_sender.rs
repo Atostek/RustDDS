@@ -215,8 +215,8 @@ impl UDPSender {
       });
       if queue.len() == CONTROL_QUEUE_WARN_LEN {
         warn!(
-          "nonblocking-transmit: control queue for {id:?} reached {} datagrams; \
-           link may be wedged (nothing dropped)",
+          "nonblocking-transmit: control queue for {id:?} reached {} datagrams; link may be \
+           wedged (nothing dropped)",
           queue.len()
         );
       }
@@ -328,8 +328,7 @@ impl UDPSender {
         buffer.len()
       );
     }
-    let Some(socket_address) =
-      self.locator_socket_addr(locator, "send_to_multicast_locator_via")
+    let Some(socket_address) = self.locator_socket_addr(locator, "send_to_multicast_locator_via")
     else {
       return;
     };

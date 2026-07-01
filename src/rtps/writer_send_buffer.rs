@@ -373,7 +373,8 @@ mod tests {
   use crate::{
     dds::{ddsdata::DDSData, with_key::datawriter::WriteOptionsBuilder},
     messages::submessages::elements::serialized_payload::SerializedPayload,
-    structure::guid::GUID, RepresentationIdentifier,
+    structure::guid::GUID,
+    RepresentationIdentifier,
   };
 
   fn sample() -> DDSData {
@@ -391,7 +392,9 @@ mod tests {
   }
 
   fn may_block_opts() -> WriteOptions {
-    WriteOptionsBuilder::new().best_effort_may_block(true).build()
+    WriteOptionsBuilder::new()
+      .best_effort_may_block(true)
+      .build()
   }
 
   // nonblocking-transmit: a best-effort writer that opted in via
@@ -417,7 +420,8 @@ mod tests {
     // The Writer transmits seq 1; backlog drops to 1, room opens for one more.
     buf.set_sent_frontier(SequenceNumber::new(1));
     assert!(admit_now(&buf, may_block_opts())); // seq 3
-    assert!(!admit_now(&buf, may_block_opts())); // full again (2 unsent: seq 2,3)
+    assert!(!admit_now(&buf, may_block_opts())); // full again (2 unsent: seq
+                                                 // 2,3)
   }
 
   // By default (`best_effort_may_block == false`, DDS v1.4 2.2.2.4.2.11) a
@@ -436,7 +440,8 @@ mod tests {
     // Default WriteOptions => best_effort_may_block == false => never blocks.
     assert!(admit_now(&buf, WriteOptions::default()));
     assert!(admit_now(&buf, WriteOptions::default()));
-    assert!(admit_now(&buf, WriteOptions::default())); // still admitted despite full backlog
+    assert!(admit_now(&buf, WriteOptions::default())); // still admitted despite
+                                                       // full backlog
   }
 
   // Built-in (discovery) writers must never be throttled by the backlog.
@@ -452,6 +457,7 @@ mod tests {
     );
     assert!(admit_now(&buf, may_block_opts()));
     assert!(admit_now(&buf, may_block_opts()));
-    assert!(admit_now(&buf, may_block_opts())); // still admitted despite tiny backlog limit
+    assert!(admit_now(&buf, may_block_opts())); // still admitted despite tiny
+                                                // backlog limit
   }
 }

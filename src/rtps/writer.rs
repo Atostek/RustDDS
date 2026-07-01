@@ -628,8 +628,12 @@ impl Writer {
     send_also_heartbeat: bool,
     target_reader_opt: Option<&RtpsReaderProxy>,
   ) -> bool {
-    let (fragmentation_needed, _progress) =
-      self.send_cache_change_from(cc, send_also_heartbeat, target_reader_opt, SampleCursor::Fresh);
+    let (fragmentation_needed, _progress) = self.send_cache_change_from(
+      cc,
+      send_also_heartbeat,
+      target_reader_opt,
+      SampleCursor::Fresh,
+    );
     fragmentation_needed
   }
 
@@ -914,9 +918,9 @@ impl Writer {
                 reader_proxy.get_pending_gap(),
                 self.my_guid.entity_id,
                 self.endianness,
-              reader_guid,
-            )
-            .add_header_and_build(self.my_guid.prefix);
+                reader_guid,
+              )
+              .add_header_and_build(self.my_guid.prefix);
             self.send_control_to_readers(
               DeliveryMode::Unicast,
               gap_message,

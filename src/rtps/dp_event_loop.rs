@@ -596,8 +596,8 @@ impl DPEventLoop {
     use mio_06::unix::EventedFd;
     let pending_control = self.udp_sender.pending_control_sockets();
     for sid in self.udp_sender.socket_ids() {
-      let want = pending_control.contains(&sid)
-        || self.bulk_ready.get(&sid).is_some_and(|q| !q.is_empty());
+      let want =
+        pending_control.contains(&sid) || self.bulk_ready.get(&sid).is_some_and(|q| !q.is_empty());
       let armed = self.writable_armed.contains(&sid);
       match (want, armed) {
         (true, false) => {

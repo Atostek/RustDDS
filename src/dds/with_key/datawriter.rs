@@ -90,8 +90,8 @@ impl WriteOptionsBuilder {
   /// congestion.
   ///
   /// This option only affects **best-effort** DataWriters and has no effect on
-  /// reliable ones (reliable writers always apply back-pressure bounded by their
-  /// `max_blocking_time`).
+  /// reliable ones (reliable writers always apply back-pressure bounded by
+  /// their `max_blocking_time`).
   ///
   /// - `false` (the default): the `write` call never blocks for a best-effort
   ///   writer. If the outgoing network socket is congested, the sample is
@@ -99,8 +99,8 @@ impl WriteOptionsBuilder {
   ///   section 2.2.2.4.2.11 ("write"), which does not permit `write` to block
   ///   for best-effort reliability.
   /// - `true`: the nonblocking-transmit back-pressure is extended to this
-  ///   best-effort write, so the `write` call may block while the send socket is
-  ///   congested (until it drains), instead of dropping the sample.
+  ///   best-effort write, so the `write` call may block while the send socket
+  ///   is congested (until it drains), instead of dropping the sample.
   #[must_use]
   pub fn best_effort_may_block(mut self, may_block: bool) -> Self {
     self.best_effort_may_block = may_block;
@@ -139,9 +139,9 @@ impl WriteOptions {
   /// congestion (see [`WriteOptionsBuilder::best_effort_may_block`]).
   ///
   /// Only meaningful for best-effort DataWriters; reliable writers always apply
-  /// back-pressure regardless of this flag. Defaults to `false`, so by default a
-  /// best-effort `write` never blocks and drops samples under congestion, as
-  /// required by DDS v1.4 section 2.2.2.4.2.11.
+  /// back-pressure regardless of this flag. Defaults to `false`, so by default
+  /// a best-effort `write` never blocks and drops samples under congestion,
+  /// as required by DDS v1.4 section 2.2.2.4.2.11.
   pub fn best_effort_may_block(&self) -> bool {
     self.best_effort_may_block
   }
