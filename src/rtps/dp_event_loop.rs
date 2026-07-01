@@ -1,6 +1,6 @@
 use std::{
   cell::RefCell,
-  collections::HashMap,
+  collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
   net::IpAddr,
   rc::Rc,
   sync::{Arc, RwLock},
@@ -29,6 +29,7 @@ use crate::{
   rtps::{
     constant::*,
     message_receiver::MessageReceiver,
+    outbound::SocketId,
     reader::{Reader, ReaderIngredients},
     rtps_reader_proxy::RtpsReaderProxy,
     rtps_writer_proxy::RtpsWriterProxy,
@@ -92,6 +93,14 @@ pub struct DPEventLoop {
 
   writers: HashMap<EntityId, Writer>,
   udp_sender: Rc<UDPSender>,
+
+  // nonblocking-transmit: per-socket round-robin of writers that have bulk DATA
+  // to send but hit WouldBlock. Served on write readiness, control first.
+  // `writable_armed` tracks which sender sockets currently have writable poll
+  // interest registered (armed on demand, disarmed when queues drain).
+  // (see src/rtps/nonblocking_transmit_design.md)
+  bulk_ready: BTreeMap<SocketId, VecDeque<EntityId>>,
+  writable_armed: BTreeSet<SocketId>,
 
   // Interface-aware transmit: per-remote observed receive interfaces/addresses,
   // shared (intra-thread) with the MessageReceiver that populates it.
@@ -256,6 +265,8 @@ impl DPEventLoop {
       remove_writer_receiver,
       stop_poll_receiver,
       writers: HashMap::new(),
+      bulk_ready: BTreeMap::new(),
+      writable_armed: BTreeSet::new(),
       shared_timer,
       ack_nack_receiver: acknack_receiver,
       discovery_update_notification_receiver,
@@ -275,9 +286,17 @@ impl DPEventLoop {
 
     // loop starts here
     loop {
+      // nonblocking-transmit: on platforms without write-readiness registration
+      // we poll queued outbound work with a short timeout; on unix the sender
+      // sockets' writable readiness wakes us, so a long idle timeout is fine.
+      let poll_timeout = if cfg!(unix) || !ev_wrapper.has_pending_outbound() {
+        Duration::from_millis(2000)
+      } else {
+        Duration::from_millis(2)
+      };
       ev_wrapper
         .poll
-        .poll(&mut events, Some(Duration::from_millis(2000)))
+        .poll(&mut events, Some(poll_timeout))
         .expect("Failed in waiting of poll.");
 
       // liveness watchdog
@@ -445,12 +464,17 @@ impl DPEventLoop {
               }
 
               fixed_unknown => {
-                error!(
-                  "Unknown event.token {:?} = 0x{:x?} , decoded as {:?}",
-                  event.token(),
-                  event.token().0,
-                  fixed_unknown
-                );
+                // nonblocking-transmit: write readiness on a sender socket.
+                if let Some(sid) = sender_writable_socket_id(fixed_unknown) {
+                  ev_wrapper.on_socket_writable(sid);
+                } else {
+                  error!(
+                    "Unknown event.token {:?} = 0x{:x?} , decoded as {:?}",
+                    event.token(),
+                    event.token().0,
+                    fixed_unknown
+                  );
+                }
               }
             },
 
@@ -466,20 +490,25 @@ impl DPEventLoop {
                   Reader::process_command,
                 );
               } else if eid.kind().is_writer() {
-                let local_readers = match ev_wrapper.writers.get_mut(&eid) {
+                let (blocked, local_readers) = match ev_wrapper.writers.get_mut(&eid) {
                   None => {
                     if !preparing_to_stop {
                       error!("Event for unknown writer {eid:?}");
                     };
-                    vec![]
+                    (BTreeSet::new(), vec![])
                   }
                   Some(writer) => {
                     // The DataWriter admitted new samples into the shared send
                     // buffer and rang the doorbell; transmit them.
                     writer.process_pending();
-                    writer.local_readers()
+                    (writer.take_blocked_sockets(), writer.local_readers())
                   }
                 };
+                // nonblocking-transmit: if the socket(s) congested, enqueue this
+                // writer for a round-robin resume on write readiness.
+                for sid in blocked {
+                  ev_wrapper.mark_writer_willing(sid, eid);
+                }
                 // Notify local (same participant) readers that new data is available in the
                 // cache.
                 ev_wrapper
@@ -500,8 +529,111 @@ impl DPEventLoop {
           }
         } // for
       } // if
+
+      // nonblocking-transmit: service the per-socket outbound queues and keep
+      // write-readiness interest in sync with what is pending.
+      ev_wrapper.service_outbound();
     } // loop
   } // fn
+
+  // --- nonblocking-transmit helpers -----------------------------------------
+
+  // Enqueue a writer on a socket's round-robin bulk queue (no duplicates).
+  fn mark_writer_willing(&mut self, sid: SocketId, eid: EntityId) {
+    let queue = self.bulk_ready.entry(sid).or_default();
+    if !queue.contains(&eid) {
+      queue.push_back(eid);
+    }
+  }
+
+  // Is there any queued control or bulk work waiting for a socket to drain?
+  fn has_pending_outbound(&self) -> bool {
+    !self.udp_sender.pending_control_sockets().is_empty()
+      || self.bulk_ready.values().any(|q| !q.is_empty())
+  }
+
+  // Write readiness fired for one sender socket: flush its control queue first
+  // (strict priority), then serve willing bulk writers round-robin until the
+  // socket fills again or its queue empties.
+  fn on_socket_writable(&mut self, sid: SocketId) {
+    self.udp_sender.flush_control(sid);
+    if self.udp_sender.pending_control_sockets().contains(&sid) {
+      // Still congested after control; wait for the next writable edge.
+      return;
+    }
+    while let Some(eid) = self.bulk_ready.get_mut(&sid).and_then(VecDeque::pop_front) {
+      let blocked = match self.writers.get_mut(&eid) {
+        Some(writer) => {
+          writer.process_pending();
+          writer.take_blocked_sockets()
+        }
+        None => BTreeSet::new(),
+      };
+      let sid_blocked = blocked.contains(&sid);
+      for s in blocked {
+        self.mark_writer_willing(s, eid);
+      }
+      if sid_blocked {
+        // Socket filled again; the writer has been re-queued. Stop and wait for
+        // the next writable edge.
+        break;
+      }
+    }
+  }
+
+  fn service_outbound(&mut self) {
+    #[cfg(unix)]
+    self.reconcile_writable_interest();
+    #[cfg(not(unix))]
+    self.drain_outbound_fallback();
+  }
+
+  // Arm write-readiness poll interest for sockets that have queued work, and
+  // disarm it for sockets that have drained. Level-triggered, so we keep being
+  // woken while a socket is writable and has pending work.
+  #[cfg(unix)]
+  fn reconcile_writable_interest(&mut self) {
+    use mio_06::unix::EventedFd;
+    let pending_control = self.udp_sender.pending_control_sockets();
+    for sid in self.udp_sender.socket_ids() {
+      let want =
+        pending_control.contains(&sid) || self.bulk_ready.get(&sid).is_some_and(|q| !q.is_empty());
+      let armed = self.writable_armed.contains(&sid);
+      match (want, armed) {
+        (true, false) => {
+          if let Some(fd) = self.udp_sender.socket_raw_fd(sid) {
+            match self.poll.register(
+              &EventedFd(&fd),
+              sender_writable_token(sid),
+              Ready::writable(),
+              PollOpt::level(),
+            ) {
+              Ok(()) => {
+                self.writable_armed.insert(sid);
+              }
+              Err(e) => error!("nonblocking-transmit: failed to arm writable for {sid:?}: {e}"),
+            }
+          }
+        }
+        (false, true) => {
+          if let Some(fd) = self.udp_sender.socket_raw_fd(sid) {
+            let _ = self.poll.deregister(&EventedFd(&fd));
+          }
+          self.writable_armed.remove(&sid);
+        }
+        _ => {}
+      }
+    }
+  }
+
+  // Fallback for platforms without EventedFd: flush/serve every socket each loop
+  // iteration (the loop uses a short poll timeout while anything is pending).
+  #[cfg(not(unix))]
+  fn drain_outbound_fallback(&mut self) {
+    for sid in self.udp_sender.socket_ids() {
+      self.on_socket_writable(sid);
+    }
+  }
 
   #[cfg(feature = "security")] // Currently used only with security.
                                // Just remove attribute if used also without.

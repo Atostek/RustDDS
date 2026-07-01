@@ -42,6 +42,7 @@ pub struct WriteOptionsBuilder {
   related_sample_identity: Option<SampleIdentity>,
   source_timestamp: Option<Timestamp>,
   to_single_reader: Option<GUID>,
+  best_effort_may_block: bool,
 }
 
 impl WriteOptionsBuilder {
@@ -54,6 +55,7 @@ impl WriteOptionsBuilder {
       related_sample_identity: self.related_sample_identity,
       source_timestamp: self.source_timestamp,
       to_single_reader: self.to_single_reader,
+      best_effort_may_block: self.best_effort_may_block,
     }
   }
 
@@ -83,6 +85,27 @@ impl WriteOptionsBuilder {
     self.to_single_reader = Some(reader);
     self
   }
+
+  /// Whether a best-effort `write` call is allowed to block under send-socket
+  /// congestion.
+  ///
+  /// This option only affects **best-effort** DataWriters and has no effect on
+  /// reliable ones (reliable writers always apply back-pressure bounded by
+  /// their `max_blocking_time`).
+  ///
+  /// - `false` (the default): the `write` call never blocks for a best-effort
+  ///   writer. If the outgoing network socket is congested, the sample is
+  ///   dropped rather than retained. This matches the DDS specification v1.4
+  ///   section 2.2.2.4.2.11 ("write"), which does not permit `write` to block
+  ///   for best-effort reliability.
+  /// - `true`: the nonblocking-transmit back-pressure is extended to this
+  ///   best-effort write, so the `write` call may block while the send socket
+  ///   is congested (until it drains), instead of dropping the sample.
+  #[must_use]
+  pub fn best_effort_may_block(mut self, may_block: bool) -> Self {
+    self.best_effort_may_block = may_block;
+    self
+  }
 }
 
 /// Type to be used with write_with_options.
@@ -93,6 +116,10 @@ pub struct WriteOptions {
   source_timestamp: Option<Timestamp>,             // from DDS spec
   to_single_reader: Option<GUID>,                  /* try to send to one Reader only
                                                     * future extension room fo other fields. */
+  // nonblocking-transmit: opt-in blocking back-pressure for best-effort writers.
+  // Defaults to `false` (DDS v1.4 section 2.2.2.4.2.11: `write` must not block
+  // for best-effort reliability). See `WriteOptionsBuilder::best_effort_may_block`.
+  best_effort_may_block: bool,
 }
 
 impl WriteOptions {
@@ -107,6 +134,17 @@ impl WriteOptions {
   pub fn to_single_reader(&self) -> Option<GUID> {
     self.to_single_reader
   }
+
+  /// Whether a best-effort `write` call is allowed to block under send-socket
+  /// congestion (see [`WriteOptionsBuilder::best_effort_may_block`]).
+  ///
+  /// Only meaningful for best-effort DataWriters; reliable writers always apply
+  /// back-pressure regardless of this flag. Defaults to `false`, so by default
+  /// a best-effort `write` never blocks and drops samples under congestion,
+  /// as required by DDS v1.4 section 2.2.2.4.2.11.
+  pub fn best_effort_may_block(&self) -> bool {
+    self.best_effort_may_block
+  }
 }
 
 impl From<Option<Timestamp>> for WriteOptions {
@@ -115,6 +153,7 @@ impl From<Option<Timestamp>> for WriteOptions {
       related_sample_identity: None,
       source_timestamp,
       to_single_reader: None,
+      best_effort_may_block: false,
     }
   }
 }
