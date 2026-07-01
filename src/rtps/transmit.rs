@@ -16,10 +16,10 @@
 //!   interface(s) we have actually seen its traffic arrive. This is the primary
 //!   input to route selection.
 //!
-//! Safety guardrail: when we do not have enough information to narrow a remote's
-//! route confidently, [`SendRoute::fallback`] is set and the writer falls back
-//! to the legacy "send to every advertised locator on every interface" path, so
-//! reachability is never reduced.
+//! Safety guardrail: when we do not have enough information to narrow a
+//! remote's route confidently, [`SendRoute::fallback`] is set and the writer
+//! falls back to the legacy "send to every advertised locator on every
+//! interface" path, so reachability is never reduced.
 
 use std::{
   collections::BTreeMap,
@@ -197,7 +197,12 @@ impl InterfaceObservations {
 
   /// Record that a packet from `prefix` arrived from `source`, on local
   /// interface `iface` (if it could be determined).
-  pub fn record(&mut self, prefix: GuidPrefix, iface: Option<InterfaceSelector>, source: SocketAddr) {
+  pub fn record(
+    &mut self,
+    prefix: GuidPrefix,
+    iface: Option<InterfaceSelector>,
+    source: SocketAddr,
+  ) {
     self
       .by_participant
       .entry(prefix)
@@ -214,7 +219,8 @@ impl InterfaceObservations {
   }
 }
 
-/// Strategy for turning advertised locators + observations into a [`SendRoute`].
+/// Strategy for turning advertised locators + observations into a
+/// [`SendRoute`].
 ///
 /// Kept as a trait so the heuristic can evolve (or be swapped) without touching
 /// the transmit path.
@@ -328,7 +334,10 @@ mod tests {
   use crate::structure::guid::GuidPrefix;
 
   fn udp(ip: [u8; 4], port: u16) -> Locator {
-    Locator::UdpV4(SocketAddrV4::new(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port))
+    Locator::UdpV4(SocketAddrV4::new(
+      Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+      port,
+    ))
   }
 
   fn sockaddr(ip: [u8; 4], port: u16) -> SocketAddr {
@@ -385,7 +394,12 @@ mod tests {
     // Observation without a resolvable local interface (unicast only source).
     obs.record(None, sockaddr([10, 0, 0, 5], 7410));
     let mc = udp([239, 255, 0, 1], 7401);
-    let route = sel.select(&[udp([10, 0, 0, 5], 7410)], &[mc], Some(&obs), &[iface([10, 0, 0, 1])]);
+    let route = sel.select(
+      &[udp([10, 0, 0, 5], 7410)],
+      &[mc],
+      Some(&obs),
+      &[iface([10, 0, 0, 1])],
+    );
     assert!(route.fallback);
   }
 
@@ -440,7 +454,11 @@ mod tests {
     let p = GuidPrefix::UNKNOWN;
     obs.record(p, Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
     obs.record(p, Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
-    obs.record(p, Some(iface([192, 168, 1, 1])), sockaddr([192, 168, 1, 5], 7410));
+    obs.record(
+      p,
+      Some(iface([192, 168, 1, 1])),
+      sockaddr([192, 168, 1, 5], 7410),
+    );
     let recorded = obs.get(p).unwrap();
     assert_eq!(recorded.interface_count(), 2);
     // Sticky: the first-chosen interface stays.
@@ -465,7 +483,12 @@ mod tests {
     let mut obs = ObservedRoutes::default();
     let margin = Duration::from_secs(30);
     let t0 = Instant::now();
-    obs.record_at(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410), t0, margin);
+    obs.record_at(
+      Some(iface([10, 0, 0, 1])),
+      sockaddr([10, 0, 0, 5], 7410),
+      t0,
+      margin,
+    );
     // Challenger arrives before the current interface has been silent for the
     // full margin -> no switch.
     obs.record_at(
@@ -482,7 +505,12 @@ mod tests {
     let mut obs = ObservedRoutes::default();
     let margin = Duration::from_secs(30);
     let t0 = Instant::now();
-    obs.record_at(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410), t0, margin);
+    obs.record_at(
+      Some(iface([10, 0, 0, 1])),
+      sockaddr([10, 0, 0, 5], 7410),
+      t0,
+      margin,
+    );
     // Current interface has been silent for >= margin when the challenger is
     // heard -> switch.
     obs.record_at(
@@ -507,7 +535,12 @@ mod tests {
     // silent for a full margin, so it is never displaced.
     for k in 1..=6 {
       let t = t0 + Duration::from_secs(10 * k);
-      obs.record_at(Some(challenger), sockaddr([192, 168, 1, 5], 7410), t, margin);
+      obs.record_at(
+        Some(challenger),
+        sockaddr([192, 168, 1, 5], 7410),
+        t,
+        margin,
+      );
       obs.record_at(
         Some(current),
         sockaddr([10, 0, 0, 5], 7410),

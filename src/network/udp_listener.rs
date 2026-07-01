@@ -25,7 +25,8 @@ pub struct PacketOrigin {
   /// Remote source socket address, if it could be determined.
   pub source: Option<SocketAddr>,
   /// Local interface the datagram was received on, if it could be determined
-  /// (requires `IP_PKTINFO`; `None` on platforms/paths where it is unavailable).
+  /// (requires `IP_PKTINFO`; `None` on platforms/paths where it is
+  /// unavailable).
   pub local_if: Option<InterfaceSelector>,
 }
 
@@ -107,10 +108,15 @@ impl UDPListener {
     // simply lose interface metadata and fall back to the legacy send path.
     #[cfg(unix)]
     {
-      if let Err(e) =
-        nix::sys::socket::setsockopt(&raw_socket, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
-      {
-        warn!("Could not enable IP_PKTINFO on listener socket: {e}. Interface-aware transmit disabled for this socket.");
+      if let Err(e) = nix::sys::socket::setsockopt(
+        &raw_socket,
+        nix::sys::socket::sockopt::Ipv4PacketInfo,
+        &true,
+      ) {
+        warn!(
+          "Could not enable IP_PKTINFO on listener socket: {e}. Interface-aware transmit disabled \
+           for this socket."
+        );
       }
     }
 
@@ -357,17 +363,15 @@ impl UDPListener {
     // Read the datagram and pull out the Copy metadata; the borrow of
     // `receive_buffer` (through `iov`) ends when this block ends.
     let (nbytes, source, ifindex, spec_dst) = {
-      let mut iov = [IoSliceMut::new(&mut self.receive_buffer[..MAX_MESSAGE_SIZE])];
-      let msg = match recvmsg::<SockaddrStorage>(
-        fd,
-        &mut iov,
-        Some(&mut cmsg_space),
-        MsgFlags::empty(),
-      ) {
-        Ok(m) => m,
-        Err(Errno::EAGAIN) => return Ok(None),
-        Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
-      };
+      let mut iov = [IoSliceMut::new(
+        &mut self.receive_buffer[..MAX_MESSAGE_SIZE],
+      )];
+      let msg =
+        match recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty()) {
+          Ok(m) => m,
+          Err(Errno::EAGAIN) => return Ok(None),
+          Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+        };
 
       let nbytes = msg.bytes;
       let source = msg.address.and_then(sockaddr_storage_to_socketaddr);
@@ -398,7 +402,10 @@ impl UDPListener {
   /// Non-Unix fallback: capture the source address only (no interface info).
   #[cfg(not(unix))]
   fn recv_one(&mut self) -> io::Result<Option<(usize, PacketOrigin)>> {
-    match self.socket.recv_from(&mut self.receive_buffer[..MAX_MESSAGE_SIZE]) {
+    match self
+      .socket
+      .recv_from(&mut self.receive_buffer[..MAX_MESSAGE_SIZE])
+    {
       Ok((nbytes, source)) => Ok(Some((
         nbytes,
         PacketOrigin {
@@ -423,9 +430,7 @@ impl UDPListener {
 }
 
 #[cfg(unix)]
-fn sockaddr_storage_to_socketaddr(
-  addr: nix::sys::socket::SockaddrStorage,
-) -> Option<SocketAddr> {
+fn sockaddr_storage_to_socketaddr(addr: nix::sys::socket::SockaddrStorage) -> Option<SocketAddr> {
   use std::net::{SocketAddrV4, SocketAddrV6};
   if let Some(v4) = addr.as_sockaddr_in() {
     Some(SocketAddr::V4(SocketAddrV4::new(v4.ip(), v4.port())))

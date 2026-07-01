@@ -227,9 +227,7 @@ impl UDPSender {
       None => {
         // Requested interface unknown: preserve reachability by falling back to
         // all interfaces.
-        trace!(
-          "send_to_multicast_locator_via: interface {interface:?} not found, sending on all"
-        );
+        trace!("send_to_multicast_locator_via: interface {interface:?} not found, sending on all");
         for (_iface, socket) in &self.multicast_sockets {
           self.send_to_udp_socket(buffer, socket, &socket_address);
         }

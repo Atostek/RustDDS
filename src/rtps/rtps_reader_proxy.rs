@@ -566,7 +566,10 @@ mod route_tests {
   };
 
   fn udp(ip: [u8; 4], port: u16) -> Locator {
-    Locator::UdpV4(SocketAddrV4::new(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port))
+    Locator::UdpV4(SocketAddrV4::new(
+      Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+      port,
+    ))
   }
 
   fn iface(ip: [u8; 4]) -> InterfaceSelector {
@@ -583,7 +586,11 @@ mod route_tests {
     let mut rp = proxy_with_prefix(GuidPrefix::UNKNOWN);
     rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7410)];
     let observations = InterfaceObservations::new();
-    rp.resolve_send_route(&observations, &[iface([10, 0, 0, 1])], &DefaultRouteSelector);
+    rp.resolve_send_route(
+      &observations,
+      &[iface([10, 0, 0, 1])],
+      &DefaultRouteSelector,
+    );
     assert!(rp.send_route().fallback);
   }
 
@@ -601,7 +608,11 @@ mod route_tests {
       SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 7410),
     );
 
-    rp.resolve_send_route(&observations, &[iface([10, 0, 0, 1])], &DefaultRouteSelector);
+    rp.resolve_send_route(
+      &observations,
+      &[iface([10, 0, 0, 1])],
+      &DefaultRouteSelector,
+    );
 
     let route = rp.send_route();
     assert!(!route.fallback);

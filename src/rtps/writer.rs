@@ -1396,7 +1396,7 @@ impl Writer {
   fn matched_reader_update(&mut self, updated_reader_proxy: &RtpsReaderProxy) -> bool {
     let mut is_new = false;
     let is_volatile = self.qos().is_volatile(); // Get this in advance to work with the borrow checker
-    // Capture the interface set once; resolution consults current observations.
+                                                // Capture the interface set once; resolution consults current observations.
     let multicast_ifaces = self.udp_sender.multicast_interfaces();
     self
       .readers

@@ -267,9 +267,7 @@ mod tests {
         "eth0",
         3,
         &[
-          IpNetwork::V6(
-            Ipv6Network::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64).unwrap(),
-          ),
+          IpNetwork::V6(Ipv6Network::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64).unwrap()),
           IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 7), 24).unwrap()),
         ],
         &[pnet_sys::IFF_MULTICAST],
@@ -280,7 +278,9 @@ mod tests {
     assert!(!map.contains_key(&0), "index 0 must be skipped");
     assert_eq!(
       map.get(&3),
-      Some(&InterfaceSelector::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)))),
+      Some(&InterfaceSelector::Ip(IpAddr::V4(Ipv4Addr::new(
+        10, 0, 0, 7
+      )))),
       "should prefer the IPv4 address"
     );
   }
