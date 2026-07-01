@@ -1,4 +1,5 @@
 use std::{
+  cell::RefCell,
   cmp::{max, min},
   collections::{BTreeMap, BTreeSet},
   ops::Bound::Included,
@@ -33,6 +34,7 @@ use crate::{
     },
     rtps_reader_proxy::RtpsReaderProxy,
     timed_event::DpTimerEvent,
+    transmit::{DefaultRouteSelector, InterfaceObservations, RouteKey},
     writer_send_buffer::WriterSendBuffer,
     Message, MessageBuilder,
   },
@@ -158,6 +160,11 @@ pub(crate) struct Writer {
   // Sending mechanism
   udp_sender: Rc<UDPSender>,
 
+  // Interface-aware transmit: per-remote observed receive interfaces/addresses,
+  // shared (intra-thread) with the MessageReceiver that records them. Consulted
+  // when (re)resolving each reader proxy's SendRoute.
+  interface_observations: Rc<RefCell<InterfaceObservations>>,
+
   // By default, this writer is a StatefulWriter (see RTPS spec section 8.4.9)
   // If like_stateless is true, then the writer mimics the behavior of a Best-Effort
   // StatelessWriter. This behavior is needed only for a single built-in discovery topic of
@@ -202,6 +209,7 @@ impl Writer {
     udp_sender: Rc<UDPSender>,
     timed_event_timer: SharedTimer<DpTimerEvent>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
+    interface_observations: Rc<RefCell<InterfaceObservations>>,
   ) -> Self {
     // If writer should behave statelessly, only BestEffort QoS is currently
     // supported
@@ -278,6 +286,7 @@ impl Writer {
       matched_readers_count_total: 0,
       requested_incompatible_qos_count: 0,
       udp_sender,
+      interface_observations,
       my_topic_name: i.topic_name,
       send_buffer: i.send_buffer,
       last_sent: SequenceNumber::zero(),
@@ -1200,13 +1209,12 @@ impl Writer {
     message: Message,
     readers: &mut dyn Iterator<Item = &RtpsReaderProxy>,
   ) {
-    // TODO: This is a stupid transmit algorithm. We should compute a preferred
-    // unicast and multicast locators for each reader only on every reader update,
-    // and not find it dynamically on every message.
-
-    // TODO: In addition to Locators found in Readers, we should observe
-    // the Locators given in MEssageReceiverState, i.e. if there was an
-    // applicable InfoReply submessage, and we are sending a reply.
+    // Interface-aware transmit (see src/rtps/transmit_design.md): each reader
+    // carries a pre-resolved `SendRoute`. When the route is known we emit a
+    // single datagram per distinct destination (`RouteKey`), targeting one
+    // interface for multicast. When the route is unknown/ambiguous we fall back
+    // to the legacy path (send to every advertised locator on every interface)
+    // so reachability is preserved.
 
     let readers = readers.collect::<Vec<_>>(); // clone iterator
 
@@ -1218,49 +1226,80 @@ impl Writer {
     match encoded {
       Ok(message) => {
         let buffer = message.write_to_vec_with_ctx(self.endianness).unwrap();
-        let mut already_sent_to = BTreeSet::new();
 
-        macro_rules! send_unless_sent_and_mark {
+        // De-duplication of narrowed (interface-aware) sends across readers.
+        let mut sent_routes: BTreeSet<RouteKey> = BTreeSet::new();
+        // De-duplication of legacy (all-interface) sends across readers.
+        let mut sent_legacy: BTreeSet<Locator> = BTreeSet::new();
+
+        macro_rules! emit_multicast {
+          ($mc:expr, $iface:expr) => {
+            if sent_routes.insert(RouteKey::Multicast($mc, $iface)) {
+              self
+                .udp_sender
+                .send_to_multicast_locator_via(&buffer, &$mc, &$iface);
+            } else {
+              trace!("Already sent to multicast {:?} via {:?}", $mc, $iface);
+            }
+          };
+        }
+        macro_rules! emit_unicast {
+          ($uc:expr) => {
+            if sent_routes.insert(RouteKey::Unicast($uc)) {
+              self.udp_sender.send_to_locator(&buffer, &$uc);
+            } else {
+              trace!("Already sent to unicast {:?}", $uc);
+            }
+          };
+        }
+        macro_rules! send_legacy {
           ($locs:expr) => {
             for loc in $locs.iter() {
-              if already_sent_to.contains(loc) {
-                trace!("Already sent to {:?}", loc);
-              } else {
+              if sent_legacy.insert(*loc) {
                 self.udp_sender.send_to_locator(&buffer, loc);
-                already_sent_to.insert(loc.clone());
+              } else {
+                trace!("Already sent to {:?}", loc);
               }
             }
           };
         }
 
         for reader in readers {
-          match (
-            preferred_mode,
-            reader
-              .unicast_locator_list
-              .iter()
-              .find(|l| Locator::is_udp(l)),
-            reader
-              .multicast_locator_list
-              .iter()
-              .find(|l| Locator::is_udp(l)),
-          ) {
-            (DeliveryMode::Multicast, _, Some(_mc_locator)) => {
-              send_unless_sent_and_mark!(reader.multicast_locator_list);
+          let route = reader.send_route();
+
+          if route.fallback {
+            // Unknown/ambiguous route: preserve reachability using the legacy
+            // all-locators/all-interfaces path with the original precedence.
+            match (
+              preferred_mode,
+              reader
+                .unicast_locator_list
+                .iter()
+                .find(|l| Locator::is_udp(l)),
+              reader
+                .multicast_locator_list
+                .iter()
+                .find(|l| Locator::is_udp(l)),
+            ) {
+              (DeliveryMode::Multicast, _, Some(_)) => send_legacy!(reader.multicast_locator_list),
+              (DeliveryMode::Unicast, Some(_), _) => send_legacy!(reader.unicast_locator_list),
+              (_, _, Some(_)) => send_legacy!(reader.multicast_locator_list),
+              (_, Some(_), _) => send_legacy!(reader.unicast_locator_list),
+              (_, None, None) => warn!("send_message_to_readers: No locators for {reader:?}"),
             }
-            (DeliveryMode::Unicast, Some(_uc_locator), _) => {
-              send_unless_sent_and_mark!(reader.unicast_locator_list)
+            continue;
+          }
+
+          // Narrowed route: reuse the multicast/unicast preference precedence.
+          match (preferred_mode, route.multicast, route.unicast) {
+            (DeliveryMode::Multicast, Some((mc, iface)), _) => emit_multicast!(mc, iface),
+            (DeliveryMode::Unicast, _, Some(uc)) => emit_unicast!(uc),
+            (_, _, Some(uc)) => emit_unicast!(uc),
+            (_, Some((mc, iface)), _) => emit_multicast!(mc, iface),
+            (_, None, None) => {
+              warn!("send_message_to_readers: resolved route has no destination for {reader:?}");
             }
-            (_delivery_mode, _, Some(_mc_locator)) => {
-              send_unless_sent_and_mark!(reader.multicast_locator_list);
-            }
-            (_delivery_mode, Some(_uc_locator), _) => {
-              send_unless_sent_and_mark!(reader.unicast_locator_list)
-            }
-            (_delivery_mode, None, None) => {
-              warn!("send_message_to_readers: No locators for {reader:?}");
-            }
-          } // match
+          }
         }
       }
       Err(e) => error!("Failed to send message to readers. Encoding failed: {e:?}"),
@@ -1357,10 +1396,20 @@ impl Writer {
   fn matched_reader_update(&mut self, updated_reader_proxy: &RtpsReaderProxy) -> bool {
     let mut is_new = false;
     let is_volatile = self.qos().is_volatile(); // Get this in advance to work with the borrow checker
+    // Capture the interface set once; resolution consults current observations.
+    let multicast_ifaces = self.udp_sender.multicast_interfaces();
     self
       .readers
       .entry(updated_reader_proxy.remote_reader_guid)
-      .and_modify(|rp| rp.update(updated_reader_proxy, &self.my_topic_name))
+      .and_modify(|rp| {
+        rp.update(updated_reader_proxy, &self.my_topic_name);
+        // Locators may have changed; refresh the interface-aware send route.
+        rp.resolve_send_route(
+          &self.interface_observations.borrow(),
+          &multicast_ifaces,
+          &DefaultRouteSelector,
+        );
+      })
       .or_insert_with(|| {
         is_new = true;
         let mut new_proxy = updated_reader_proxy.clone();
@@ -1370,9 +1419,27 @@ impl Writer {
           // for all existing sequence numbers
           new_proxy.set_pending_gap_up_to(self.send_buffer.last_change_sequence_number());
         }
+        new_proxy.resolve_send_route(
+          &self.interface_observations.borrow(),
+          &multicast_ifaces,
+          &DefaultRouteSelector,
+        );
         new_proxy
       });
     is_new
+  }
+
+  /// Refresh the [`SendRoute`](crate::rtps::transmit::SendRoute) of every
+  /// matched reader belonging to `prefix`. Called when fresh interface
+  /// observations for that participant may have arrived (e.g. periodic SPDP).
+  pub fn recompute_routes_for(&mut self, prefix: GuidPrefix) {
+    let multicast_ifaces = self.udp_sender.multicast_interfaces();
+    let observations = self.interface_observations.borrow();
+    for rp in self.readers.values_mut() {
+      if rp.remote_reader_guid.prefix == prefix {
+        rp.resolve_send_route(&observations, &multicast_ifaces, &DefaultRouteSelector);
+      }
+    }
   }
 
   fn matched_reader_remove(&mut self, guid: GUID) -> Option<RtpsReaderProxy> {

@@ -1,11 +1,12 @@
 use std::{
+  collections::HashMap,
   io,
   net::{IpAddr, SocketAddr},
 };
 
 use log::{error, warn};
 
-use crate::structure::locator::Locator;
+use crate::{rtps::transmit::InterfaceSelector, structure::locator::Locator};
 
 pub fn get_local_multicast_locators(port: u16) -> Vec<Locator> {
   let saddr = SocketAddr::new("239.255.0.1".parse().unwrap(), port);
@@ -80,6 +81,36 @@ fn get_local_multicast_ip_addrs_inner(
     .map(|ip_net| ip_net.ip())
     .filter(|ip| ip.is_ipv4())
     .collect()
+}
+
+/// Builds a mapping from OS interface index to an [`InterfaceSelector`].
+///
+/// Used to resolve the `ipi_ifindex` reported by `IP_PKTINFO`/`IPV6_PKTINFO`
+/// into the interface identity our sender uses (its IP). Prefers an IPv4
+/// address so the result matches the keys of the multicast sender sockets.
+pub fn build_ifindex_to_interface_map() -> HashMap<u32, InterfaceSelector> {
+  build_ifindex_map_inner(pnet::datalink::interfaces())
+}
+
+fn build_ifindex_map_inner(
+  interfaces: Vec<pnet::datalink::NetworkInterface>,
+) -> HashMap<u32, InterfaceSelector> {
+  let mut map = HashMap::new();
+  for iface in interfaces {
+    if iface.index == 0 {
+      continue;
+    }
+    let ip = iface
+      .ips
+      .iter()
+      .map(|n| n.ip())
+      .find(IpAddr::is_ipv4)
+      .or_else(|| iface.ips.first().map(|n| n.ip()));
+    if let Some(ip) = ip {
+      map.insert(iface.index, InterfaceSelector::Ip(ip));
+    }
+  }
+  map
 }
 
 #[cfg(test)]
@@ -223,6 +254,34 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
         7412,
       ))]
+    );
+  }
+
+  #[test]
+  fn ifindex_map_prefers_ipv4_and_skips_index_zero() {
+    use super::InterfaceSelector;
+
+    let interfaces = vec![
+      loopback(), // index 0 -> skipped
+      interface(
+        "eth0",
+        3,
+        &[
+          IpNetwork::V6(
+            Ipv6Network::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64).unwrap(),
+          ),
+          IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 7), 24).unwrap()),
+        ],
+        &[pnet_sys::IFF_MULTICAST],
+      ),
+    ];
+
+    let map = super::build_ifindex_map_inner(interfaces);
+    assert!(!map.contains_key(&0), "index 0 must be skipped");
+    assert_eq!(
+      map.get(&3),
+      Some(&InterfaceSelector::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)))),
+      "should prefer the IPv4 address"
     );
   }
 

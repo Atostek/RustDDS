@@ -184,10 +184,53 @@ flowchart TD
 
 ## 6. Non-goals and open questions
 
-- No code changes accompany this document.
 - Open questions:
   - exact `InterfaceSelector` representation (interface IP vs OS index) and
     Windows parity for `IP_PKTINFO`;
   - whether to also prune redundant unicast when multicast already covers a
     remote;
   - the specifics of the default `RouteSelector` policy.
+
+## 7. Implementation notes (as built)
+
+- `InterfaceSelector` is the interface IP (`InterfaceSelector::Ip(IpAddr)`),
+  matching the address the multicast sender sockets are bound to. The enum keeps
+  room for an OS-index variant.
+- Receive origin is captured in [`udp_listener.rs`](../network/udp_listener.rs)
+  via `recvmsg` + `IP_PKTINFO` (Unix; `nix` crate). For IPv4 the local interface
+  is taken directly from `ipi_spec_dst`; `ipi_ifindex` is resolved through a
+  cached index→interface map as a fallback. On non-Unix platforms only the
+  source address is captured (`local_if = None`), which keeps the fallback path.
+- Observations live in `InterfaceObservations`, shared intra-thread via
+  `Rc<RefCell<..>>` between `MessageReceiver` (writer) and `DPEventLoop`
+  (consumer). Cleared on `remote_participant_lost`.
+- Routes are resolved in `matched_reader_update` (on discovery add/update) and
+  refreshed in `Writer::recompute_routes_for`, invoked from `update_participant`
+  when fresh SPDP traffic may have changed observations.
+- The default policy is deliberately conservative: unknown/ambiguous → fallback
+  (legacy all-locators/all-interfaces path), so the feature is a strict
+  optimization for peers whose receive interface we have positively observed.
+
+## 8. Manual multi-homed validation
+
+CI runs on single-interface hosts, which exercise the fallback and the
+narrowed-but-single-interface paths, but cannot prove interface selection across
+multiple interfaces. To validate that manually:
+
+1. Set up two hosts, each connected to two separate subnets (e.g. host A on
+   `10.0.0.0/24` and `192.168.50.0/24`; host B likewise), so each participant is
+   reachable via two interfaces.
+2. Optionally emulate this on one machine with two network namespaces or two
+   `veth`/dummy interfaces on different subnets, both multicast-capable, and run
+   a publisher in one namespace and a subscriber in the other.
+3. Run a reliable publisher on A and subscriber on B:
+   - `shape_main -P -t Square -c BLUE -r` on A,
+   - `shape_main -S -t Square -r` on B.
+4. Capture traffic on each interface (`tcpdump -ni <iface> udp`). Expected: after
+   discovery converges, DATA/HEARTBEAT for a given remote is emitted on a single
+   interface (the one its SPDP/SEDP arrived on), not duplicated across both.
+5. Bring the observed interface down mid-run; the next discovery refresh should
+   re-resolve the route to the surviving interface (or fall back to all
+   interfaces until a new observation is made), and delivery should continue.
+6. Sanity: with `RUST_LOG=trace`, "Already sent to ..." trace lines confirm
+   `RouteKey` de-duplication across readers sharing a destination.

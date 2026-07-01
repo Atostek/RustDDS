@@ -11,7 +11,10 @@ use crate::{
   dds::{participant::DomainParticipant, qos::QosPolicies},
   discovery::sedp_messages::DiscoveredReaderData,
   messages::submessages::submessage::AckSubmessage,
-  rtps::constant::*,
+  rtps::{
+    constant::*,
+    transmit::{InterfaceObservations, InterfaceSelector, RouteSelector, SendRoute},
+  },
   structure::{
     guid::{EntityId, GUID},
     locator::Locator,
@@ -61,6 +64,11 @@ pub(crate) struct RtpsReaderProxy {
   pub repair_mode: bool,
   qos: QosPolicies,
   frags_requested: BTreeMap<SequenceNumber, BitVec>,
+
+  // Interface-aware transmit: the resolved send destination for this reader,
+  // recomputed when locators or observations change. Defaults to the fallback
+  // (legacy all-locators) route until resolved.
+  send_route: SendRoute,
 }
 
 impl RtpsReaderProxy {
@@ -78,6 +86,7 @@ impl RtpsReaderProxy {
       repair_mode: false,
       qos,
       frags_requested: BTreeMap::new(),
+      send_route: SendRoute::default(),
     }
   }
 
@@ -187,6 +196,7 @@ impl RtpsReaderProxy {
       repair_mode: false,
       qos: reader.qos_policy.clone(),
       frags_requested: BTreeMap::new(),
+      send_route: SendRoute::default(),
     }
   }
 
@@ -238,7 +248,30 @@ impl RtpsReaderProxy {
       repair_mode: false,
       qos: discovered_reader_data.subscription_topic_data.qos(),
       frags_requested: BTreeMap::new(),
+      send_route: SendRoute::default(),
     }
+  }
+
+  /// The currently resolved [`SendRoute`] for this reader.
+  pub fn send_route(&self) -> SendRoute {
+    self.send_route
+  }
+
+  /// Recompute this reader's [`SendRoute`] from its advertised locators and the
+  /// per-participant [`InterfaceObservations`], using `selector`.
+  pub fn resolve_send_route(
+    &mut self,
+    observations: &InterfaceObservations,
+    local_multicast_ifaces: &[InterfaceSelector],
+    selector: &dyn RouteSelector,
+  ) {
+    let observed = observations.get(self.remote_reader_guid.prefix);
+    self.send_route = selector.select(
+      &self.unicast_locator_list,
+      &self.multicast_locator_list,
+      observed,
+      local_multicast_ifaces,
+    );
   }
 
   pub fn handle_ack_nack(
@@ -519,5 +552,63 @@ mod acknack_tests {
     rp.handle_ack_nack(&AckSubmessage::AckNack(ack), SequenceNumber::from(100));
 
     assert_eq!(rp.all_acked_before, SequenceNumber::from(50));
+  }
+}
+
+#[cfg(test)]
+mod route_tests {
+  use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+
+  use super::*;
+  use crate::{
+    rtps::transmit::{DefaultRouteSelector, InterfaceObservations, InterfaceSelector},
+    structure::guid::GuidPrefix,
+  };
+
+  fn udp(ip: [u8; 4], port: u16) -> Locator {
+    Locator::UdpV4(SocketAddrV4::new(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port))
+  }
+
+  fn iface(ip: [u8; 4]) -> InterfaceSelector {
+    InterfaceSelector::Ip(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])))
+  }
+
+  fn proxy_with_prefix(prefix: GuidPrefix) -> RtpsReaderProxy {
+    let guid = GUID::new(prefix, EntityId::UNKNOWN);
+    RtpsReaderProxy::new(guid, QosPolicies::default(), false)
+  }
+
+  #[test]
+  fn resolve_falls_back_without_observation() {
+    let mut rp = proxy_with_prefix(GuidPrefix::UNKNOWN);
+    rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7410)];
+    let observations = InterfaceObservations::new();
+    rp.resolve_send_route(&observations, &[iface([10, 0, 0, 1])], &DefaultRouteSelector);
+    assert!(rp.send_route().fallback);
+  }
+
+  #[test]
+  fn resolve_narrows_with_observation() {
+    let prefix = GuidPrefix::new(&[9; 12]);
+    let mut rp = proxy_with_prefix(prefix);
+    rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7410)];
+    rp.multicast_locator_list = vec![udp([239, 255, 0, 1], 7401)];
+
+    let mut observations = InterfaceObservations::new();
+    observations.record(
+      prefix,
+      Some(iface([10, 0, 0, 1])),
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 7410),
+    );
+
+    rp.resolve_send_route(&observations, &[iface([10, 0, 0, 1])], &DefaultRouteSelector);
+
+    let route = rp.send_route();
+    assert!(!route.fallback);
+    assert_eq!(route.unicast, Some(udp([10, 0, 0, 5], 7410)));
+    assert_eq!(
+      route.multicast,
+      Some((udp([239, 255, 0, 1], 7401), iface([10, 0, 0, 1])))
+    );
   }
 }

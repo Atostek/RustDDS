@@ -11,14 +11,20 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(windows)]
 use local_ip_address::list_afinet_netifas;
 
-use crate::{network::util::get_local_multicast_ip_addrs_filtered, structure::locator::Locator};
+use crate::{
+  network::util::get_local_multicast_ip_addrs_filtered, rtps::transmit::InterfaceSelector,
+  structure::locator::Locator,
+};
 
 // We need one multicast sender socket per interface
 
 #[derive(Debug)]
 pub struct UDPSender {
   unicast_socket: mio_08::net::UdpSocket,
-  multicast_sockets: Vec<mio_08::net::UdpSocket>,
+  // One multicast sender socket per local interface, keyed by the interface it
+  // was bound to (its `InterfaceSelector`). This lets us target a single
+  // interface instead of sending on all of them.
+  multicast_sockets: Vec<(InterfaceSelector, mio_08::net::UdpSocket)>,
 }
 
 impl UDPSender {
@@ -88,7 +94,10 @@ impl UDPSender {
         }
       };
 
-      multicast_sockets.push(mio_08::net::UdpSocket::from_std(mc_socket));
+      multicast_sockets.push((
+        InterfaceSelector::Ip(multicast_if_ipaddr),
+        mio_08::net::UdpSocket::from_std(mc_socket),
+      ));
     } // end for
 
     let sender = Self {
@@ -139,7 +148,7 @@ impl UDPSender {
     }
     let send = |socket_address: SocketAddr| {
       if socket_address.ip().is_multicast() {
-        for socket in &self.multicast_sockets {
+        for (_iface, socket) in &self.multicast_sockets {
           self.send_to_udp_socket(buffer, socket, &socket_address);
         }
       } else {
@@ -158,6 +167,72 @@ impl UDPSender {
       // We get those from Discovery.
       {
         trace!("send_to_locator: Unknown LocatorKind: {kind:?}");
+      }
+    }
+  }
+
+  /// The set of local interfaces on which this sender can emit multicast.
+  /// Used by route resolution to validate an observed interface is usable.
+  pub fn multicast_interfaces(&self) -> Vec<InterfaceSelector> {
+    self
+      .multicast_sockets
+      .iter()
+      .map(|(iface, _)| *iface)
+      .collect()
+  }
+
+  /// Send a multicast datagram out of a single, specific local interface.
+  ///
+  /// Falls back to sending on all multicast interfaces (like
+  /// [`Self::send_to_locator`]) if the requested interface is not one of ours,
+  /// so a stale/misresolved interface never silently drops traffic.
+  pub fn send_to_multicast_locator_via(
+    &self,
+    buffer: &[u8],
+    locator: &Locator,
+    interface: &InterfaceSelector,
+  ) {
+    if buffer.len() > 1500 {
+      warn!(
+        "send_to_multicast_locator_via: Message size = {}",
+        buffer.len()
+      );
+    }
+
+    let socket_address = match locator {
+      Locator::UdpV4(sa) => SocketAddr::from(*sa),
+      Locator::UdpV6(sa) => SocketAddr::from(*sa),
+      Locator::Invalid | Locator::Reserved => {
+        error!("send_to_multicast_locator_via: Cannot send to {locator:?}");
+        return;
+      }
+      Locator::Other { kind, .. } => {
+        trace!("send_to_multicast_locator_via: Unknown LocatorKind: {kind:?}");
+        return;
+      }
+    };
+
+    if !socket_address.ip().is_multicast() {
+      // Not a multicast destination; treat as a plain unicast send.
+      self.send_to_udp_socket(buffer, &self.unicast_socket, &socket_address);
+      return;
+    }
+
+    match self
+      .multicast_sockets
+      .iter()
+      .find(|(iface, _)| iface == interface)
+    {
+      Some((_, socket)) => self.send_to_udp_socket(buffer, socket, &socket_address),
+      None => {
+        // Requested interface unknown: preserve reachability by falling back to
+        // all interfaces.
+        trace!(
+          "send_to_multicast_locator_via: interface {interface:?} not found, sending on all"
+        );
+        for (_iface, socket) in &self.multicast_sockets {
+          self.send_to_udp_socket(buffer, socket, &socket_address);
+        }
       }
     }
   }
@@ -189,7 +264,7 @@ impl UDPSender {
     if address.is_multicast() {
       let address = SocketAddr::new(IpAddr::V4(address), port);
       let mut size = 0;
-      for s in self.multicast_sockets {
+      for (_iface, s) in self.multicast_sockets {
         size = s.send_to(buffer, address)?;
       }
       Ok(size)
