@@ -1,6 +1,6 @@
 [package]
 name = "rustdds"
-version = "0.12.0" 
+version = "0.13.0" 
 authors = ["Juhana Helovuo <juhana.helovuo@atostek.com>",
   "Oiva Moisio <oiva.moisio@atostek.com>",
   "Miska Melkinen <miska.melkinen@atostek.com>",
