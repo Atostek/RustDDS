@@ -45,11 +45,21 @@ import glob
 import html
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
 
 DEFAULT_DDS_RTPS_DIR = os.environ.get("DDS_RTPS_DIR", "/home/juhe/cursor/dds-rtps")
+
+# File the matrix runner writes into the results dir recording the exact dds-rtps
+# checkout used for the run. Read in preference to probing the (possibly moved)
+# working tree.
+SUITE_VERSION_FILE = "dds_rtps_version.txt"
+
+# File the matrix runner writes recording the test platform (`uname -srvmo`) of
+# the machine that ran the matrix. Read in preference to the local machine.
+PLATFORM_FILE = "platform.txt"
 
 # testcase name -> category token, e.g. rtps_test_suite_1_Test_DataRepresentation_1
 CATEGORY_RE = re.compile(r"Test_([A-Za-z0-9]+)_")
@@ -96,6 +106,60 @@ def find_latest_results_dir():
         reverse=True,
     )
     return candidates[0] if candidates else None
+
+
+def detect_suite_version(results_dir, override=None):
+    """Determine the dds-rtps test-suite version to report.
+
+    Order of preference:
+      1. an explicit ``--suite-version`` override;
+      2. a ``dds_rtps_version.txt`` recorded in the results dir by the matrix
+         runner (the exact checkout used for the run);
+      3. ``git describe`` of the current $DDS_RTPS_DIR checkout (best effort;
+         may differ from the run and is marked as such);
+      4. ``"unknown"``.
+    """
+    if override:
+        return override, "specified"
+
+    recorded = os.path.join(results_dir, SUITE_VERSION_FILE)
+    if os.path.isfile(recorded):
+        with open(recorded) as fh:
+            text = fh.read().strip()
+        if text:
+            return text, "recorded at run time"
+
+    try:
+        desc = subprocess.run(
+            ["git", "-C", DEFAULT_DDS_RTPS_DIR, "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        if desc:
+            return desc, "detected from current checkout"
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+    return "unknown", ""
+
+
+def detect_platform(results_dir):
+    """Identify the test platform via ``uname -srvmo``.
+
+    Prefers ``platform.txt`` recorded by the matrix runner (the machine that ran
+    the tests); otherwise falls back to running ``uname`` on the local machine.
+    """
+    recorded = os.path.join(results_dir, PLATFORM_FILE)
+    if os.path.isfile(recorded):
+        with open(recorded) as fh:
+            text = fh.read().strip()
+        if text:
+            return text
+    try:
+        return subprocess.run(
+            ["uname", "-srvmo"], capture_output=True, text=True, timeout=10, check=True
+        ).stdout.strip() or "unknown"
+    except (subprocess.SubprocessError, OSError):
+        return "unknown"
 
 
 def classify_failure(message):
@@ -235,13 +299,18 @@ def not_run_note(rc):
 
 # --------------------------- Markdown rendering ---------------------------
 
-def render_markdown(chosen_label, agg, peers, categories, not_run, results_dir):
+def render_markdown(chosen_label, agg, peers, categories, not_run, platform,
+                    suite_version, suite_version_source):
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ver = suite_version
+    if suite_version_source:
+        ver += f" ({suite_version_source})"
     lines = []
     lines.append(f"# Interoperability summary: {chosen_label}")
     lines.append("")
     lines.append(f"- Chosen implementation: **{chosen_label}**")
-    lines.append(f"- Source results: `{results_dir}`")
+    lines.append(f"- dds-rtps test suite version: **{ver}**")
+    lines.append(f"- Test platform: `{platform}`")
     lines.append(f"- Generated: {now}")
     lines.append("")
     lines.append(
@@ -250,6 +319,13 @@ def render_markdown(chosen_label, agg, peers, categories, not_run, results_dir):
         "unsupported (`PUB_/SUB_UNSUPPORTED_FEATURE`); *failed* is any other "
         "mismatch. Both test directions (chosen vendor as Publisher and as "
         "Subscriber) are summed per peer."
+    )
+    lines.append("")
+    lines.append(
+        "> The self row (chosen vendor vs itself) has about half as many test "
+        "cases as the other rows: reversing the publisher and subscriber roles "
+        "when both endpoints are the same implementation is redundant, so that "
+        "pairing is run in one direction only."
     )
     lines.append("")
 
@@ -313,10 +389,12 @@ tr.notrun td { color: #888; font-style: italic; }
 .unsup { color: #9a6700; }
 .fail { color: #cf222e; }
 .meta { color: #555; font-size: 0.9rem; }
+.note { color: #555; font-size: 0.9rem; border-left: 3px solid #bbb; padding-left: 0.75rem; }
 .legend { margin-top: 1rem; font-size: 0.9rem; }
 @media (prefers-color-scheme: dark) {
   th { background: #222; } tr.total td, td.total { background: #1c1c1c; }
-  th, td { border-color: #555; } .meta { color: #aaa; }
+  th, td { border-color: #555; } .meta, .note { color: #aaa; }
+  .note { border-left-color: #555; }
   .pass { color: #3fb950; } .unsup { color: #d29922; } .fail { color: #f85149; }
 }
 """
@@ -331,9 +409,13 @@ def html_cell(counter):
     )
 
 
-def render_html(chosen_label, agg, peers, categories, not_run, results_dir):
+def render_html(chosen_label, agg, peers, categories, not_run, platform,
+                suite_version, suite_version_source):
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     esc = html.escape
+    ver = suite_version
+    if suite_version_source:
+        ver += f" ({suite_version_source})"
     out = []
     out.append("<!DOCTYPE html>")
     out.append('<html lang="en"><head><meta charset="utf-8">')
@@ -343,7 +425,8 @@ def render_html(chosen_label, agg, peers, categories, not_run, results_dir):
     out.append(f"<h1>Interoperability summary: {esc(chosen_label)}</h1>")
     out.append('<div class="meta">')
     out.append(f"Chosen implementation: <strong>{esc(chosen_label)}</strong><br>")
-    out.append(f"Source results: <code>{esc(results_dir)}</code><br>")
+    out.append(f"dds-rtps test suite version: <strong>{esc(ver)}</strong><br>")
+    out.append(f"Test platform: <code>{esc(platform)}</code><br>")
     out.append(f"Generated: {esc(now)}")
     out.append("</div>")
     out.append(
@@ -352,6 +435,12 @@ def render_html(chosen_label, agg, peers, categories, not_run, results_dir):
         "feature as unsupported (<code>PUB_/SUB_UNSUPPORTED_FEATURE</code>); "
         "<em>failed</em> is any other mismatch. Both test directions (chosen "
         "vendor as Publisher and as Subscriber) are summed per peer.</p>"
+    )
+    out.append(
+        '<p class="note">The self row (chosen vendor vs itself) has about half '
+        "as many test cases as the other rows: reversing the publisher and "
+        "subscriber roles when both endpoints are the same implementation is "
+        "redundant, so that pairing is run in one direction only.</p>"
     )
 
     out.append("<table>")
@@ -430,6 +519,13 @@ def main(argv=None):
         default=None,
         help="output directory (default: the results directory).",
     )
+    parser.add_argument(
+        "--suite-version",
+        default=None,
+        help="dds-rtps test suite version to report (default: read from "
+        f"{SUITE_VERSION_FILE} in the results dir, else git-describe of "
+        "$DDS_RTPS_DIR).",
+    )
     args = parser.parse_args(argv)
 
     results_dir = args.results_dir or find_latest_results_dir()
@@ -457,6 +553,10 @@ def main(argv=None):
 
     categories = collect(reports, [])
     rc_by_vendor = load_summary_csv(results_dir)
+    suite_version, suite_version_source = detect_suite_version(
+        results_dir, args.suite_version
+    )
+    platform = detect_platform(results_dir)
 
     written = []
     for vendor in vendors:
@@ -478,8 +578,14 @@ def main(argv=None):
             if impl_of(vlabel) not in covered_impls:
                 not_run.append((vlabel, rc))
 
-        md = render_markdown(chosen_label, agg, peers, categories, not_run, results_dir)
-        htmldoc = render_html(chosen_label, agg, peers, categories, not_run, results_dir)
+        md = render_markdown(
+            chosen_label, agg, peers, categories, not_run, platform,
+            suite_version, suite_version_source,
+        )
+        htmldoc = render_html(
+            chosen_label, agg, peers, categories, not_run, platform,
+            suite_version, suite_version_source,
+        )
 
         base = os.path.join(out_dir, f"interop_summary_{chosen_label}")
         md_path = base + ".md"

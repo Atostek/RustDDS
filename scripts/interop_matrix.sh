@@ -72,7 +72,16 @@ SUMMARY="${OUTDIR}/SUMMARY.csv"
 mkdir -p "$LOGDIR"
 
 echo "pair,direction,vendor,return_code,completed,ok,error" > "$SUMMARY"
-echo "[$(date '+%F %T')] RustDDS interop matrix START (pair cap=${PAIR_TIMEOUT}s)" | tee -a "$MASTER"
+
+# Record the exact dds-rtps test-suite checkout used, so summaries can report it
+# even if the working tree later moves. Read by scripts/interop_summary.py.
+SUITE_VERSION=$(git -C "$DDS_RTPS_DIR" describe --tags --always --dirty 2>/dev/null)
+echo "${SUITE_VERSION:-unknown}" > "${OUTDIR}/dds_rtps_version.txt"
+
+# Record the test platform so summaries identify where the matrix ran.
+uname -srvmo > "${OUTDIR}/platform.txt" 2>/dev/null || echo unknown > "${OUTDIR}/platform.txt"
+
+echo "[$(date '+%F %T')] RustDDS interop matrix START (pair cap=${PAIR_TIMEOUT}s, dds-rtps ${SUITE_VERSION:-unknown})" | tee -a "$MASTER"
 
 cleanup() {
   pkill -9 -f 'interoperability_report.py' 2>/dev/null
