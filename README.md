@@ -146,6 +146,10 @@ The DDS specification specifies manual memory management in the sense that many 
 * Smarter transmit route selection in case of multi-homed hosts
 * Non-blocking transmit and publisher backpressure implemented
 
+### Version 0.13.1
+* Interoperability improvements
+* Add missing NACK_FRAG handling
+
 ## Version 0.12.0
 * Upgrade to `cdr-encoding`  v 0.11, which has an breaking API change from the previous version. This adds support for borrowing (zero-copy) deserialization.
 
