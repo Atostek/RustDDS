@@ -455,10 +455,23 @@ impl QosPolicies {
     }
 
     // check Ownership: offered kind == requested kind. Default: SHARED.
+    // Only the KIND (SHARED vs EXCLUSIVE) affects compatibility. OWNERSHIP_STRENGTH
+    // is a writer-only policy (DDS spec v1.4 §2.2.3.10) that selects which writer's
+    // sample is delivered for EXCLUSIVE ownership; it must NOT be compared for
+    // matching, otherwise two EXCLUSIVE endpoints with differing strengths would
+    // be wrongly reported INCOMPATIBLE_QOS.
     {
       let off = self.ownership.unwrap_or(policy::Ownership::Shared);
       let req = other.ownership.unwrap_or(policy::Ownership::Shared);
-      if off != req {
+      let same_kind = matches!(
+        (off, req),
+        (policy::Ownership::Shared, policy::Ownership::Shared)
+          | (
+            policy::Ownership::Exclusive { .. },
+            policy::Ownership::Exclusive { .. }
+          )
+      );
+      if !same_kind {
         return Some(QosPolicyId::Ownership);
       }
     }
@@ -888,6 +901,26 @@ pub mod policy {
   }
 
   /// DDS 2.2.3.9 OWNERSHIP
+  ///
+  /// # Support status / known limitation
+  ///
+  /// RustDDS uses OWNERSHIP only for **matching**: a `Shared` endpoint and an
+  /// `Exclusive` endpoint are incompatible (`INCOMPATIBLE_QOS`), while the
+  /// `strength` value does *not* affect matching (it is a writer-only policy,
+  /// DDS spec v1.4 §2.2.3.10).
+  ///
+  /// RustDDS does **not** implement EXCLUSIVE-ownership *delivery filtering*.
+  /// When several EXCLUSIVE writers publish to the **same instance**, a correct
+  /// implementation would deliver only the samples of the highest-strength
+  /// live writer (with owner hand-off on liveliness loss / unregister). RustDDS
+  /// instead delivers samples from all matched writers. Consequently a reader
+  /// sees data from every EXCLUSIVE writer regardless of `strength`.
+  ///
+  /// This surfaces in the dds-rtps interoperability suite as the single failing
+  /// ownership case `Test_Ownership_3` (two same-instance EXCLUSIVE writers,
+  /// expected `RECEIVING_FROM_ONE`, RustDDS yields `RECEIVING_FROM_BOTH`). All
+  /// other ownership cases pass. Implementing per-instance owner tracking would
+  /// remove this limitation.
   #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
   pub enum Ownership {
     Shared,

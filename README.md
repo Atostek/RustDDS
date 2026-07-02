@@ -38,7 +38,7 @@ The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talki
 * Topic finding ✅
 * Partition QoS
 * Time-based filter QoS
-* Ownership QoS
+* Ownership QoS: SHARED/EXCLUSIVE matching ✅ (EXCLUSIVE per-instance delivery filtering by strength not implemented)
 * Presentation QoS: Coherent/atomic sample sets and ordering
 * Deadline and Latency budget QoS
 * Sample fragmentation (large object exchange) ✅
@@ -47,6 +47,8 @@ The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talki
 * Listener (or equivalent) for Topics
 * Alternative API using Rust `async` tasks ✅
 * Shared-memory transport for local connections
+
+If you would like to have more features in RustDDS, then please contact sales at Atostek Oy, or submit a pull request.
 
 ## Interoperability
 
