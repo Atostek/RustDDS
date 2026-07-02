@@ -62,7 +62,7 @@ pub enum QosPolicyId {
   Lifespan,
   // DurabilityService, // 22
   Representation, // 23 (DDS-XTypes v1.3 DATA_REPRESENTATION)
-  Property, // No Id in the security spec (But this is from older DDS/RTPs spec.)
+  Property,       // No Id in the security spec (But this is from older DDS/RTPs spec.)
 }
 
 /// Utility for building [QosPolicies]
@@ -321,11 +321,14 @@ impl QosPolicies {
   /// Set the DATA_REPRESENTATION QoS policy (DDS-XTypes v1.3 Section 7.6.3.1).
   ///
   /// For a DataWriter the first list element is the representation it uses; for
-  /// a DataReader the list is the set of representations it accepts. This is not
-  /// part of [`QosPolicyBuilder`] because it holds a `Vec` (incompatible with the
-  /// `const` builder used for built-in QoS).
+  /// a DataReader the list is the set of representations it accepts. This is
+  /// not part of [`QosPolicyBuilder`] because it holds a `Vec` (incompatible
+  /// with the `const` builder used for built-in QoS).
   #[must_use]
-  pub fn with_data_representation(mut self, data_representation: policy::DataRepresentation) -> Self {
+  pub fn with_data_representation(
+    mut self,
+    data_representation: policy::DataRepresentation,
+  ) -> Self {
     self.data_representation = Some(data_representation);
     self
   }
@@ -917,15 +920,16 @@ pub mod policy {
 
   impl DataRepresentation {
     /// The single representation a DataWriter with this (optional) policy uses:
-    /// the first list element, or XCDR1 when absent/empty (DDS-XTypes 7.6.3.1.1).
+    /// the first list element, or XCDR1 when absent/empty (DDS-XTypes
+    /// 7.6.3.1.1).
     pub fn offered_representation(maybe: Option<&DataRepresentation>) -> DataRepresentationId {
       maybe
         .and_then(|dr| dr.value.first().copied())
         .unwrap_or(XCDR_DATA_REPRESENTATION)
     }
 
-    /// The representations a DataReader with this (optional) policy accepts: the
-    /// list, or `[XCDR1]` when absent/empty (DDS-XTypes 7.6.3.1.1).
+    /// The representations a DataReader with this (optional) policy accepts:
+    /// the list, or `[XCDR1]` when absent/empty (DDS-XTypes 7.6.3.1.1).
     pub fn accepted_representations(
       maybe: Option<&DataRepresentation>,
     ) -> Vec<DataRepresentationId> {

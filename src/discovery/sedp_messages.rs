@@ -15,7 +15,8 @@ use crate::{
     qos::{
       policy::{
         DataRepresentation, Deadline, DestinationOrder, Durability, History, LatencyBudget,
-        Lifespan, Liveliness, Ownership, Presentation, Reliability, ResourceLimits, TimeBasedFilter,
+        Lifespan, Liveliness, Ownership, Presentation, Reliability, ResourceLimits,
+        TimeBasedFilter,
       },
       HasQoSPolicy, QosPolicies,
     },
