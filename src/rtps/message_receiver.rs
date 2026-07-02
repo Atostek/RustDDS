@@ -875,8 +875,21 @@ impl MessageReceiver {
         }
       }
 
-      ReaderSubmessage::NackFrag(_, _) => {
-        // TODO: Implement NackFrag handling
+      ReaderSubmessage::NackFrag(nackfrag, _) => {
+        // Forward the fragment retransmission request to the target writer, the
+        // same way AckNack is forwarded. The writer handles it via
+        // `AckSubmessage::NackFrag` (scheduling repair-fragment sends). Must not
+        // block: the receiving end is on this same thread.
+        match self
+          .acknack_sender
+          .try_send((self.source_guid_prefix, AckSubmessage::NackFrag(nackfrag)))
+        {
+          Ok(_) => (),
+          Err(TrySendError::Full(_)) => {
+            info!("NackFrag pipe full. Looks like I am very busy. Discarding submessage.");
+          }
+          Err(e) => warn!("NackFrag pipe fail: {e:?}"),
+        }
       }
     }
   }

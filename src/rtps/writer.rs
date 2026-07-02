@@ -931,7 +931,6 @@ impl Writer {
       } // AckNack
       AckSubmessage::NackFrag(ref nackfrag) => {
         // NackFrag is negative acknowledgement only, i.e. requesting missing fragments.
-
         let reader_guid = GUID::new(reader_guid_prefix, nackfrag.reader_id);
         if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
           reader_proxy.mark_frags_requested(nackfrag.writer_sn, &nackfrag.fragment_number_state);

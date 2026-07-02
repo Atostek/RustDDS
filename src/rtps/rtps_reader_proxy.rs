@@ -402,22 +402,17 @@ impl RtpsReaderProxy {
       .entry(seq_num)
       .or_insert_with(|| BitVec::with_capacity(64)); // default capacity out of hat
 
-    if let Some(max_fn_requested) = req_set.iter().next_back() {
-      // allocate more space if needed
-      let max_fn_requested = usize::from(max_fn_requested);
-      if max_fn_requested > req_set.len() {
-        let growth_need = max_fn_requested - req_set.len();
-        req_set.grow(growth_need, false);
+    for f in frag_nums.iter() {
+      // -1 because FragmentNumbers start at 1
+      let idx = usize::from(f) - 1;
+      // The bit vector must be long enough to address `idx`. Grow it (filling
+      // with `false`) whenever a requested fragment number exceeds the current
+      // length, otherwise `set()` would be out of bounds. Note that a freshly
+      // inserted `BitVec` has length 0 regardless of its capacity.
+      if idx >= req_set.len() {
+        req_set.grow(idx + 1 - req_set.len(), false);
       }
-      for f in frag_nums.iter() {
-        // -1 because FragmentNumbers start at 1
-        req_set.set(usize::from(f) - 1, true);
-      }
-    } else {
-      warn!(
-        "mark_frags_requested: Empty set in NackFrag??? reader={:?} SN={:?}",
-        self.remote_reader_guid, seq_num
-      );
+      req_set.set(idx, true);
     }
   }
 
