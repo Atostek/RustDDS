@@ -14,8 +14,8 @@ use crate::{
     participant::DomainParticipant,
     qos::{
       policy::{
-        Deadline, DestinationOrder, Durability, History, LatencyBudget, Lifespan, Liveliness,
-        Ownership, Presentation, Reliability, ResourceLimits, TimeBasedFilter,
+        DataRepresentation, Deadline, DestinationOrder, Durability, History, LatencyBudget,
+        Lifespan, Liveliness, Ownership, Presentation, Reliability, ResourceLimits, TimeBasedFilter,
       },
       HasQoSPolicy, QosPolicies,
     },
@@ -170,6 +170,7 @@ pub struct SubscriptionBuiltinTopicData {
   // pub group_data: Option<GroupData>,
   // pub durability_service: Option<DurabilityService>,
   lifespan: Option<Lifespan>,
+  data_representation: Option<DataRepresentation>,
 
   // From spec Remote Procedure Call over DDS:
   service_instance_name: Option<String>,
@@ -209,6 +210,7 @@ impl SubscriptionBuiltinTopicData {
       time_based_filter: None,
       presentation: None,
       lifespan: None,
+      data_representation: None,
       // DDS-RPC
       // TODO: these are not implemented
       service_instance_name: None,  // Note: Not implemented
@@ -256,6 +258,7 @@ impl SubscriptionBuiltinTopicData {
     self.time_based_filter = qos.time_based_filter;
     self.presentation = qos.presentation;
     self.lifespan = qos.lifespan;
+    self.data_representation = qos.data_representation.clone();
     // history does not exist
     // resource_limits does not exist
   }
@@ -274,6 +277,7 @@ impl SubscriptionBuiltinTopicData {
       history: None, // SubscriptionBuiltinTopicData does not contain History QoS
       resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
       lifespan: self.lifespan,
+      data_representation: self.data_representation.clone(),
 
       #[cfg(feature = "security")]
       property: None, // TODO: no property QoS?
@@ -475,6 +479,7 @@ impl ParameterListable for DiscoveredReaderData {
           time_based_filter: _,
           presentation: _,
           lifespan: _,
+          data_representation: _,
 
           service_instance_name,
           related_datawriter_key,
@@ -630,6 +635,7 @@ pub struct PublicationBuiltinTopicData {
   pub ownership: Option<Ownership>,
   pub destination_order: Option<DestinationOrder>,
   pub presentation: Option<Presentation>,
+  pub data_representation: Option<DataRepresentation>,
 
   // From Remote Procedure Call over DDS:
   pub service_instance_name: Option<String>,
@@ -668,6 +674,7 @@ impl PublicationBuiltinTopicData {
       ownership: None,
       destination_order: None,
       presentation: None,
+      data_representation: None,
 
       service_instance_name: None,  // TODO: These are not supported/used
       related_datareader_key: None, // TODO
@@ -702,6 +709,7 @@ impl PublicationBuiltinTopicData {
     self.ownership = qos.ownership;
     self.destination_order = qos.destination_order;
     self.presentation = qos.presentation;
+    self.data_representation = qos.data_representation.clone();
   }
 
   pub fn qos(&self) -> QosPolicies {
@@ -718,6 +726,7 @@ impl PublicationBuiltinTopicData {
       history: None,         // PublicationBuiltinTopicData does not contain History QoS
       resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
       lifespan: self.lifespan,
+      data_representation: self.data_representation.clone(),
       #[cfg(feature = "security")]
       property: None, // TODO: no property Qos?
     }
@@ -930,6 +939,7 @@ impl ParameterListable for DiscoveredWriterData {
           time_based_filter: _,
           presentation: _,
           lifespan: _,
+          data_representation: _,
 
           service_instance_name,
           related_datareader_key,
@@ -1077,6 +1087,7 @@ impl HasQoSPolicy for TopicBuiltinTopicData {
       history: self.history,
       resource_limits: self.resource_limits,
       lifespan: self.lifespan,
+      data_representation: None, // Topic-level DATA_REPRESENTATION not tracked
       #[cfg(feature = "security")]
       property: None, // TODO: no property Qos?
     }

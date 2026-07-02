@@ -61,6 +61,7 @@ pub enum QosPolicyId {
   // TransportPriority, // 20
   Lifespan,
   // DurabilityService, // 22
+  Representation, // 23 (DDS-XTypes v1.3 DATA_REPRESENTATION)
   Property, // No Id in the security spec (But this is from older DDS/RTPs spec.)
 }
 
@@ -205,6 +206,10 @@ impl QosPolicyBuilder {
       history: self.history,
       resource_limits: self.resource_limits,
       lifespan: self.lifespan,
+      // DATA_REPRESENTATION is not part of the (const) builder: it holds a `Vec`
+      // (drop glue) which is incompatible with `const fn`, and the built-in QoS
+      // policies never need it. Set it via `QosPolicies::with_data_representation`.
+      data_representation: None,
       #[cfg(feature = "security")]
       property: None,
     }
@@ -229,6 +234,7 @@ pub struct QosPolicies {
   pub(crate) history: Option<policy::History>,
   pub(crate) resource_limits: Option<policy::ResourceLimits>,
   pub(crate) lifespan: Option<policy::Lifespan>,
+  pub(crate) data_representation: Option<policy::DataRepresentation>,
   #[cfg(feature = "security")]
   pub(crate) property: Option<policy::Property>,
 }
@@ -308,6 +314,22 @@ impl QosPolicies {
     self.lifespan
   }
 
+  pub fn data_representation(&self) -> Option<policy::DataRepresentation> {
+    self.data_representation.clone()
+  }
+
+  /// Set the DATA_REPRESENTATION QoS policy (DDS-XTypes v1.3 Section 7.6.3.1).
+  ///
+  /// For a DataWriter the first list element is the representation it uses; for
+  /// a DataReader the list is the set of representations it accepts. This is not
+  /// part of [`QosPolicyBuilder`] because it holds a `Vec` (incompatible with the
+  /// `const` builder used for built-in QoS).
+  #[must_use]
+  pub fn with_data_representation(mut self, data_representation: policy::DataRepresentation) -> Self {
+    self.data_representation = Some(data_representation);
+    self
+  }
+
   #[cfg(feature = "security")]
   pub fn property(&self) -> Option<policy::Property> {
     self.property.clone()
@@ -333,6 +355,10 @@ impl QosPolicies {
       history: other.history.or(self.history),
       resource_limits: other.resource_limits.or(self.resource_limits),
       lifespan: other.lifespan.or(self.lifespan),
+      data_representation: other
+        .data_representation
+        .clone()
+        .or(self.data_representation.clone()),
       #[cfg(feature = "security")]
       property: other.property.clone().or(self.property.clone()),
     }
@@ -483,6 +509,21 @@ impl QosPolicies {
       }
     }
 
+    // check Data Representation (DDS-XTypes v1.3 Section 7.6.3.1.1):
+    // the writer (offered = self) uses a single representation (first element of
+    // its list, or XCDR1 if absent/empty); it is compatible with the reader
+    // (requested = other) only if that representation is contained in the
+    // reader's accepted list (or [XCDR1] if the reader's is absent/empty).
+    {
+      let offered =
+        policy::DataRepresentation::offered_representation(self.data_representation.as_ref());
+      let requested =
+        policy::DataRepresentation::accepted_representations(other.data_representation.as_ref());
+      if !requested.contains(&offered) {
+        return Some(QosPolicyId::Representation);
+      }
+    }
+
     // default value. no incompatibility detected.
     None
   }
@@ -508,6 +549,7 @@ impl QosPolicies {
       history,
       resource_limits,
       lifespan,
+      data_representation,
       #[cfg(feature = "security")]
         property: _, // TODO: properties to parameter list?
     } = self;
@@ -589,6 +631,11 @@ impl QosPolicies {
     }
     emit_option!(PID_RESOURCE_LIMITS, resource_limits, policy::ResourceLimits);
     emit_option!(PID_LIFESPAN, lifespan, policy::Lifespan);
+    emit_option!(
+      PID_DATA_REPRESENTATION,
+      data_representation,
+      policy::DataRepresentation
+    );
 
     Ok(pl)
   }
@@ -653,6 +700,8 @@ impl QosPolicies {
 
     let resource_limits: Option<policy::ResourceLimits> = get_option!(PID_RESOURCE_LIMITS);
     let lifespan: Option<policy::Lifespan> = get_option!(PID_LIFESPAN);
+    let data_representation: Option<policy::DataRepresentation> =
+      get_option!(PID_DATA_REPRESENTATION);
 
     #[cfg(feature = "security")]
     let property: Option<policy::Property> = None; // TODO: Should also properties be read?
@@ -672,6 +721,7 @@ impl QosPolicies {
       history,
       resource_limits,
       lifespan,
+      data_representation,
       #[cfg(feature = "security")]
       property,
     })
@@ -839,6 +889,51 @@ pub mod policy {
   pub enum Ownership {
     Shared,
     Exclusive { strength: i32 }, // This also implements OwnershipStrength
+  }
+
+  /// Identifier of a data representation, per DDS-XTypes v1.3 Section 7.6.3.1.
+  pub type DataRepresentationId = i16;
+
+  /// Extensible CDR encoding version 1 (the DDS default).
+  pub const XCDR_DATA_REPRESENTATION: DataRepresentationId = 0;
+  /// XML data representation (not supported by RustDDS).
+  pub const XML_DATA_REPRESENTATION: DataRepresentationId = 1;
+  /// Extensible CDR encoding version 2 (not supported by RustDDS).
+  pub const XCDR2_DATA_REPRESENTATION: DataRepresentationId = 2;
+
+  /// DDS-XTypes v1.3 Section 7.6.3.1 DATA_REPRESENTATION QoS policy.
+  ///
+  /// A DataWriter offers a single data representation (the first element of the
+  /// list, or XCDR1 if the list is empty). A DataReader requests one or more
+  /// accepted representations. The policies are compatible when the writer's
+  /// offered representation is contained in the reader's requested list.
+  ///
+  /// On the wire this is `PID_DATA_REPRESENTATION` (0x0073), a CDR
+  /// `sequence<int16>`.
+  #[derive(Clone, Debug, PartialEq, Eq, Hash, Readable, Writable, Serialize, Deserialize)]
+  pub struct DataRepresentation {
+    pub value: Vec<DataRepresentationId>,
+  }
+
+  impl DataRepresentation {
+    /// The single representation a DataWriter with this (optional) policy uses:
+    /// the first list element, or XCDR1 when absent/empty (DDS-XTypes 7.6.3.1.1).
+    pub fn offered_representation(maybe: Option<&DataRepresentation>) -> DataRepresentationId {
+      maybe
+        .and_then(|dr| dr.value.first().copied())
+        .unwrap_or(XCDR_DATA_REPRESENTATION)
+    }
+
+    /// The representations a DataReader with this (optional) policy accepts: the
+    /// list, or `[XCDR1]` when absent/empty (DDS-XTypes 7.6.3.1.1).
+    pub fn accepted_representations(
+      maybe: Option<&DataRepresentation>,
+    ) -> Vec<DataRepresentationId> {
+      match maybe {
+        Some(dr) if !dr.value.is_empty() => dr.value.clone(),
+        _ => vec![XCDR_DATA_REPRESENTATION],
+      }
+    }
   }
 
   /// DDS 2.2.3.11 LIVELINESS
