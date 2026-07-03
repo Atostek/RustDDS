@@ -57,7 +57,7 @@ if [ -z "${MATRIX_DETACHED:-}" ] && [ -z "${MATRIX_NO_DETACH:-}" ]; then
   exit 0
 fi
 
-DDS_RTPS_DIR="${DDS_RTPS_DIR:-/home/juhe/cursor/dds-rtps}"
+DDS_RTPS_DIR="${DDS_RTPS_DIR:-../dds-rtps}"
 RUST="${RUST_EXE:-executables/rustdds-0.12.0_shape_main_linux}"
 PAIR_TIMEOUT="${PAIR_TIMEOUT:-2400}"   # 40 min hard cap per pair
 

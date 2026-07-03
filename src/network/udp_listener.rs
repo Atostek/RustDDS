@@ -324,6 +324,18 @@ impl UDPListener {
       };
       // Something was received.
 
+      // The buffer length is still MAX_MESSAGE_SIZE, set before the receive so
+      // the kernel had room to write into. Shrink it back to the number of bytes
+      // actually received, so that the padding + split below only consume this
+      // datagram's worth of the chunk. Without this, every datagram (however
+      // small) would carve off a full MAX_MESSAGE_SIZE slot, wasting the chunk
+      // and defeating the packing this alignment logic assumes.
+      unsafe {
+        // Safe: recv_one wrote `nbytes` valid bytes at the front of the buffer,
+        // and nbytes <= MAX_MESSAGE_SIZE == the current len.
+        self.receive_buffer.set_len(nbytes);
+      }
+
       // Now, append some extra data to align the buffer end, so the next piece will
       // be aligned also. This assumes that the initial buffer was aligned to begin
       // with. This is because RTPS data is optimized to align to 4-byte boundaries.
