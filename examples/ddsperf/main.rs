@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use log::error;
 use rustdds::{
+  dds::result::WriteError,
   policy::History,
   policy::Reliability,
   with_key::Sample,
@@ -270,6 +271,7 @@ fn main() {
         let mut rtt_max = rustdds::Duration::from_secs(0);
         let mut last_pong_seq = 0;
         let mut lost_seq_count = 0_u32;
+        let mut ping_dropped = 0_u32;
 
         println!("Waiting for messages.");
         loop {
@@ -283,14 +285,16 @@ fn main() {
                 } else {
                   Duration::from_secs(0)
                 };
-              println!("{} samples {} lost {} bytes  RTT avg {}, max {}",
-                  format_count(sample_count as u64), format_count(lost_seq_count as u64), format_count(byte_count),
+              println!("{} samples {} lost {} dropped {} bytes  RTT avg {}, max {}",
+                  format_count(sample_count as u64), format_count(lost_seq_count as u64),
+                  format_count(ping_dropped as u64), format_count(byte_count),
                   format_duration(rtt_avg) , format_duration(rtt_max.to_std()));
               sample_count = 0;
               byte_count = 0;
               rtt_total = rustdds::Duration::from_secs(0);
               rtt_max = rustdds::Duration::from_secs(0);
               lost_seq_count = 0;
+              ping_dropped = 0;
               print_and_reset_cpu_usage();
             }
 
@@ -306,8 +310,14 @@ fn main() {
               };
               ping_seq += 1;
               let ts = Timestamp::now();
-              data_writer.async_write(keyed_seq_msg, Some(ts))
-                .await.unwrap();
+              match data_writer.async_write(keyed_seq_msg, Some(ts)).await {
+                Ok(()) => {}
+                // Reliable send window is full and did not drain within
+                // max_blocking_time. Drop this ping and keep going instead of
+                // crashing; count it so over-driving is visible in the stats.
+                Err(WriteError::WouldBlock { .. }) => ping_dropped += 1,
+                Err(e) => error!("ping write failed: {e:?}"),
+              }
             }
 
             // handle pong
@@ -407,9 +417,12 @@ fn main() {
                     byte_count += (8 + 4 + keyed_seq_msg.baggage.len()) as u64;
                     match s.sample_info().source_timestamp() {
                       Some(ts) => {
-                        data_writer.async_write(keyed_seq_msg.clone(), Some(ts))
-                          .await
-                          .unwrap();
+                        match data_writer.async_write(keyed_seq_msg.clone(), Some(ts)).await {
+                          Ok(()) => {}
+                          // Under backpressure, drop the echo rather than crash.
+                          Err(WriteError::WouldBlock { .. }) => {}
+                          Err(e) => error!("pong write failed: {e:?}"),
+                        }
                       }
                       None => println!("Ping without source timestamp!"),
                     }
