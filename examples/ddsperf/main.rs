@@ -1,7 +1,7 @@
 //! Performance test program inspired by `ddsperf` in CycloneDDS
 
 use std::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
 use log::error;
@@ -230,6 +230,11 @@ fn main() {
             .async_write(new_message, None)
             .unwrap_or_else(|e| error!("DataWriter async_write failed: {e:?}"))
             .await;
+          // Periodic (~1 s) CPU/RSS report so the publisher side is also
+          // observable for leaks (send-buffer growth, etc.).
+          if rate > 0 && seq % rate == 0 {
+            print_and_reset_cpu_usage();
+          }
           // wait for 1 sec for transfer to complete before exiting.
           let interval = 1_000_000_000 / rate;
           Timer::after(Duration::from_nanos(interval.into())).await;
@@ -518,7 +523,62 @@ fn cpu_usage_printer_closure() -> impl FnMut() {
   }
 }
 
-#[cfg(not(target_os = "linux"))]
+// macOS has no procfs. Use libproc's proc_pidinfo(PROC_PIDTASKINFO) to read the
+// current resident set size (pti_resident_size, in bytes) and the accumulated
+// user/system CPU time (pti_total_user/system, in nanoseconds). 
+//
+// This is functionally equivalent to the Linux version above (user %, sys %,
+// current RSS), but it is NOT a portable replacement for it: it relies on
+// libc::proc_pidinfo / PROC_PIDTASKINFO / proc_taskinfo, which the `libc` crate
+// only exposes on Apple targets. 
+#[cfg(target_os = "macos")]
+fn cpu_usage_printer_closure() -> impl FnMut() {
+  fn task_info() -> Option<libc::proc_taskinfo> {
+    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let n = unsafe {
+      libc::proc_pidinfo(
+        libc::getpid(),
+        libc::PROC_PIDTASKINFO,
+        0,
+        (&mut ti as *mut libc::proc_taskinfo).cast::<libc::c_void>(),
+        size,
+      )
+    };
+    (n == size).then_some(ti)
+  }
+
+  let mut prev = task_info();
+  let mut last_instant = Instant::now();
+
+  move || {
+    let now = task_info();
+    let now_instant = Instant::now();
+    let call_interval = now_instant.duration_since(last_instant).as_secs_f32();
+    last_instant = now_instant;
+
+    match (prev, now) {
+      (Some(p), Some(c)) if call_interval > 0.0 => {
+        // pti_total_* are in nanoseconds.
+        let user_secs = (c.pti_total_user.saturating_sub(p.pti_total_user)) as f32 / 1e9;
+        let sys_secs = (c.pti_total_system.saturating_sub(p.pti_total_system)) as f32 / 1e9;
+        println!(
+          "user {:2.0}% sys {:2.0}% RSS {}B",
+          100.0 * user_secs / call_interval,
+          100.0 * sys_secs / call_interval,
+          format_count(c.pti_resident_size)
+        );
+      }
+      (_, Some(c)) => {
+        println!("user  ?% sys  ?% RSS {}B", format_count(c.pti_resident_size));
+      }
+      _ => println!("(cpu/rss unavailable)"),
+    }
+    prev = now;
+  }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cpu_usage_printer_closure() -> impl FnMut() {
   || {
     // no-op

@@ -106,7 +106,7 @@ fi
   echo "lat_duration=$LAT_DURATION"
 } > "${OUTDIR}/run_info.txt"
 
-echo "scenario,type,reliability,rate_hz,payload_bytes,duration_s,samples,samples_per_s,approx_mbytes_per_s,rtt_avg_us,rtt_max_us" > "$SUMMARY"
+echo "scenario,type,reliability,rate_hz,payload_bytes,duration_s,samples,samples_per_s,approx_mbytes_per_s,rtt_avg_us,rtt_max_us,sub_rss_start_mb,sub_rss_end_mb,sub_rss_max_mb,pub_rss_end_mb" > "$SUMMARY"
 
 cleanup_procs
 
@@ -146,7 +146,7 @@ run_throughput() {
   mbps="$(awk -v r="$rate" -v p="$payload" -v b="$SHAPE_BASE" 'BEGIN{printf "%.2f", r*(p+b)/1000000.0}')"
 
   echo "             -> ${samples} samples, ${rate}/s, ~${mbps} MB/s"
-  echo "${name},throughput,${rel_txt},NA,${payload},${DURATION},${samples},${rate},${mbps},NA,NA" >> "$SUMMARY"
+  echo "${name},throughput,${rel_txt},NA,${payload},${DURATION},${samples},${rate},${mbps},NA,NA,NA,NA,NA,NA" >> "$SUMMARY"
   cleanup_procs
 }
 
@@ -199,8 +199,71 @@ run_latency() {
   samp_per_s="$(awk '/RTT avg/ {seen++; if(seen>2){sum+=$1;cnt++}} END{if(cnt>0)printf "%.0f", sum/cnt; else printf "0"}' "$ping_log")"
 
   echo "             -> RTT avg ${rtt_avg} us, max ${rtt_max} us, ${samp_per_s} samples/s"
-  echo "${name},latency,${rel_txt},${rate},${payload},${LAT_DURATION},NA,${samp_per_s},NA,${rtt_avg},${rtt_max}" >> "$SUMMARY"
+  echo "${name},latency,${rel_txt},${rate},${payload},${LAT_DURATION},NA,${samp_per_s},NA,${rtt_avg},${rtt_max},NA,NA,NA,NA" >> "$SUMMARY"
   cleanup_procs
+}
+
+# --- Large-object best-effort throughput + RAM-leak watch via ddsperf --------
+# Sends large (multi-fragment) objects best-effort and records the subscriber's
+# resident-set size (RSS) over the whole run. A healthy run shows RSS plateauing;
+# a steadily climbing RSS points to a leak (e.g. receive buffers / reassembly
+# holding on to memory). ddsperf's per-second report carries the RSS on both
+# ends (macOS + Linux).
+#
+# args: name rate_hz size_bytes
+# echoes "OK <samp_per_s>" and appends a SUMMARY row on success, or "FAIL ..."
+# with near-zero throughput so the caller can fall back to a smaller object.
+BIG_DURATION="${BIG_DURATION:-30}"
+
+# Parse the RSS values (in MB) from a ddsperf log's "... RSS <n>[kMG]B" lines.
+rss_series_mb() {
+  sed -nE 's/.*RSS[[:space:]]*([0-9.]+)([kMG]?)B.*/\1 \2/p' "$1" | awk '
+    { v=$1; u=$2;
+      if(u=="k") v=v/1000.0; else if(u=="G") v=v*1000.0; else if(u=="") v=v/1000000.0;
+      printf "%.2f\n", v }'
+}
+
+run_bigobj_leak() {
+  local name="$1" rate="$2" size="$3"
+  local sub_log="${LOGDIR}/big_${name}_sub.log"
+  local pub_log="${LOGDIR}/big_${name}_pub.log"
+
+  echo "[bigobj]     ${name}: best_effort, rate=${rate}Hz, size=${size}B, ${BIG_DURATION}s"
+
+  "$DDSPERF" -u sub > "$sub_log" 2>&1 &
+  local sub=$!
+  sleep 1
+  "$DDSPERF" -u pub "$rate" size "$size" > "$pub_log" 2>&1 &
+  local pub=$!
+
+  sleep "$BIG_DURATION"
+  kill "$pub" "$sub" 2>/dev/null
+  wait "$pub" 2>/dev/null
+  wait "$sub" 2>/dev/null
+
+  # Steady-state received samples/s (skip first two warm-up ticks).
+  local samp_per_s
+  samp_per_s="$(awk '/samples .* bytes/ {seen++; if(seen>2){sum+=$1;cnt++}}
+                     END{if(cnt>0)printf "%.1f", sum/cnt; else printf "0"}' "$sub_log")"
+
+  # RSS trajectory (MB) for the subscriber, plus the publisher's final RSS.
+  local sub_series sub_start sub_end sub_max pub_end
+  sub_series="$(rss_series_mb "$sub_log")"
+  sub_start="$(echo "$sub_series" | head -n1)"; sub_start="${sub_start:-NA}"
+  sub_end="$(echo "$sub_series"   | tail -n1)"; sub_end="${sub_end:-NA}"
+  sub_max="$(echo "$sub_series"   | sort -n | tail -n1)"; sub_max="${sub_max:-NA}"
+  pub_end="$(rss_series_mb "$pub_log" | tail -n1)"; pub_end="${pub_end:-NA}"
+
+  local growth
+  growth="$(awk -v a="$sub_start" -v b="$sub_end" 'BEGIN{
+      if(a=="NA"||b=="NA") print "NA"; else printf "%.1f", b-a}')"
+
+  echo "             -> ${samp_per_s} samples/s; sub RSS ${sub_start}->${sub_end} MB (max ${sub_max}, growth ${growth}), pub RSS end ${pub_end} MB"
+
+  echo "${name},bigobj,best_effort,${rate},${size},${BIG_DURATION},NA,${samp_per_s},NA,NA,NA,${sub_start},${sub_end},${sub_max},${pub_end}" >> "$SUMMARY"
+
+  # "worked" = received at least half the offered rate.
+  awk -v s="$samp_per_s" -v r="$rate" 'BEGIN{exit !(s >= r*0.5)}'
 }
 
 # ---------------------------------------------------------------------------
@@ -222,6 +285,16 @@ run_throughput "rel_large_frag" 1 5    70000    # reliable, > 64 KiB -> fragment
 run_latency "be_100hz"   0 100 64
 run_latency "be_200hz"   0 200 256
 run_latency "rel_100hz"  1 100 64
+
+# Large-object best-effort + RAM-leak watch. Try 2 MB @ 5 Hz; if it can't sustain
+# roughly half the offered rate, fall back to 1 MB @ 4 Hz.
+if run_bigobj_leak "be_2mb_5hz" 5 2000000; then
+  echo "             (2 MB @ 5 Hz sustained; skipping 1 MB fallback)"
+else
+  echo "             (2 MB @ 5 Hz did NOT sustain; falling back to 1 MB @ 4 Hz)"
+  run_bigobj_leak "be_1mb_4hz" 4 1000000 || true
+fi
+cleanup_procs
 
 echo
 echo "===== SUMMARY (${OUTDIR}/SUMMARY.csv) ====="

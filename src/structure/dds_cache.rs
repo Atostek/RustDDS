@@ -229,9 +229,21 @@ impl TopicCache {
     // Some heuristic to decide if we should collect now.
     // let payload_size = max(1, cache_change.data_value.payload_size());
     let semi_random_number = i64::from(cache_change.sequence_number) as usize;
-    // let fairly_large_constant = 0xffff;
-    let modulus = 64;
-    if modulus == 0 || semi_random_number % modulus == 0 {
+    // Garbage collect more often when samples are large, so the cache does not
+    // balloon between collections for big (e.g. fragmented) payloads:
+    //   payload <= 1 KiB   : GC every 64 samples (cheap amortization)
+    //   1 KiB < p <= 64 KiB: GC every 8 samples
+    //   payload > 64 KiB    : GC on every sample
+    let payload_size = cache_change.data_value.payload_size();
+    let modulus = if payload_size <= 1024 {
+      64
+    } else if payload_size <= 65536 {
+      8
+    } else {
+      1
+    };
+    let gc_triggered = modulus <= 1 || semi_random_number % modulus == 0;
+    if gc_triggered {
       debug!("Garbage collecting topic {}", self.topic_name);
       self.remove_changes_before(Timestamp::ZERO);
       // remove limit is so low that it has no effect.

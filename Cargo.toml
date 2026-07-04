@@ -124,3 +124,6 @@ termion = "4.0.2"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = "0.17" # for ddsperf
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2" # for ddsperf CPU/RSS reporting on macOS
