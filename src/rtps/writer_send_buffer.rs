@@ -57,6 +57,18 @@ struct Inner {
   // Highest sequence number the Writer has actually put on the wire.
   sent_frontier: SequenceNumber,
 
+  // Hard upper bound on the number of retained samples for *non-blocking*
+  // (best-effort, DDS-default) writes. Because such writes are never throttled
+  // at admission (see `has_room`), and eviction otherwise only happens on the
+  // periodic (6 s) cache-cleaning timer, the buffer would grow without bound
+  // when the application produces faster than the socket drains. We therefore
+  // apply KeepLast-style "newest wins" eviction directly on insert: once the
+  // buffer exceeds `max_retain`, the oldest samples are dropped. Derived from
+  // the writer's History depth / ResourceLimits (same value as `window_limit`).
+  // Does NOT apply to reliable / opted-in writers, which are bounded by the
+  // send window / unsent-backlog and must retain samples for repair.
+  max_retain: usize,
+
   // Wakers of async producers / ack-waiters parked because the window was full
   // or acknowledgements were still pending. Drained (woken) on any advance.
   wakers: Vec<Waker>,
@@ -95,6 +107,7 @@ impl WriterSendBuffer {
     is_builtin: bool,
     window_limit: usize,
     backlog_limit: usize,
+    max_retain: usize,
   ) -> Self {
     Self {
       shared: Arc::new(Shared {
@@ -107,6 +120,7 @@ impl WriterSendBuffer {
           reliable_readers_present: false,
           backlog_limit: backlog_limit.max(1),
           sent_frontier: SequenceNumber::new(0),
+          max_retain: max_retain.max(1),
           wakers: Vec::new(),
         }),
         progress: Condvar::new(),
@@ -188,7 +202,7 @@ impl WriterSendBuffer {
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
       if Self::has_room(shared, &inner, may_block) {
-        let seq = Self::insert_locked(shared, &mut inner, write_options, data);
+        let seq = Self::insert_locked(shared, &mut inner, write_options, data, may_block);
         return Admission::Admitted(seq);
       }
       // Window full: wait for an acknowledgement to free up space.
@@ -223,7 +237,13 @@ impl WriterSendBuffer {
     let mut inner = shared.inner.lock().unwrap();
     let may_block = shared.reliable_writer || write_options.best_effort_may_block();
     if Self::has_room(shared, &inner, may_block) {
-      Ok(Self::insert_locked(shared, &mut inner, write_options, data))
+      Ok(Self::insert_locked(
+        shared,
+        &mut inner,
+        write_options,
+        data,
+        may_block,
+      ))
     } else {
       register_waker(&mut inner.wakers, waker);
       Err((write_options, data))
@@ -235,11 +255,32 @@ impl WriterSendBuffer {
     inner: &mut Inner,
     write_options: WriteOptions,
     data: DDSData,
+    may_block: bool,
   ) -> SequenceNumber {
     let seq = inner.last_seq.plus_1();
     let cc = CacheChange::new(shared.writer_guid, seq, write_options, data);
     inner.changes.insert(seq, cc);
     inner.last_seq = seq;
+
+    // KeepLast "newest wins" bound for non-blocking (best-effort default)
+    // writes. These are never throttled at admission (`has_room` returns true),
+    // and the only other eviction path is the periodic cache-cleaning timer,
+    // which starves under a sustained flood -- so without this the buffer grows
+    // without bound (confirmed multi-GB leak). Reliable / opted-in writers are
+    // exempt: they are already bounded by the send window / unsent backlog and
+    // must retain unacknowledged samples for repair, so we never drop here.
+    // Built-in (discovery) writers are also exempt to never lose discovery data.
+    if !may_block && !shared.is_builtin {
+      while inner.changes.len() > inner.max_retain {
+        // BTreeMap keeps keys sorted, so the first entry is the oldest SN.
+        let oldest = match inner.changes.keys().next().copied() {
+          Some(sn) => sn,
+          None => break,
+        };
+        inner.changes.remove(&oldest);
+        inner.first_seq = oldest.plus_1();
+      }
+    }
     seq
   }
 
@@ -287,6 +328,12 @@ impl WriterSendBuffer {
   /// The sequence number of the latest allocated sample (0 if none yet).
   pub fn last_change_sequence_number(&self) -> SequenceNumber {
     self.shared.inner.lock().unwrap().last_seq
+  }
+
+  /// Number of samples currently retained in the buffer. Test-only.
+  #[cfg(test)]
+  pub fn retained_len(&self) -> usize {
+    self.shared.inner.lock().unwrap().changes.len()
   }
 
   /// The lowest sequence number still retained (or the next-to-be-written if
@@ -410,6 +457,7 @@ mod tests {
       /* is_builtin */ false,
       /* window_limit */ 1000,
       /* backlog_limit */ 2,
+      /* max_retain */ 1000,
     );
 
     // Nothing sent yet: backlog fills after two admissions.
@@ -436,6 +484,7 @@ mod tests {
       /* is_builtin */ false,
       /* window_limit */ 1000,
       /* backlog_limit */ 1,
+      /* max_retain */ 1000,
     );
     // Default WriteOptions => best_effort_may_block == false => never blocks.
     assert!(admit_now(&buf, WriteOptions::default()));
@@ -454,10 +503,70 @@ mod tests {
       /* is_builtin */ true,
       1000,
       /* backlog_limit */ 1,
+      /* max_retain */ 1000,
     );
     assert!(admit_now(&buf, may_block_opts()));
     assert!(admit_now(&buf, may_block_opts()));
     assert!(admit_now(&buf, may_block_opts())); // still admitted despite tiny
                                                 // backlog limit
+  }
+
+  // A best-effort (non-blocking, DDS-default) writer is never throttled at
+  // admission, but the retained buffer must stay bounded by `max_retain`
+  // (KeepLast "newest wins"): the leak fix. Every write is admitted, yet the
+  // buffer never holds more than `max_retain` samples, and it retains the
+  // newest ones (oldest are evicted on insert).
+  #[test]
+  fn best_effort_default_bounded_by_max_retain() {
+    let max_retain = 4;
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      /* reliable_writer */ false,
+      /* is_builtin */ false,
+      /* window_limit */ 1000,
+      /* backlog_limit */ 1000,
+      max_retain,
+    );
+
+    for _ in 0..100 {
+      // Default WriteOptions => best-effort, non-blocking => always admitted.
+      assert!(admit_now(&buf, WriteOptions::default()));
+      // Invariant after every insert: never exceeds the retain bound.
+      assert!(buf.retained_len() <= max_retain);
+    }
+
+    // Exactly `max_retain` retained, and they are the newest sequence numbers.
+    assert_eq!(buf.retained_len(), max_retain);
+    let last = buf.last_change_sequence_number();
+    assert_eq!(last, SequenceNumber::new(100));
+    let first = buf.first_change_sequence_number();
+    assert_eq!(first, SequenceNumber::new(100 - max_retain as i64 + 1));
+    // Newest is retained, an evicted older one is gone.
+    assert!(buf.get_by_sn(last).is_some());
+    assert!(buf.get_by_sn(SequenceNumber::new(1)).is_none());
+  }
+
+  // Reliable writers must NOT drop on insert (they retain for repair); the
+  // `max_retain` bound applies only to non-blocking best-effort writes.
+  #[test]
+  fn reliable_writer_not_trimmed_by_max_retain() {
+    let max_retain = 2;
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      /* reliable_writer */ true,
+      /* is_builtin */ false,
+      /* window_limit */ 1000,
+      /* backlog_limit */ 1000,
+      max_retain,
+    );
+    // No reliable readers matched yet => admission not window-throttled.
+    for _ in 0..10 {
+      assert!(admit_now(&buf, WriteOptions::default()));
+    }
+    // Reliable path keeps everything for potential repair despite tiny
+    // max_retain.
+    assert_eq!(buf.retained_len(), 10);
   }
 }

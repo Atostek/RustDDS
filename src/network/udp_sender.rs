@@ -43,13 +43,45 @@ pub struct UDPSender {
 impl UDPSender {
   #[cfg(test)]
   pub fn new(sender_port: u16) -> io::Result<Self> {
-    Self::new_with_networks(sender_port, None)
+    Self::new_with_networks(sender_port, None, 0)
   }
 
-  pub fn new_with_networks(sender_port: u16, only_networks: Option<&[IpAddr]>) -> io::Result<Self> {
+  // Request (and verify) SO_SNDBUF on a sender socket. `size == 0` leaves the
+  // OS default in place. Like the receive path, the kernel silently clamps the
+  // request to a per-socket ceiling (macOS: `kern.ipc.maxsockbuf`, 8 MiB by
+  // default; Linux: `net.core.wmem_max`), so we read the effective value back
+  // and warn when it is materially smaller than requested -- a too-small send
+  // buffer causes WouldBlock churn / control-queue growth under bursty output.
+  fn set_and_verify_send_buffer(socket: &Socket, size: usize) {
+    if size == 0 {
+      return;
+    }
+    if let Err(e) = socket.set_send_buffer_size(size) {
+      warn!("Failed to set SO_SNDBUF to {size}: {e}. Using OS default.");
+      return;
+    }
+    match socket.send_buffer_size() {
+      Ok(effective) if effective < size => warn!(
+        "SO_SNDBUF clamped: requested {size} bytes but got {effective} bytes. The kernel limits \
+         per-socket send buffers; raise it if the sender backlogs under load (macOS: `sudo sysctl \
+         -w kern.ipc.maxsockbuf=<bytes>`, Linux: `sudo sysctl -w net.core.wmem_max=<bytes>`)."
+      ),
+      Ok(effective) => debug!("SO_SNDBUF requested {size} bytes, effective {effective} bytes."),
+      Err(e) => debug!("Could not read back SO_SNDBUF: {e}"),
+    }
+  }
+
+  pub fn new_with_networks(
+    sender_port: u16,
+    only_networks: Option<&[IpAddr]>,
+    send_buffer_size: usize,
+  ) -> io::Result<Self> {
     let unicast_socket = {
       let saddr: SocketAddr = SocketAddr::new("0.0.0.0".parse().unwrap(), sender_port);
-      let socket = UdpSocket::bind(saddr)?;
+      let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+      Self::set_and_verify_send_buffer(&raw_socket, send_buffer_size);
+      raw_socket.bind(&SockAddr::from(saddr))?;
+      let socket = UdpSocket::from(raw_socket);
       // nonblocking-transmit: the socket must never stall the event loop.
       socket.set_nonblocking(true)?;
       socket
@@ -73,6 +105,7 @@ impl UDPSender {
         IpAddr::V4(a) => {
           let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
           raw_socket.set_multicast_if_v4(&a)?;
+          Self::set_and_verify_send_buffer(&raw_socket, send_buffer_size);
 
           // Handle windows.
           //
@@ -100,6 +133,7 @@ impl UDPSender {
         // ipv6
         IpAddr::V6(addr) => {
           let raw_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+          Self::set_and_verify_send_buffer(&raw_socket, send_buffer_size);
 
           // note: you don't need to use set_multicast_if for ipv6 multicast.
           // it comes for free!

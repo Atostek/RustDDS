@@ -73,6 +73,7 @@ pub struct DomainParticipantBuilder {
                                        * and multicast setup */
 
   socket_receive_buffer_size: usize,
+  socket_send_buffer_size: usize,
 
   #[cfg(feature = "security")]
   security_plugins: Option<SecurityPlugins>,
@@ -86,6 +87,7 @@ impl DomainParticipantBuilder {
       domain_id,
       only_networks: None,
       socket_receive_buffer_size: Self::DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE,
+      socket_send_buffer_size: Self::DEFAULT_SOCKET_SEND_BUFFER_SIZE,
       #[cfg(feature = "security")]
       security_plugins: None,
       #[cfg(feature = "security")]
@@ -107,9 +109,37 @@ impl DomainParticipantBuilder {
   }
 
   pub const DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+  pub const DEFAULT_SOCKET_SEND_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
+  /// Requested `SO_RCVBUF` (kernel receive buffer) for every UDP listener
+  /// socket, in bytes. A large receive buffer absorbs traffic bursts before the
+  /// single-threaded event loop can drain them, reducing packet loss under
+  /// load. The default is 8 MiB.
+  ///
+  /// The kernel silently clamps the request to a per-socket ceiling; if the
+  /// effective value ends up materially below what was requested, a warning is
+  /// logged. To go above the ceiling, raise the OS limit first:
+  /// - macOS: `sudo sysctl -w kern.ipc.maxsockbuf=<bytes>` (default is 8 MiB,
+  ///   so the 8 MiB default here is already at the cap unless you raise it).
+  /// - Linux: `sudo sysctl -w net.core.rmem_max=<bytes>` (note Linux reports
+  ///   back roughly twice the requested size due to internal bookkeeping).
   pub fn socket_receive_buffer_size(mut self, size: usize) -> Self {
     self.socket_receive_buffer_size = size;
+    self
+  }
+
+  /// Requested `SO_SNDBUF` (kernel send buffer) for every UDP sender socket, in
+  /// bytes. A large send buffer smooths bursty output so the writer hits
+  /// `WouldBlock` (and grows the control queue) less often. The default is
+  /// 8 MiB.
+  ///
+  /// The kernel silently clamps the request to a per-socket ceiling; if the
+  /// effective value ends up materially below what was requested, a warning is
+  /// logged. To go above the ceiling, raise the OS limit first:
+  /// - macOS: `sudo sysctl -w kern.ipc.maxsockbuf=<bytes>` (default is 8 MiB).
+  /// - Linux: `sudo sysctl -w net.core.wmem_max=<bytes>`.
+  pub fn socket_send_buffer_size(mut self, size: usize) -> Self {
+    self.socket_send_buffer_size = size;
     self
   }
 
@@ -274,6 +304,7 @@ impl DomainParticipantBuilder {
       status_receiver,
       security_plugins_handle.clone(),
       self.socket_receive_buffer_size,
+      self.socket_send_buffer_size,
       self.only_networks,
     )?;
 
@@ -806,6 +837,7 @@ impl DomainParticipantDisc {
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     socket_receive_buffer_size: usize,
+    socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
@@ -819,6 +851,7 @@ impl DomainParticipantDisc {
       status_receiver,
       security_plugins_handle,
       socket_receive_buffer_size,
+      socket_send_buffer_size,
       only_networks,
     )?;
 
@@ -1041,6 +1074,7 @@ impl DomainParticipantInner {
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     socket_receive_buffer_size: usize,
+    socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
@@ -1211,6 +1245,7 @@ impl DomainParticipantInner {
           status_sender,
           security_plugins_clone,
           only_networks_for_ev_loop,
+          socket_send_buffer_size,
         );
         dp_event_loop.event_loop();
       })?;

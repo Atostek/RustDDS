@@ -500,6 +500,11 @@ impl InnerPublisher {
     // samples may await transmission when the network socket is congested. We
     // reuse the same capacity as the reliable window.
     let backlog_limit = window_limit;
+    // KeepLast-style hard cap on retained samples for best-effort (non-blocking)
+    // writes, which are not throttled at admission. Same capacity as the send
+    // window (History depth / ResourceLimits / default), so the writer never
+    // retains more than the application's configured history requires.
+    let max_retain = window_limit;
     let send_buffer = WriterSendBuffer::new(
       guid,
       topic.name(),
@@ -507,6 +512,7 @@ impl InnerPublisher {
       guid.entity_id.entity_kind.is_built_in(),
       window_limit,
       backlog_limit,
+      max_retain,
     );
     // mio readiness "doorbell": the DataWriter rings `doorbell` after admitting a
     // sample; the event loop registers `doorbell_registration` under the writer's

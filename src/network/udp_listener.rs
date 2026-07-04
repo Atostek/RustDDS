@@ -85,6 +85,30 @@ impl UDPListener {
         .unwrap_or_else(|e| {
           warn!("Failed to set SO_RCVBUF to {recv_buffer_size}: {e}. Using OS default.");
         });
+
+      // Verify the effective size (getsockopt). The kernel silently clamps
+      // SO_RCVBUF to a per-socket ceiling (macOS: `kern.ipc.maxsockbuf`, which
+      // defaults to 8 MiB; Linux: `net.core.rmem_max`). Note Linux reports back
+      // ~2x the requested value (bookkeeping overhead). Warn only when the
+      // effective size is materially below what we asked for, so silent clamping
+      // that can cause packet loss under load is visible in the logs.
+      match raw_socket.recv_buffer_size() {
+        Ok(effective) => {
+          if effective < recv_buffer_size {
+            warn!(
+              "SO_RCVBUF clamped: requested {recv_buffer_size} bytes but got {effective} bytes. \
+               The kernel limits per-socket receive buffers; raise it to reduce packet loss under \
+               load (macOS: `sudo sysctl -w kern.ipc.maxsockbuf=<bytes>`, Linux: `sudo sysctl -w \
+               net.core.rmem_max=<bytes>`)."
+            );
+          } else {
+            debug!("SO_RCVBUF requested {recv_buffer_size} bytes, effective {effective} bytes.");
+          }
+        }
+        Err(e) => {
+          debug!("Could not read back SO_RCVBUF: {e}");
+        }
+      }
     }
 
     // We set ReuseAddr so that other DomainParticipants on this host can

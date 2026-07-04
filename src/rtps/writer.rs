@@ -549,12 +549,17 @@ impl Writer {
         // immutable borrow of `self.readers` (target reader) is released before
         // we mutate our cursor/frontier below.
         let cursor = self.sample_cursor;
+        // Best-effort has no acknowledgement/repair semantics, so a heartbeat
+        // per sample is pure overhead (an extra submessage built and sent for
+        // every DATA). Only reliable writers piggyback a heartbeat here;
+        // best-effort skips it entirely.
+        let send_also_heartbeat = self.is_reliable();
         let (_fragmented, progress) = {
           let target_reader_opt = match write_options.to_single_reader() {
             Some(guid) => self.readers.get(&guid), // Sending only to this reader
             None => None,                          // Sending to all matched readers
           };
-          self.send_cache_change_from(&cc, true, target_reader_opt, cursor)
+          self.send_cache_change_from(&cc, send_also_heartbeat, target_reader_opt, cursor)
         };
         match progress {
           SendProgress::Complete => {
@@ -1343,7 +1348,12 @@ impl Writer {
     // to the legacy path (send to every advertised locator on every interface)
     // so reachability is preserved.
 
-    let readers = readers.collect::<Vec<_>>(); // clone iterator
+    // Only the security path needs the readers materialized into a slice (to
+    // pass to `security_encode`). In the default (non-security) build we iterate
+    // the incoming iterator directly below, avoiding a per-sample Vec
+    // allocation on the send hot path.
+    #[cfg(feature = "security")]
+    let readers = readers.collect::<Vec<_>>();
 
     let mut blocked: BTreeSet<SocketId> = BTreeSet::new();
 

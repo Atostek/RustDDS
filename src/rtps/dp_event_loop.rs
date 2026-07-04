@@ -137,6 +137,7 @@ impl DPEventLoop {
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     security_plugins_opt: Option<SecurityPluginsHandle>,
     only_networks: Option<Arc<[IpAddr]>>,
+    socket_send_buffer_size: usize,
   ) -> Self {
     let poll = Poll::new().expect("Unable to create new poll.");
     let (acknack_sender, acknack_receiver) =
@@ -234,8 +235,9 @@ impl DPEventLoop {
     }
 
     // port number 0 means OS chooses an available port number.
-    let udp_sender = UDPSender::new_with_networks(0, only_networks.as_deref())
-      .expect("UDPSender construction fail"); // TODO
+    let udp_sender =
+      UDPSender::new_with_networks(0, only_networks.as_deref(), socket_send_buffer_size)
+        .expect("UDPSender construction fail"); // TODO
 
     #[cfg(not(feature = "security"))]
     let security_plugins_opt = security_plugins_opt.and(None); // make sure it is None an consume value
@@ -1357,6 +1359,7 @@ mod tests {
         participant_status_sender,
         None,
         None,
+        0,
       );
       dp_event_loop
         .poll
