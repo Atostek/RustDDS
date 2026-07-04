@@ -220,8 +220,13 @@ fn main() {
         baggage,
       };
 
+      // rate == 0 means "flat out": publish as fast as possible with no
+      // per-sample pacing timer (mirrors CycloneDDS `ddsperf pub` with no rate).
+      // This is what the max-throughput / traffic-pressure scenarios use.
+      let flat_out = rate == 0;
       smol::block_on(async {
         let mut seq = 0;
+        let mut last_report = std::time::Instant::now();
         loop {
           let mut new_message = keyed_seq_msg.clone();
           new_message.seq = seq;
@@ -230,14 +235,21 @@ fn main() {
             .async_write(new_message, None)
             .unwrap_or_else(|e| error!("DataWriter async_write failed: {e:?}"))
             .await;
-          // Periodic (~1 s) CPU/RSS report so the publisher side is also
-          // observable for leaks (send-buffer growth, etc.).
-          if rate > 0 && seq % rate == 0 {
-            print_and_reset_cpu_usage();
+          if flat_out {
+            // No pacing. Report CPU/RSS roughly once per second (wall clock).
+            if last_report.elapsed() >= Duration::from_secs(1) {
+              print_and_reset_cpu_usage();
+              last_report = std::time::Instant::now();
+            }
+          } else {
+            // Periodic (~1 s) CPU/RSS report so the publisher side is also
+            // observable for leaks (send-buffer growth, etc.).
+            if seq % rate == 0 {
+              print_and_reset_cpu_usage();
+            }
+            let interval = 1_000_000_000 / rate;
+            Timer::after(Duration::from_nanos(interval.into())).await;
           }
-          // wait for 1 sec for transfer to complete before exiting.
-          let interval = 1_000_000_000 / rate;
-          Timer::after(Duration::from_nanos(interval.into())).await;
         } // loop
       });
     } // Pub
