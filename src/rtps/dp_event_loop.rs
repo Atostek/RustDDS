@@ -55,6 +55,16 @@ use crate::{
 #[cfg(not(feature = "security"))]
 use crate::no_security::security_plugins::SecurityPluginsHandle;
 
+// Upper bound on how many datagrams the event loop drains from a single UDP
+// listener per poll iteration. Bulk user traffic (especially fragmented
+// samples flat-out) can arrive as fast as it is read; without a cap, one
+// listener's `messages()` never reaches WouldBlock and the single-threaded
+// loop is stuck there, starving discovery/control sockets. Capping the drain
+// (with level-triggered listeners so the remainder re-fires) keeps discovery
+// responsive under load, e.g. so a subscriber can still match a publisher's
+// writer while being flooded with data from that not-yet-matched writer.
+const MAX_LISTENER_MESSAGES_PER_POLL: usize = 16;
+
 #[derive(Clone, Debug)]
 pub struct DomainInfo {
   pub domain_participant_guid: GUID,
@@ -149,7 +159,12 @@ impl DPEventLoop {
           listener.mio_socket(),
           *token,
           Ready::readable(),
-          PollOpt::edge(),
+          // Level-triggered: the event loop caps how many datagrams it drains
+          // from a listener per poll iteration (see the bounded drain in the
+          // listener token handler). Level-triggering guarantees that any
+          // packets left after the cap re-fire on the next poll, so a bulk
+          // flood on the user-traffic socket cannot starve discovery/control.
+          PollOpt::level(),
         )
         .expect("Failed to register listener.");
     }
@@ -225,7 +240,7 @@ impl DPEventLoop {
         &*shared_timer.borrow(),
         DPEV_TIMER_TOKEN,
         Ready::readable(),
-        PollOpt::edge(),
+        PollOpt::level(),
       )
       .expect("Failed to register dp_event_loop shared timer");
     {
@@ -358,7 +373,7 @@ impl DPEventLoop {
                       error!("No listener with token {:?}", event.token());
                       vec![]
                     },
-                    UDPListener::messages,
+                    |l| l.messages_bounded(MAX_LISTENER_MESSAGES_PER_POLL),
                   );
                 for (packet, origin) in udp_messages {
                   ev_wrapper

@@ -9,7 +9,7 @@ use std::{
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use speedy::{Endianness, Writable};
+use speedy::Endianness;
 use mio_extras::channel::TrySendError;
 use mio_06::{Ready, Registration, SetReadiness, Token};
 
@@ -752,7 +752,28 @@ impl Writer {
             Some(guid) => self.readers.get(&guid), // Sending only to this reader
             None => None,                          // Sending to all matched readers
           };
-          self.send_cache_change_from(&cc, send_also_heartbeat, target_reader_opt, cursor)
+          // Built-in (discovery) writers carry low-volume, delivery-critical
+          // SEDP/SPDP data. Their initial push must not be dropped on WouldBlock:
+          // under a flat-out user writer the send socket is perpetually congested,
+          // so a dropped DiscoveredWriterData would have to be recovered by the
+          // reliable heartbeat/ACKNACK/repair chain - which is itself starved
+          // (the shared timer barely fires under load), leaving the remote
+          // endpoint permanently undiscovered. Route discovery pushes through the
+          // never-dropped Control queue (strict priority in on_socket_writable)
+          // so discovery completes regardless of user-data congestion. User
+          // writers keep the flow-controlled Bulk path.
+          let push_class = if self.my_guid.entity_id.kind().is_built_in() {
+            TrafficClass::Control
+          } else {
+            TrafficClass::Bulk
+          };
+          self.send_cache_change_from(
+            &cc,
+            send_also_heartbeat,
+            target_reader_opt,
+            cursor,
+            push_class,
+          )
         };
         match progress {
           SendProgress::Complete => {
@@ -820,8 +841,13 @@ impl Writer {
   }
 
   // Returns a boolean telling if the data had to be fragmented. This one-shot
-  // wrapper is used by the repair path: on WouldBlock the datagram is dropped
-  // (the reader will re-NACK), so repair never buffers or stalls.
+  // wrapper is used by the repair path (ACKNACK response). Repair is a
+  // reliability action: it must actually reach the reader, so it goes through
+  // the never-dropped `Control` queue rather than the best-effort `Bulk` path.
+  // Dropping repair on WouldBlock livelocks under sustained send congestion -
+  // the reader re-NACKs, the retransmit is dropped again, and reliable data
+  // (e.g. builtin SEDP DiscoveredWriterData) never gets delivered while a
+  // flat-out writer keeps the socket blocked.
   fn send_cache_change(
     &self,
     cc: &CacheChange,
@@ -833,6 +859,7 @@ impl Writer {
       send_also_heartbeat,
       target_reader_opt,
       SampleCursor::Fresh,
+      TrafficClass::Control,
     );
     fragmentation_needed
   }
@@ -846,6 +873,7 @@ impl Writer {
     send_also_heartbeat: bool,
     target_reader_opt: Option<&RtpsReaderProxy>,
     cursor: SampleCursor,
+    class: TrafficClass,
   ) -> (bool, SendProgress) {
     // First make sure that if the data is meant for a single reader only, we do
     // not accidentally send it to everyone.
@@ -883,13 +911,13 @@ impl Writer {
           DeliveryMode::Multicast,
           msg,
           &mut self.readers.values(),
-          TrafficClass::Bulk,
+          class,
         ),
         Some(reader_proxy) => self.send_message_to_readers(
           DeliveryMode::Unicast,
           msg,
           &mut std::iter::once(reader_proxy),
-          TrafficClass::Bulk,
+          class,
         ),
       };
       if !blocked.is_empty() {
@@ -1046,6 +1074,17 @@ impl Writer {
 
         let my_topic = self.my_topic_name.clone(); // for debugging
 
+        // Built-in (discovery) writers must recover a missed sample promptly and
+        // independently of the shared timer: under a flat-out user writer the
+        // timer thread is CPU-starved and the deferred `SendRepairData` timeout
+        // fires late or never, so a NACKed DiscoveredWriterData is never
+        // retransmitted and the remote endpoint stays undiscovered. For built-in
+        // writers we therefore repair synchronously, right here on the ACKNACK
+        // event (which the event loop always services). Discovery is low-volume,
+        // so responding immediately (no nack-batching delay) is cheap.
+        let repair_immediately = self.my_guid.entity_id.kind().is_built_in();
+        let mut do_immediate_repair = false;
+
         if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
           // Mark requested SNs as "unsent changes"
 
@@ -1094,19 +1133,24 @@ impl Writer {
             reader_proxy.repair_mode = false;
           } else {
             reader_proxy.repair_mode = true; // TODO: Is this correct? Do we need to repair immediately?
-                                             // set repair timer to fire
-                                             // Note: `reader_proxy` holds a mutable borrow of `self`, so we
-                                             // cannot call the `&self` helper here; access disjoint fields
-                                             // directly instead.
-            self.timed_event_timer.borrow_mut().set_timeout(
-              self.nack_response_delay,
-              DpTimerEvent::Writer {
-                entity_id: self.my_guid.entity_id,
-                event: TimedEvent::SendRepairData {
-                  to_reader: reader_guid,
+            if repair_immediately {
+              // Built-in writer: repair now (see note above), not via the timer.
+              do_immediate_repair = true;
+            } else {
+              // set repair timer to fire
+              // Note: `reader_proxy` holds a mutable borrow of `self`, so we
+              // cannot call the `&self` helper here; access disjoint fields
+              // directly instead.
+              self.timed_event_timer.borrow_mut().set_timeout(
+                self.nack_response_delay,
+                DpTimerEvent::Writer {
+                  entity_id: self.my_guid.entity_id,
+                  event: TimedEvent::SendRepairData {
+                    to_reader: reader_guid,
+                  },
                 },
-              },
-            );
+              );
+            }
           }
         } // if have reader_proxy
 
@@ -1127,6 +1171,15 @@ impl Writer {
               &mut std::iter::once(reader_proxy),
             );
           }
+        }
+
+        // Built-in writers repair synchronously (see note above): the missed
+        // sample is retransmitted now, on this ACKNACK event, without waiting
+        // for the (starvable) shared timer. `handle_repair_data_send` detaches
+        // and re-inserts the reader proxy internally, so it must run after the
+        // borrows above are released.
+        if do_immediate_repair {
+          self.handle_repair_data_send(reader_guid);
         }
       } // AckNack
       AckSubmessage::NackFrag(ref nackfrag) => {
@@ -1383,14 +1436,15 @@ impl Writer {
           self.security_plugins.as_ref(),
         );
 
-        // nonblocking-transmit: repair frags are bulk. On WouldBlock we simply
-        // drop; the reader will re-NACK, so repair is self-healing and never
-        // buffers or stalls.
+        // Repair frags are a reliability action (response to a NACK_FRAG), so
+        // they must actually reach the reader. Use the never-dropped `Control`
+        // queue: dropping repair on WouldBlock livelocks under sustained send
+        // congestion (reader re-NACKs, retransmit dropped again, forever).
         let _blocked = self.send_message_to_readers(
           DeliveryMode::Unicast,
           message_builder.add_header_and_build(self.my_guid.prefix),
           &mut std::iter::once(&*reader_proxy),
-          TrafficClass::Bulk,
+          TrafficClass::Control,
         );
       } else {
         error!(
@@ -1559,7 +1613,7 @@ impl Writer {
 
     match encoded {
       Ok(message) => {
-        let buffer = message.write_to_vec_with_ctx(self.endianness).unwrap();
+        let buffer = message.write_to_vec_fast(self.endianness).unwrap();
 
         // De-duplication of narrowed (interface-aware) sends across readers.
         let mut sent_routes: BTreeSet<RouteKey> = BTreeSet::new();
@@ -1724,8 +1778,40 @@ impl Writer {
             local_writer: self.my_guid,
             remote_reader: reader_proxy.remote_reader_guid,
           });
-          // If we're reliable, should we send out a heartbeat so that new reader can
-          // catch up?
+          // Reliable: send an initial HEARTBEAT to the newly matched reader so it
+          // can request the samples we already hold (repair/late-join). This runs
+          // synchronously on the discovery-match event in the event loop, so it
+          // does NOT depend on the periodic heartbeat timer - which is CPU-starved
+          // under a flat-out user writer, leaving the timer to fire seldom or
+          // never. Without this prompt, a reader that matches after our initial
+          // send burst is never told what we have and never NACKs, so reliable
+          // data (notably builtin SEDP DiscoveredWriterData) is never delivered
+          // and the endpoints stay unmatched. Unicast to just the new reader.
+          if self.is_reliable() && !self.like_stateless {
+            let new_reader_guid = reader_proxy.remote_reader_guid;
+            let first = self.send_buffer.first_change_sequence_number();
+            let last = self.send_buffer.last_change_sequence_number();
+            let hb_message = MessageBuilder::new()
+              .ts_msg(self.endianness, Some(Timestamp::now()))
+              .heartbeat_msg(
+                self.entity_id(),
+                first,
+                last,
+                self.next_heartbeat_count(),
+                self.endianness,
+                EntityId::UNKNOWN,
+                false, // final_flag: require the reader to respond with ACKNACK
+                false, // liveliness_flag
+              )
+              .add_header_and_build(self.my_guid.prefix);
+            if let Some(rp) = self.readers.get(&new_reader_guid) {
+              self.send_control_to_readers(
+                DeliveryMode::Unicast,
+                hb_message,
+                &mut std::iter::once(rp),
+              );
+            }
+          }
           info!(
             "Matched new remote reader on topic={:?} reader={:?}",
             self.topic_name(),

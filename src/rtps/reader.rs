@@ -11,7 +11,9 @@ use mio_06::Token;
 use mio_extras::channel as mio_channel;
 use log::{debug, error, info, trace, warn};
 use enumflags2::BitFlags;
-use speedy::{Endianness, Writable};
+use speedy::Endianness;
+#[cfg(feature = "security")]
+use speedy::Writable;
 
 use crate::{
   dds::{
@@ -1235,7 +1237,7 @@ impl Reader {
     dst_locator_list: &[Locator],
   ) {
     let bytes = message
-      .write_to_vec_with_ctx(Endianness::LittleEndian)
+      .write_to_vec_fast(Endianness::LittleEndian)
       .unwrap(); //TODO!
     let _dummy = message; // consume it to avoid clippy warning
     self
