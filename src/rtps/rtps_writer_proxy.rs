@@ -6,6 +6,7 @@ use log::{debug, error, info, trace, warn};
 
 use crate::{
   discovery::sedp_messages::DiscoveredWriterData,
+  rtps::constant::MAX_TRACKED_CHANGES_PER_WRITER,
   structure::{
     guid::{EntityId, GUID},
     locator::Locator,
@@ -217,6 +218,10 @@ impl RtpsWriterProxy {
     if seq_num == self.ack_base {
       self.advance_ack_base();
     }
+
+    // Bound the map even when ack_base cannot advance (best-effort loss leaves a
+    // permanent gap below the newly received sample).
+    self.enforce_change_map_cap();
   }
 
   // Used to add individual irrelevant changes from GAP message
@@ -282,6 +287,7 @@ impl RtpsWriterProxy {
       {
         self.changes.insert(na, None);
       }
+      self.enforce_change_map_cap();
     }
   }
 
@@ -349,5 +355,102 @@ impl RtpsWriterProxy {
       // ack_base-1 up to test_sn (excluded), so ack_base can be set to test_sn
       self.ack_base = test_sn;
     }
+
+    // Entries strictly below ack_base are already accounted for (received or
+    // not_available) and are never read again: `missing_seqnums` starts at
+    // max(hb_first, ack_base) and `should_ignore_change` treats anything below
+    // ack_base as handled regardless of the map. Historically these entries were
+    // only cleaned by HEARTBEAT/GAP, which best-effort writers never send, so
+    // the map grew by one entry per received sample. Drop them eagerly here.
+    self.prune_below_ack_base();
+  }
+
+  // Drop tracked changes below ack_base (they are already accounted for).
+  fn prune_below_ack_base(&mut self) {
+    // Only touch the map when there is actually something below ack_base to drop
+    // (the common stalled-gap case has nothing below ack_base, so we skip the
+    // split_off entirely and keep the receive path cheap).
+    if matches!(self.changes.keys().next(), Some(&first) if first < self.ack_base) {
+      // split_off returns everything from the key onward; keep that, drop the rest.
+      self.changes = self.changes.split_off(&self.ack_base);
+    }
+  }
+
+  // Memory-safety backstop: under best-effort loss `ack_base` can stall at a
+  // permanently missing sample while received sequence numbers pile up above it,
+  // so pruning below ack_base is not enough. When the map exceeds the cap, force
+  // ack_base past the oldest tracked change (giving up on the stalled gap as
+  // lost) so the map cannot grow without bound.
+  fn enforce_change_map_cap(&mut self) {
+    while self.changes.len() > MAX_TRACKED_CHANGES_PER_WRITER {
+      let oldest = match self.changes.keys().next() {
+        Some(&sn) => sn,
+        None => break,
+      };
+      self.changes.remove(&oldest);
+      if self.ack_base <= oldest {
+        self.ack_base = oldest + SequenceNumber::new(1);
+      }
+    }
+    // After forcing ack_base forward, drop anything now below it.
+    self.prune_below_ack_base();
+  }
+
+  #[cfg(test)]
+  pub fn tracked_changes_count(&self) -> usize {
+    self.changes.len()
   }
 } // impl
+
+#[cfg(test)]
+mod bounded_map_tests {
+  use super::*;
+  use crate::structure::guid::GuidPrefix;
+
+  fn test_proxy() -> RtpsWriterProxy {
+    RtpsWriterProxy::new(
+      GUID::new(GuidPrefix::UNKNOWN, EntityId::UNKNOWN),
+      vec![],
+      vec![],
+      EntityId::UNKNOWN,
+    )
+  }
+
+  // Regression: a best-effort writer sends no HEARTBEAT/GAP, so the changes map
+  // used to accumulate one entry per received sample forever. With eager pruning
+  // below ack_base, contiguous delivery must keep the map ~empty.
+  #[test]
+  fn changes_map_does_not_grow_on_contiguous_delivery() {
+    let mut wp = test_proxy();
+    let n: i64 = 50_000;
+    for i in 1..=n {
+      wp.received_changes_add(SequenceNumber::new(i), Timestamp::INVALID);
+    }
+    // Everything received in order: ack_base advanced past the last sample.
+    assert_eq!(wp.all_ackable_before(), SequenceNumber::new(n + 1));
+    assert!(
+      wp.tracked_changes_count() <= 1,
+      "changes map grew unbounded on contiguous delivery: {} entries",
+      wp.tracked_changes_count()
+    );
+  }
+
+  // Regression: with a permanently missing sample (best-effort loss) ack_base
+  // stalls, so pruning below it is not enough. The hard cap must still bound the
+  // map by giving up on the stalled gap.
+  #[test]
+  fn changes_map_bounded_with_permanent_gap() {
+    let mut wp = test_proxy();
+    // Sample 1 is never delivered; deliver a long run above it.
+    let n: i64 = MAX_TRACKED_CHANGES_PER_WRITER as i64 * 4;
+    for i in 2..=n {
+      wp.received_changes_add(SequenceNumber::new(i), Timestamp::INVALID);
+    }
+    assert!(
+      wp.tracked_changes_count() <= MAX_TRACKED_CHANGES_PER_WRITER,
+      "changes map exceeded cap {} under a permanent gap: {} entries",
+      MAX_TRACKED_CHANGES_PER_WRITER,
+      wp.tracked_changes_count()
+    );
+  }
+}

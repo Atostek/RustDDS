@@ -377,6 +377,24 @@ impl RtpsReaderProxy {
       );
     }
     self.unsent_changes.insert(sequence_number);
+
+    // Memory-safety backstop: never let this set grow without bound. In normal
+    // operation it is pruned as samples are pushed (see Writer::process_pending)
+    // or acknowledged (handle_ack_nack), but a best-effort flood sends no
+    // ACKNACKs, so cap the set and drop the oldest (least-useful-to-resend)
+    // entries if it ever exceeds the cap.
+    while self.unsent_changes.len() > MAX_UNSENT_CHANGES_PER_READER {
+      if let Some(&oldest) = self.unsent_changes.iter().next() {
+        self.unsent_changes.remove(&oldest);
+      } else {
+        break;
+      }
+    }
+  }
+
+  #[cfg(test)]
+  pub fn unsent_changes_count(&self) -> usize {
+    self.unsent_changes.len()
   }
 
   pub fn acked_up_to_before(&self) -> SequenceNumber {
@@ -504,6 +522,52 @@ impl Iterator for FragBitVecIterator {
 //     }
 //   }
 // }
+
+#[cfg(test)]
+mod bounded_unsent_tests {
+  use super::*;
+  use crate::structure::guid::GuidPrefix;
+
+  fn test_proxy() -> RtpsReaderProxy {
+    let guid = GUID::new(GuidPrefix::UNKNOWN, EntityId::UNKNOWN);
+    RtpsReaderProxy::new(guid, QosPolicies::default(), false)
+  }
+
+  // Regression: the push path (Writer::process_pending) now prunes each sample
+  // from unsent_changes via mark_change_sent, so a best-effort flood (no
+  // ACKNACKs) does not leave one entry per sample behind. Model that here.
+  #[test]
+  fn unsent_changes_do_not_grow_when_pruned_on_push() {
+    let mut rp = test_proxy();
+    for i in 1..=50_000 {
+      let sn = SequenceNumber::new(i);
+      rp.notify_new_cache_change(sn);
+      rp.mark_change_sent(sn); // Writer::process_pending does this on Complete/drop.
+    }
+    assert_eq!(
+      rp.unsent_changes_count(),
+      0,
+      "unsent_changes should be empty after every sample is marked sent"
+    );
+  }
+
+  // Regression / safety net: even if pruning never happened (pathological peer),
+  // the hard cap must keep unsent_changes bounded.
+  #[test]
+  fn unsent_changes_bounded_by_hard_cap() {
+    let mut rp = test_proxy();
+    let n = (MAX_UNSENT_CHANGES_PER_READER as i64) * 4;
+    for i in 1..=n {
+      rp.notify_new_cache_change(SequenceNumber::new(i));
+    }
+    assert!(
+      rp.unsent_changes_count() <= MAX_UNSENT_CHANGES_PER_READER,
+      "unsent_changes exceeded cap {}: {} entries",
+      MAX_UNSENT_CHANGES_PER_READER,
+      rp.unsent_changes_count()
+    );
+  }
+}
 
 #[cfg(test)]
 mod acknack_tests {

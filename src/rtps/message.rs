@@ -108,6 +108,12 @@ impl<C: Context> Writable<C> for Message {
   }
 }
 
+/// Serialized size of the fixed RTPS [`Header`] that `add_header_and_build`
+/// prepends (protocol id + version + vendor id + guid prefix).
+pub(crate) const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
+/// Serialized size of a [`SubmessageHeader`] (kind + flags + octetsToNextHeader).
+const SUBMESSAGE_HEADER_SIZE: usize = 4;
+
 #[derive(Default, Clone)]
 pub(crate) struct MessageBuilder {
   submessages: Vec<Submessage>,
@@ -116,6 +122,32 @@ pub(crate) struct MessageBuilder {
 impl MessageBuilder {
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Serialized size of the submessages accumulated so far, i.e. the datagram
+  /// size *without* the 20-byte RTPS message header. Each submessage's
+  /// `content_length` is already 4-byte aligned (payloads are padded on write),
+  /// so this is exact for the DATA/INFO_TS/HEARTBEAT submessages used by the
+  /// writer's coalescing path.
+  pub fn submessage_bytes_len(&self) -> usize {
+    self
+      .submessages
+      .iter()
+      .map(|s| SUBMESSAGE_HEADER_SIZE + s.header.content_length as usize)
+      .sum()
+  }
+
+  /// Serialized size of the whole RTPS message (20-byte header + submessages)
+  /// that `add_header_and_build` would produce. Used by the writer's DATA
+  /// coalescing loop to keep an aggregated datagram under an MTU-safe budget.
+  pub fn len_serialized(&self) -> usize {
+    RTPS_MESSAGE_HEADER_SIZE + self.submessage_bytes_len()
+  }
+
+  /// Move all submessages from `other` onto the end of this builder. Used to
+  /// coalesce several samples' `INFO_TS`+`DATA` submessages into one datagram.
+  pub fn append(&mut self, mut other: MessageBuilder) {
+    self.submessages.append(&mut other.submessages);
   }
 
   pub fn dst_submessage(mut self, endianness: Endianness, guid_prefix: GuidPrefix) -> Self {

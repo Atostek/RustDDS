@@ -42,6 +42,36 @@ pub const HEARTBEAT_PERIOD_FAST: crate::structure::duration::Duration =
 // they remain available for repair) rather than being evicted eagerly.
 pub const DEFAULT_WRITER_MAX_SAMPLES: usize = 8192;
 
+// Memory-safety backstop for the per-matched-reader set of sequence numbers a
+// Writer still intends to send (`RtpsReaderProxy::unsent_changes`). In normal
+// operation this set is pruned as samples are pushed or acknowledged, but a
+// best-effort flood (no ACKNACKs) or a pathological peer could otherwise let it
+// grow without bound. When the set exceeds this cap, the oldest entries are
+// dropped (they are the least useful to retransmit).
+pub const MAX_UNSENT_CHANGES_PER_READER: usize = DEFAULT_WRITER_MAX_SAMPLES;
+
+// Memory-safety backstop for the per-matched-writer map of received/irrelevant
+// sequence numbers a Reader tracks (`RtpsWriterProxy::changes`). Entries below
+// `ack_base` are pruned eagerly, but under best-effort loss `ack_base` can stall
+// at a permanently missing sample while received sequence numbers pile up above
+// it. When the map exceeds this cap, `ack_base` is forced forward past the
+// oldest gap (those old samples are given up as lost) so the map stays bounded.
+pub const MAX_TRACKED_CHANGES_PER_WRITER: usize = DEFAULT_WRITER_MAX_SAMPLES;
+
+// Upper bound on the serialized size (RTPS header + submessages) of an
+// aggregated datagram built by the writer's DATA-coalescing path. Kept below a
+// typical Ethernet MTU (1500) minus IPv4 (20) + UDP (8) headers = 1472, with a
+// small margin, so aggregated datagrams do not trigger IP fragmentation. Only
+// unfragmented samples are coalesced; a single sample larger than this still
+// goes out on its own (equivalent to the non-aggregated path).
+pub const MAX_AGGREGATED_DATAGRAM_SIZE: usize = 1452;
+
+// Serialized size of a trailing HEARTBEAT submessage (4-byte submessage header +
+// readerId 4 + writerId 4 + firstSN 8 + lastSN 8 + count 4). The coalescing loop
+// reserves this much of the datagram budget for reliable writers so the single
+// trailing HEARTBEAT always fits after the last DATA.
+pub const HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE: usize = 32;
+
 // Helper list for initializing remote standard (non-secure) built-in readers
 // Structure is (builtin_writer_entity_id, builtin_reader_entity_id,
 // reader_as_BuiltinEndpointSet)

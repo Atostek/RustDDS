@@ -30,7 +30,8 @@ use crate::{
   rtps::{
     constant::{
       DEFAULT_WRITER_MAX_SAMPLES, HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW,
-      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION,
+      HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE, MAX_AGGREGATED_DATAGRAM_SIZE, NACK_RESPONSE_DELAY,
+      NACK_SUPPRESSION_DURATION,
     },
     outbound::{SocketId, TrafficClass},
     rtps_reader_proxy::RtpsReaderProxy,
@@ -78,6 +79,23 @@ pub(crate) enum SampleCursor {
   /// All fragments sent; only the trailing HEARTBEAT of a fragmented sample
   /// remains.
   Heartbeat,
+}
+
+/// Item 1 (DATA aggregation): outcome of attempting to coalesce one or more
+/// consecutive unfragmented multicast-to-all samples into a single datagram.
+pub(crate) enum BatchOutcome {
+  /// The aggregated datagram was accepted by every socket. `last_seq` is the
+  /// highest sequence number included in the batch.
+  Sent { last_seq: SequenceNumber },
+  /// A socket returned WouldBlock and back-pressure applies (reliable, or a
+  /// best-effort sample that opted in to blocking). The whole datagram is
+  /// all-or-nothing: `last_sent` is left unchanged so the batch is rebuilt and
+  /// resent from its first sequence number on the next write-readiness wake.
+  Blocked { blocked: BTreeSet<SocketId> },
+  /// A socket returned WouldBlock for a best-effort batch that must not block;
+  /// the whole datagram is dropped and we advance past it. `last_seq` is the
+  /// highest sequence number in the dropped batch.
+  Dropped { last_seq: SequenceNumber },
 }
 
 /// nonblocking-transmit: outcome of a resumable bulk send of one cache change.
@@ -503,6 +521,150 @@ impl Writer {
   // + `sample_cursor`); the event loop re-invokes us on write readiness. Large
   // (fragmented) samples resume from the exact fragment, never restart. Blocked
   // sockets are recorded in `blocked_sockets` for the event loop to schedule.
+  // Prune a completed / dropped / skipped sequence number from every matched
+  // reader's `unsent_changes` set. Historically this was only done on the NACK
+  // repair path (`mark_change_sent`), so a best-effort push (which never gets
+  // ACKNACKs) left `unsent_changes` growing by one entry per sample forever.
+  // Pruning here keeps the per-reader bookkeeping bounded on the push path too.
+  fn mark_change_sent_to_all_readers(&mut self, sequence_number: SequenceNumber) {
+    if self.like_stateless {
+      return;
+    }
+    for reader in self.readers.values_mut() {
+      reader.mark_change_sent(sequence_number);
+    }
+  }
+
+  // Item 1: is this sample eligible for the DATA-coalescing fast path?
+  // We only coalesce unfragmented samples that go to every matched reader
+  // (multicast-to-all). Fragmented or single-reader samples keep the existing
+  // per-sample / per-fragment path.
+  fn is_aggregatable(&self, cc: &CacheChange) -> bool {
+    cc.data_value.payload_size() <= self.data_max_size_serialized
+      && cc.write_options.to_single_reader().is_none()
+  }
+
+  // Item 1: greedily coalesce consecutive unfragmented multicast-to-all samples
+  // starting at `first_seq` (up to `last_available`) into a single RTPS
+  // datagram, then send it once. Returns None if the first sample is not
+  // eligible (so the caller uses the per-sample path); otherwise the batch
+  // outcome. The datagram is all-or-nothing on WouldBlock.
+  fn try_send_aggregated_batch(
+    &mut self,
+    first_seq: SequenceNumber,
+    last_available: SequenceNumber,
+  ) -> Option<BatchOutcome> {
+    // Peek the first sample. If it is missing (evicted) or not eligible, defer
+    // to the per-sample path, which knows how to skip / fragment / route it.
+    let first_cc = self.send_buffer.get_by_sn(first_seq)?;
+    if !self.is_aggregatable(&first_cc) {
+      return None;
+    }
+
+    let is_reliable = self.is_reliable();
+    // Reserve room for the single trailing HEARTBEAT (reliable only).
+    let hb_reserve = if is_reliable && !self.like_stateless {
+      HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE
+    } else {
+      0
+    };
+
+    let mut builder = MessageBuilder::new();
+    let mut last_seq = first_seq;
+    let mut count: i32 = 0;
+    // The batch back-pressures (rather than dropping) if the writer is reliable
+    // or any included best-effort sample opted in to blocking.
+    let mut may_block = is_reliable;
+    // Whether a preceding INFO_TS in this datagram is still "active". An INFO_TS
+    // applies to every following DATA until the next INFO_TS, so a timestamped
+    // sample followed by a non-timestamped one must emit an invalidating INFO_TS
+    // to avoid the latter inheriting the former's timestamp.
+    let mut ts_active = false;
+
+    let mut seq = first_seq;
+    while seq <= last_available {
+      let Some(cc) = self.send_buffer.get_by_sn(seq) else {
+        // A gap in the buffer (evicted). Stop the batch here and let the
+        // per-sample path handle the missing sequence number next.
+        break;
+      };
+      if !self.is_aggregatable(&cc) {
+        break;
+      }
+
+      // Build this sample's INFO_TS? + DATA submessages and check the budget.
+      let mut sample = MessageBuilder::new();
+      let sample_ts_active = match cc.write_options.source_timestamp() {
+        Some(src_ts) => {
+          sample = sample.ts_msg(self.endianness, Some(src_ts));
+          true
+        }
+        None => {
+          if ts_active {
+            // Invalidate the previous timestamp so this DATA is not stamped.
+            sample = sample.ts_msg(self.endianness, None);
+          }
+          false
+        }
+      };
+      sample = sample.data_msg(
+        &cc,
+        EntityId::UNKNOWN, // multicast-to-all
+        self.my_guid,
+        self.endianness,
+        self.security_plugins.as_ref(),
+      );
+
+      // Always include the first sample (even if it alone exceeds the budget, so
+      // we make progress); otherwise stop before overflowing the datagram.
+      if count > 0
+        && builder.len_serialized() + sample.submessage_bytes_len() + hb_reserve
+          > MAX_AGGREGATED_DATAGRAM_SIZE
+      {
+        break;
+      }
+
+      builder.append(sample);
+      ts_active = sample_ts_active;
+      last_seq = seq;
+      count += 1;
+      if cc.write_options.best_effort_may_block() {
+        may_block = true;
+      }
+      seq = seq.plus_1();
+    }
+
+    // One trailing HEARTBEAT for the whole datagram (reliable writers only).
+    if hb_reserve > 0 {
+      builder = builder.heartbeat_msg(
+        self.entity_id(),
+        self.send_buffer.first_change_sequence_number(),
+        self.send_buffer.last_change_sequence_number(),
+        self.next_heartbeat_count(),
+        self.endianness,
+        EntityId::UNKNOWN, // to all readers
+        false,             // final_flag: request ACKNACK
+        false,             // liveliness_flag
+      );
+    }
+
+    let message = builder.add_header_and_build(self.my_guid.prefix);
+    let blocked = self.send_message_to_readers(
+      DeliveryMode::Multicast,
+      message,
+      &mut self.readers.values(),
+      TrafficClass::Bulk,
+    );
+
+    if blocked.is_empty() {
+      Some(BatchOutcome::Sent { last_seq })
+    } else if may_block {
+      Some(BatchOutcome::Blocked { blocked })
+    } else {
+      Some(BatchOutcome::Dropped { last_seq })
+    }
+  }
+
   pub fn process_pending(&mut self) {
     // Reset the doorbell to empty *before* reading the buffer state, so that any
     // sample admitted concurrently re-arms the (edge-triggered) doorbell and we
@@ -516,6 +678,36 @@ impl Writer {
       }
       let sequence_number = self.last_sent.plus_1();
 
+      // Item 1 (DATA aggregation): coalesce several consecutive small samples
+      // into one datagram to amortize the per-sample RTPS header + syscall.
+      // Only engaged when starting a sample fresh (no mid-fragment resume),
+      // in push mode, and with security off (per-reader crypto complicates
+      // batching). `try_send_aggregated_batch` returns None when the first
+      // sample is not eligible (fragmented or destined to a single reader), in
+      // which case we fall through to the per-sample path below.
+      if self.push_mode && self.sample_cursor == SampleCursor::Fresh && self.security_plugins.is_none()
+      {
+        match self.try_send_aggregated_batch(sequence_number, last_available) {
+          Some(BatchOutcome::Sent { last_seq }) | Some(BatchOutcome::Dropped { last_seq }) => {
+            // Coalesced samples are multicast-to-all, so per-reader `unsent`
+            // bookkeeping is a no-op (notify + mark_sent cancel out); just
+            // advance the frontier. Leaves `unsent_changes` empty on the push
+            // path, exactly like the per-sample path after the Item 5 fix.
+            self.last_sent = last_seq;
+            self.sample_cursor = SampleCursor::Fresh;
+            self.send_buffer.set_sent_frontier(last_seq);
+            continue;
+          }
+          Some(BatchOutcome::Blocked { blocked }) => {
+            // All-or-nothing: do not advance `last_sent`; the event loop resumes
+            // us on write readiness and the batch is rebuilt from `sequence_number`.
+            self.blocked_sockets.extend(blocked);
+            return;
+          }
+          None => { /* first sample not aggregatable; use the per-sample path */ }
+        }
+      }
+
       // Fetch an owned clone of the sample (cheap, Bytes-backed) so we hold the
       // buffer lock only momentarily and can serialize/send without it.
       let Some(cc) = self.send_buffer.get_by_sn(sequence_number) else {
@@ -524,6 +716,7 @@ impl Writer {
         self.last_sent = sequence_number;
         self.sample_cursor = SampleCursor::Fresh;
         self.send_buffer.set_sent_frontier(sequence_number);
+        self.mark_change_sent_to_all_readers(sequence_number);
         continue;
       };
       let write_options = cc.write_options.clone();
@@ -566,6 +759,7 @@ impl Writer {
             self.last_sent = sequence_number;
             self.sample_cursor = SampleCursor::Fresh;
             self.send_buffer.set_sent_frontier(sequence_number);
+            self.mark_change_sent_to_all_readers(sequence_number);
           }
           SendProgress::Blocked { cursor, blocked } => {
             // Reliable writers always back-pressure. Best-effort writers only if
@@ -585,6 +779,7 @@ impl Writer {
             self.last_sent = sequence_number;
             self.sample_cursor = SampleCursor::Fresh;
             self.send_buffer.set_sent_frontier(sequence_number);
+            self.mark_change_sent_to_all_readers(sequence_number);
           }
         }
       } else {
