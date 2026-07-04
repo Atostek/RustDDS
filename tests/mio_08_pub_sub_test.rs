@@ -1,3 +1,4 @@
+#![cfg(feature = "mio_08")]
 use log::error;
 use mio_08::{Events, Interest, Poll, Token};
 use serde::{Deserialize, Serialize};

@@ -889,6 +889,7 @@ where
     self.status_receiver.as_status_evented()
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.status_receiver.as_status_source()
   }

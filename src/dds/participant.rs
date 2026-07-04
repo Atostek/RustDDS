@@ -14,6 +14,7 @@ use std::{
 
 use mio_extras::channel as mio_channel;
 use mio_06::{self, Evented};
+#[cfg(feature = "mio_08")]
 use mio_08::{Interest, Registry};
 use futures::stream::{FusedStream, Stream};
 #[allow(unused_imports)]
@@ -546,6 +547,7 @@ impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatus
     self
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self
   }
@@ -566,6 +568,7 @@ impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatus
   }
 }
 
+#[cfg(feature = "mio_08")]
 impl mio_08::event::Source for DomainParticipantStatusListener {
   fn register(
     &mut self,

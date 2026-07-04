@@ -58,7 +58,7 @@ fn get_local_unicast_locators_inner(
 pub fn get_local_multicast_ip_addrs_filtered(
   only_networks: Option<&[IpAddr]>,
 ) -> io::Result<Vec<IpAddr>> {
-  let interfaces = pnet::datalink::interfaces();
+  let interfaces = pnet_datalink::interfaces();
   Ok(get_local_multicast_ip_addrs_inner(
     interfaces,
     only_networks,
@@ -68,7 +68,7 @@ pub fn get_local_multicast_ip_addrs_filtered(
 /// Inner implementation of [`get_local_multicast_ip_addrs_filtered`], factored
 /// out so tests can supply a mock interface list.
 fn get_local_multicast_ip_addrs_inner(
-  interfaces: Vec<pnet::datalink::NetworkInterface>,
+  interfaces: Vec<pnet_datalink::NetworkInterface>,
   only_networks: Option<&[IpAddr]>,
 ) -> Vec<IpAddr> {
   interfaces
@@ -89,11 +89,11 @@ fn get_local_multicast_ip_addrs_inner(
 /// into the interface identity our sender uses (its IP). Prefers an IPv4
 /// address so the result matches the keys of the multicast sender sockets.
 pub fn build_ifindex_to_interface_map() -> HashMap<u32, InterfaceSelector> {
-  build_ifindex_map_inner(pnet::datalink::interfaces())
+  build_ifindex_map_inner(pnet_datalink::interfaces())
 }
 
 fn build_ifindex_map_inner(
-  interfaces: Vec<pnet::datalink::NetworkInterface>,
+  interfaces: Vec<pnet_datalink::NetworkInterface>,
 ) -> HashMap<u32, InterfaceSelector> {
   let mut map = HashMap::new();
   for iface in interfaces {
@@ -120,10 +120,8 @@ mod tests {
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
   };
 
-  use pnet::{
-    datalink::{InterfaceType, NetworkInterface},
-    ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network},
-  };
+  use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
+  use pnet_datalink::{InterfaceType, NetworkInterface};
 
   use crate::structure::locator::Locator;
 

@@ -20,6 +20,15 @@ categories = ["network-programming", "science::robotics"]
 # the science-robotics category is because of ROS2
 
 [features]
+# Feature "mio_08" exposes integration with the "mio" crate version 0.8.x:
+# DataReaders/DataWriters implement `mio_08::event::Source` so they can be
+# registered directly with a mio-0.8 `Poll`. When disabled, RustDDS still
+# supports synchronous polling via mio-0.6 (`Evented`) and asynchronous polling
+# via `futures::Stream`. Disabling this feature drops the `mio` (0.8) and
+# `socketpair` dependencies (and their transitive deps).
+# NOTE: this feature is NOT enabled by default.
+mio_08 = ["dep:mio_08", "dep:socketpair"]
+
 # Feature "security" implements the OMG "DDS Security" specification v 1.1
 # It adds a large amount of new code and dependencies.
 security = [
@@ -40,8 +49,8 @@ build_openssl = ["openssl?/vendored"]
 mio_06 = { package = "mio" , version ="^0.6.23" } 
 mio-extras = "2.0.6"
 
-mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"] } 
-socketpair = "0.19"
+mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"], optional = true } 
+socketpair = { version = "0.19", optional = true }
 
 bit-vec = "0.8.0"
 speedy = "0.8.0"
@@ -65,7 +74,6 @@ thiserror = "2.0.9"
 cdr-encoding = { version="0.11" }
 cdr-encoding-size = { version="^0.5" }
 futures = "0.3"
-io-extras = "0.18.0"
 
 # For DDS Security:
 serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated XML config files
@@ -82,8 +90,10 @@ bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 const-oid = { version = "0.9" , optional = true } # more ASN.1
 openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.10", optional = true }
-pnet = { version = "0.35.0", default-features = false, features = ["std", "pnet_datalink"] }
-pnet_sys = { version = "0.35.0", default-features = false }
+# Only the datalink sub-crate is needed (interface enumeration). The `pnet`
+# meta-crate additionally drags in packet parsing (pnet_packet -> pnet_macros ->
+# regex), which we do not use.
+pnet_datalink = { version = "0.35.0", default-features = false, features = ["std"] }
 
 
 [target.'cfg(windows)'.dependencies]
@@ -103,6 +113,10 @@ env_logger = "0.11"
 test-log = "0.2.20"
 hex-literal = "1.0"
 anyhow = "1.0" # for test cases
+
+# Only used by unit tests in src/network/util.rs (interface flags & mock IpNetworks)
+pnet_sys = { version = "0.35.0", default-features = false }
+ipnetwork = "0.20"
 
 # ros_visualizer
 crossterm = "0.29"
@@ -127,3 +141,10 @@ procfs = "0.17" # for ddsperf
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = "0.2" # for ddsperf CPU/RSS reporting on macOS
+
+# This example registers RustDDS entities with a mio-0.8 Poll, so it needs the
+# optional "mio_08" feature (and thus the mio-0.8 crate) to build.
+[[example]]
+name = "shapes_demo_mio_08"
+path = "examples/shapes_demo_mio_08/main.rs"
+required-features = ["mio_08"]

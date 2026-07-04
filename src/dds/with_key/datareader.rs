@@ -781,6 +781,7 @@ where
   }
 }
 
+#[cfg(feature = "mio_08")]
 impl<D, DA> mio_08::event::Source for DataReader<D, DA>
 where
   D: Keyed,
@@ -834,6 +835,7 @@ where
     self.simple_data_reader.as_status_evented()
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.simple_data_reader.as_status_source()
   }

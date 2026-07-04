@@ -28,11 +28,11 @@ use crate::{
 
 #[derive(Debug)]
 pub struct UDPSender {
-  unicast_socket: mio_08::net::UdpSocket,
+  unicast_socket: UdpSocket,
   // One multicast sender socket per local interface, keyed by the interface it
   // was bound to (its `InterfaceSelector`). This lets us target a single
   // interface instead of sending on all of them.
-  multicast_sockets: Vec<(InterfaceSelector, mio_08::net::UdpSocket)>,
+  multicast_sockets: Vec<(InterfaceSelector, UdpSocket)>,
 
   // nonblocking-transmit: per-socket never-dropped control queue. A control
   // datagram is enqueued only when its socket is currently congested
@@ -51,7 +51,10 @@ impl UDPSender {
   pub fn new_with_networks(sender_port: u16, only_networks: Option<&[IpAddr]>) -> io::Result<Self> {
     let unicast_socket = {
       let saddr: SocketAddr = SocketAddr::new("0.0.0.0".parse().unwrap(), sender_port);
-      mio_08::net::UdpSocket::bind(saddr)?
+      let socket = UdpSocket::bind(saddr)?;
+      // nonblocking-transmit: the socket must never stall the event loop.
+      socket.set_nonblocking(true)?;
+      socket
     };
 
     // We set multicasting loop on so that we can hear other DomainParticipant
@@ -118,10 +121,7 @@ impl UDPSender {
         }
       };
 
-      multicast_sockets.push((
-        InterfaceSelector::Ip(multicast_if_ipaddr),
-        mio_08::net::UdpSocket::from_std(mc_socket),
-      ));
+      multicast_sockets.push((InterfaceSelector::Ip(multicast_if_ipaddr), mc_socket));
     } // end for
 
     let sender = Self {
@@ -140,7 +140,7 @@ impl UDPSender {
 
   // --- nonblocking-transmit: socket enumeration & raw non-blocking send ------
 
-  fn socket_ref(&self, id: SocketId) -> Option<&mio_08::net::UdpSocket> {
+  fn socket_ref(&self, id: SocketId) -> Option<&UdpSocket> {
     match id {
       SocketId::Unicast => Some(&self.unicast_socket),
       SocketId::Multicast(i) => self.multicast_sockets.get(i).map(|(_, s)| s),
