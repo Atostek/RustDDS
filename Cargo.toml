@@ -63,7 +63,6 @@ byteorder = { version = "1.3", features = ["i128"] }
 rand = "0.9.0"
 chrono = { version = "0.4", features = ["serde"] }
 enumflags2 = { version = "0.7.7", features = ["serde"] }
-if-addrs = "0.14"
 pastey = "0.2"
 md5 = "0.8.0"
 socket2 = { version = "0.6", features = ["all"] }
@@ -90,14 +89,9 @@ bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 const-oid = { version = "0.9" , optional = true } # more ASN.1
 openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.10", optional = true }
-# Only the datalink sub-crate is needed (interface enumeration). The `pnet`
-# meta-crate additionally drags in packet parsing (pnet_packet -> pnet_macros ->
-# regex), which we do not use.
-pnet_datalink = { version = "0.35.0", default-features = false, features = ["std"] }
-
-
 [target.'cfg(windows)'.dependencies]
-local-ip-address = "0.6.1"
+# Interface enumeration on Windows. On Unix we use nix::ifaddrs instead.
+if-addrs = "0.14"
 
 [target.'cfg(unix)'.dependencies]
 # Used to capture the receiving interface of incoming UDP datagrams via
@@ -113,10 +107,6 @@ env_logger = "0.11"
 test-log = "0.2.20"
 hex-literal = "1.0"
 anyhow = "1.0" # for test cases
-
-# Only used by unit tests in src/network/util.rs (interface flags & mock IpNetworks)
-pnet_sys = { version = "0.35.0", default-features = false }
-ipnetwork = "0.20"
 
 # ros_visualizer
 crossterm = "0.29"

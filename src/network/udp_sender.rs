@@ -12,8 +12,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-#[cfg(windows)]
-use local_ip_address::list_afinet_netifas;
 
 use crate::{
   network::util::get_local_multicast_ip_addrs_filtered,
