@@ -82,6 +82,12 @@ struct Shared {
   writer_guid: GUID,
   reliable_writer: bool,
   is_builtin: bool,
+  // True for VOLATILE durability (the DDS default). When true, a reliable writer
+  // with no matched reliable reader trims KeepLast on insert (there is no
+  // late-joiner to serve, so retaining unacked samples is pointless). When false
+  // (TRANSIENT_LOCAL / TRANSIENT / PERSISTENT) the writer must retain samples for
+  // late-joining readers, so pre-match trimming is disabled.
+  volatile: bool,
   topic_name: String,
 }
 
@@ -105,6 +111,7 @@ impl WriterSendBuffer {
     topic_name: String,
     reliable_writer: bool,
     is_builtin: bool,
+    volatile: bool,
     window_limit: usize,
     backlog_limit: usize,
     max_retain: usize,
@@ -127,6 +134,7 @@ impl WriterSendBuffer {
         writer_guid,
         reliable_writer,
         is_builtin,
+        volatile,
         topic_name,
       }),
     }
@@ -262,15 +270,26 @@ impl WriterSendBuffer {
     inner.changes.insert(seq, cc);
     inner.last_seq = seq;
 
-    // KeepLast "newest wins" bound for non-blocking (best-effort default)
-    // writes. These are never throttled at admission (`has_room` returns true),
-    // and the only other eviction path is the periodic cache-cleaning timer,
-    // which starves under a sustained flood -- so without this the buffer grows
-    // without bound (confirmed multi-GB leak). Reliable / opted-in writers are
-    // exempt: they are already bounded by the send window / unsent backlog and
-    // must retain unacknowledged samples for repair, so we never drop here.
-    // Built-in (discovery) writers are also exempt to never lose discovery data.
-    if !may_block && !shared.is_builtin {
+    // KeepLast "newest wins" bound. Applied on insert for:
+    //  - non-blocking best-effort writes: never throttled at admission
+    //    (`has_room` returns true), and the only other eviction path is the
+    //    periodic cache-cleaning timer, which starves under a sustained flood --
+    //    so without this the buffer grows without bound (confirmed multi-GB leak);
+    //  - reliable writers with NO matched reliable reader yet: there is nobody to
+    //    repair to, so retaining unacknowledged samples is pointless. A reliable
+    //    writer that produces flat-out before discovery completes (discovery is
+    //    CPU-starved under load and can lag ~1 s) would otherwise race thousands
+    //    of samples ahead, and when the reader finally matches it faces a huge
+    //    unacknowledged backlog that must be recovered via repair at the slow
+    //    (100 ms) heartbeat cadence -- collapsing reliable throughput. Trimming to
+    //    KeepLast here keeps only the recent samples (correct for volatile
+    //    durability); once a reliable reader matches, `reliable_readers_present`
+    //    flips true and we retain everything again for repair.
+    // Built-in (discovery) writers are always exempt to never lose discovery data.
+    let trim_keep_last = !shared.is_builtin
+      && (!may_block
+        || (shared.reliable_writer && shared.volatile && !inner.reliable_readers_present));
+    if trim_keep_last {
       while inner.changes.len() > inner.max_retain {
         // BTreeMap keeps keys sorted, so the first entry is the oldest SN.
         let oldest = match inner.changes.keys().next().copied() {
@@ -455,6 +474,7 @@ mod tests {
       "t".to_string(),
       /* reliable_writer */ false,
       /* is_builtin */ false,
+      /* volatile */ true,
       /* window_limit */ 1000,
       /* backlog_limit */ 2,
       /* max_retain */ 1000,
@@ -482,6 +502,7 @@ mod tests {
       "t".to_string(),
       /* reliable_writer */ false,
       /* is_builtin */ false,
+      /* volatile */ true,
       /* window_limit */ 1000,
       /* backlog_limit */ 1,
       /* max_retain */ 1000,
@@ -501,6 +522,7 @@ mod tests {
       "t".to_string(),
       false,
       /* is_builtin */ true,
+      /* volatile */ true,
       1000,
       /* backlog_limit */ 1,
       /* max_retain */ 1000,
@@ -524,6 +546,7 @@ mod tests {
       "t".to_string(),
       /* reliable_writer */ false,
       /* is_builtin */ false,
+      /* volatile */ true,
       /* window_limit */ 1000,
       /* backlog_limit */ 1000,
       max_retain,
@@ -547,16 +570,18 @@ mod tests {
     assert!(buf.get_by_sn(SequenceNumber::new(1)).is_none());
   }
 
-  // Reliable writers must NOT drop on insert (they retain for repair); the
-  // `max_retain` bound applies only to non-blocking best-effort writes.
+  // A durable (non-VOLATILE) reliable writer must NOT drop on insert even before
+  // a reader matches: it retains samples for late-joining readers. The
+  // `max_retain` bound does not apply to it.
   #[test]
-  fn reliable_writer_not_trimmed_by_max_retain() {
+  fn durable_reliable_writer_not_trimmed_before_match() {
     let max_retain = 2;
     let buf = WriterSendBuffer::new(
       GUID::GUID_UNKNOWN,
       "t".to_string(),
       /* reliable_writer */ true,
       /* is_builtin */ false,
+      /* volatile */ false, // TRANSIENT_LOCAL etc: keep for late joiners
       /* window_limit */ 1000,
       /* backlog_limit */ 1000,
       max_retain,
@@ -565,8 +590,44 @@ mod tests {
     for _ in 0..10 {
       assert!(admit_now(&buf, WriteOptions::default()));
     }
-    // Reliable path keeps everything for potential repair despite tiny
-    // max_retain.
+    // Durable path keeps everything for potential late-joiner delivery / repair
+    // despite tiny max_retain.
     assert_eq!(buf.retained_len(), 10);
+  }
+
+  // A VOLATILE reliable writer with no matched reliable reader trims KeepLast on
+  // insert: there is no late joiner to serve, so retaining unacknowledged samples
+  // is pointless and would create a huge post-match repair backlog (the reliable
+  // flat-out throughput fix). Once a reliable reader matches
+  // (`set_acked_frontier(Some(..))`), trimming stops and everything is retained
+  // for repair.
+  #[test]
+  fn volatile_reliable_writer_trimmed_until_reader_matches() {
+    let max_retain = 4;
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      /* reliable_writer */ true,
+      /* is_builtin */ false,
+      /* volatile */ true,
+      /* window_limit */ 1000,
+      /* backlog_limit */ 1000,
+      max_retain,
+    );
+    // No reliable reader yet: admitted freely (backlog has room) but trimmed to
+    // KeepLast so the buffer cannot balloon before discovery completes.
+    for _ in 0..100 {
+      assert!(admit_now(&buf, WriteOptions::default()));
+      assert!(buf.retained_len() <= max_retain);
+    }
+    assert_eq!(buf.retained_len(), max_retain);
+
+    // A reliable reader matches: from now on the writer retains everything for
+    // repair (no trimming), even past max_retain.
+    buf.set_acked_frontier(Some(SequenceNumber::new(101)));
+    for _ in 0..10 {
+      assert!(admit_now(&buf, WriteOptions::default()));
+    }
+    assert_eq!(buf.retained_len(), max_retain + 10);
   }
 }

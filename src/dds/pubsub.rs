@@ -505,11 +505,21 @@ impl InnerPublisher {
     // window (History depth / ResourceLimits / default), so the writer never
     // retains more than the application's configured history requires.
     let max_retain = window_limit;
+    // Default durability is VOLATILE (DDS v1.4 2.2.3). Only VOLATILE reliable
+    // writers may trim KeepLast before a reader matches; durable writers must
+    // retain samples for late joiners.
+    let volatile = matches!(
+      writer_qos
+        .durability()
+        .unwrap_or(policy::Durability::Volatile),
+      policy::Durability::Volatile
+    );
     let send_buffer = WriterSendBuffer::new(
       guid,
       topic.name(),
       writer_qos.is_reliable(),
       guid.entity_id.entity_kind.is_built_in(),
+      volatile,
       window_limit,
       backlog_limit,
       max_retain,

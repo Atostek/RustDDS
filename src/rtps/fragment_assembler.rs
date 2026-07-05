@@ -138,6 +138,17 @@ impl AssemblyBuffer {
   }
 }
 
+// Upper bound on the number of concurrent (incomplete) reassembly buffers kept
+// per writer. Fragments belonging to one sample normally arrive back-to-back, so
+// only a handful of samples are ever mid-reassembly at once; this cap is far
+// above that. Its purpose is to bound memory when samples never complete, e.g.
+// under best-effort overload where fragments are dropped: without it, one
+// incomplete `AssemblyBuffer` (a full sample-sized allocation) accrues per lost
+// sample and is only reclaimed by a 10 s idle timeout, growing to gigabytes.
+// When exceeded we evict the oldest (lowest sequence number) buffer, which under
+// best effort is lost anyway and under reliable will be re-requested.
+const MAX_ASSEMBLY_BUFFERS: usize = 128;
+
 // Assembles fragments from a single (remote) Writer
 // So there is only one sequence of SNs
 pub(crate) struct FragmentAssembler {
@@ -203,6 +214,13 @@ impl FragmentAssembler {
       }
     } else {
       debug!("new_dataFrag: FRAGMENT NOT COMPLETED YET");
+      // Bound memory: never keep more than MAX_ASSEMBLY_BUFFERS incomplete
+      // reassemblies. Evict the oldest (lowest SN) first; those are the least
+      // likely to still complete (their remaining fragments are long gone under
+      // best effort, and will be re-requested under reliable).
+      while self.assembly_buffers.len() > MAX_ASSEMBLY_BUFFERS {
+        self.assembly_buffers.pop_first();
+      }
       None
     }
   }
