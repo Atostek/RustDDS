@@ -265,9 +265,25 @@ fn main() {
   let topic_name = args.topic.clone();
   let color = args.color.clone().unwrap_or_else(|| "BLUE".to_owned());
 
-  let domain_participant = DomainParticipantBuilder::new(args.domain_id)
-    .build()
-    .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"));
+  let domain_participant = {
+    let mut builder = DomainParticipantBuilder::new(args.domain_id);
+    // RUSTDDS_IFACE: comma-separated local IPv4 addresses to restrict discovery
+    // and locators to a chosen physical interface (e.g. "192.168.1.161"). See
+    // note in the ddsperf example about the macOS same-host loopback caveat.
+    if let Ok(spec) = std::env::var("RUSTDDS_IFACE") {
+      let addrs: Vec<std::net::IpAddr> = spec
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+      if !addrs.is_empty() {
+        println!("shape_main: restricting to interfaces {addrs:?}");
+        builder = builder.with_only_networks(addrs);
+      }
+    }
+    builder
+      .build()
+      .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"))
+  };
 
   let qos = build_qos(&args);
 

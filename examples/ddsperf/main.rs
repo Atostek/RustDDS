@@ -12,6 +12,7 @@ use rustdds::{
   with_key::Sample,
   //DataWriterStatus,
   DataReaderStatus,
+  DomainParticipant,
   DomainParticipantBuilder,
   Keyed,
   QosPolicyBuilder,
@@ -83,9 +84,7 @@ fn main() {
   #[cfg(debug_assertions)]
   println!("-------\nNOTE: Running debug build for performace test. It will be slow.\n-------");
 
-  let domain_participant = DomainParticipantBuilder::new(0)
-    .build()
-    .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"));
+  let domain_participant = build_participant(0);
 
   let qos = QosPolicyBuilder::new()
     .history(History::KeepLast { depth: 16 })
@@ -471,6 +470,29 @@ fn main() {
     } // Pong
   } // match main_mode
 } // fn
+
+// Build the DomainParticipant, optionally restricting it to specific local
+// network interfaces. Set RUSTDDS_IFACE to a comma-separated list of local IPv4
+// addresses (e.g. "192.168.1.161") to force discovery/locators onto a chosen
+// physical interface instead of every interface. NB: on a single host, traffic
+// addressed to a local IP is still short-circuited through the kernel loopback
+// path, so this pins the advertised locator but does not change same-host MTU.
+fn build_participant(domain_id: u16) -> DomainParticipant {
+  let mut builder = DomainParticipantBuilder::new(domain_id);
+  if let Ok(spec) = std::env::var("RUSTDDS_IFACE") {
+    let addrs: Vec<std::net::IpAddr> = spec
+      .split(',')
+      .filter_map(|s| s.trim().parse().ok())
+      .collect();
+    if !addrs.is_empty() {
+      println!("ddsperf: restricting to interfaces {addrs:?}");
+      builder = builder.with_only_networks(addrs);
+    }
+  }
+  builder
+    .build()
+    .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"))
+}
 
 fn format_duration(d: Duration) -> String {
   let nanos = d.as_nanos();

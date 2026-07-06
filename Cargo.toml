@@ -19,6 +19,17 @@ repository = "https://github.com/Atostek/RustDDS"
 categories = ["network-programming", "science::robotics"] 
 # the science-robotics category is because of ROS2
 
+# Optimized build that still carries debug info (and, on macOS, a packed .dSYM)
+# so sampling profilers (xctrace / Instruments Time Profiler, samply, perf) can
+# symbolicate the hot path. Build the perf examples with:
+#   cargo build --profile profiling --example ddsperf --example shape_main
+# Binaries land in target/profiling/examples/. Used by scripts/perf_profile.sh.
+[profile.profiling]
+inherits = "release"
+debug = true
+split-debuginfo = "packed"
+strip = false
+
 [features]
 # Feature "mio_08" exposes integration with the "mio" crate version 0.8.x:
 # DataReaders/DataWriters implement `mio_08::event::Source` so they can be

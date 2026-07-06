@@ -31,25 +31,47 @@ LOGDIR="$OUTDIR/logs"
 SUMMARY="$OUTDIR/SUMMARY.csv"
 mkdir -p "$LOGDIR"
 
-# --- Force loopback UDP, multicast off, no shared memory --------------------
-CFG="$OUTDIR/cyclone_loopback.xml"
-printf '%s\n' \
+# --- Force a specific interface, multicast off, no shared memory ------------
+# Env knobs (defaults keep the historical loopback behaviour):
+#   IFACE    network interface name to bind CycloneDDS to        (lo0)
+#   PEER_IP  unicast discovery peer address on that interface    (127.0.0.1)
+#   MAX_MSG  optional Internal/MaxMessageSize, e.g. "1472B" to    (unset)
+#            emulate a 1500-byte Ethernet MTU. On loopback the real
+#            path MTU is huge (macOS lo0 = 16384), so CycloneDDS otherwise
+#            packs many DATA submessages into one large UDP datagram; capping
+#            MaxMessageSize forces ~one 1 KB sample per datagram as it would be
+#            on a 1500-MTU wire.
+IFACE="${IFACE:-lo0}"
+PEER_IP="${PEER_IP:-127.0.0.1}"
+MAX_MSG="${MAX_MSG:-}"
+
+INTERNAL_BLOCK=""
+if [ -n "$MAX_MSG" ]; then
+  INTERNAL_BLOCK="    <Internal><MaxMessageSize>${MAX_MSG}</MaxMessageSize></Internal>"
+fi
+
+CFG="$OUTDIR/cyclone_${IFACE}.xml"
+{
+  printf '%s\n' \
 '<?xml version="1.0" encoding="UTF-8" ?>' \
 '<CycloneDDS xmlns="https://cdds.io/config">' \
 '  <Domain Id="any">' \
 '    <General>' \
 '      <Interfaces>' \
-'        <NetworkInterface name="lo0" priority="default" multicast="false"/>' \
+"        <NetworkInterface name=\"${IFACE}\" priority=\"default\" multicast=\"false\"/>" \
 '      </Interfaces>' \
 '      <AllowMulticast>false</AllowMulticast>' \
 '      <EnableMulticastLoopback>false</EnableMulticastLoopback>' \
-'    </General>' \
+'    </General>'
+  [ -n "$INTERNAL_BLOCK" ] && printf '%s\n' "$INTERNAL_BLOCK"
+  printf '%s\n' \
 '    <Discovery>' \
-'      <Peers><Peer address="127.0.0.1"/></Peers>' \
+"      <Peers><Peer address=\"${PEER_IP}\"/></Peers>" \
 '      <ParticipantIndex>auto</ParticipantIndex>' \
 '    </Discovery>' \
 '  </Domain>' \
-'</CycloneDDS>' > "$CFG"
+'</CycloneDDS>'
+} > "$CFG"
 export CYCLONEDDS_URI="file://$CFG"
 
 if [ ! -x "$DDSPERF" ]; then
@@ -60,7 +82,7 @@ fi
 echo "CycloneDDS perf reference"
 echo "  ddsperf:  $DDSPERF"
 echo "  version:  $(git -C "$CYC_DIR" describe --tags --always 2>/dev/null)"
-echo "  config:   $CFG (loopback UDP, no multicast, no SHM)"
+echo "  config:   $CFG (iface=$IFACE peer=$PEER_IP${MAX_MSG:+ MaxMessageSize=$MAX_MSG}, no multicast, no SHM)"
 echo "  results:  $OUTDIR"
 echo
 
