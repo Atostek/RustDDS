@@ -25,13 +25,13 @@ use crate::{
     },
   },
   messages::submessages::submessages::AckSubmessage,
-  network::udp_sender::UDPSender,
+  network::{udp_sender::UDPSender, util::IfAddr},
   polling::SharedTimer,
   rtps::{
     constant::{
-      DEFAULT_WRITER_MAX_SAMPLES, HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW,
-      HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE, MAX_AGGREGATED_DATAGRAM_SIZE, NACK_RESPONSE_DELAY,
-      NACK_SUPPRESSION_DURATION,
+      DEFAULT_WRITER_MAX_SAMPLES, FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, FRAGMENT_SIZE,
+      HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW, HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE,
+      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION,
     },
     outbound::{SocketId, TrafficClass},
     rtps_reader_proxy::RtpsReaderProxy,
@@ -46,7 +46,7 @@ use crate::{
     entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
     locator::Locator,
-    sequence_number::{FragmentNumber, FragmentNumberRange, SequenceNumber},
+    sequence_number::{FragmentNumber, SequenceNumber},
     time::Timestamp,
   },
 };
@@ -213,6 +213,17 @@ pub(crate) struct Writer {
   // when (re)resolving each reader proxy's SendRoute.
   interface_observations: Rc<RefCell<InterfaceObservations>>,
 
+  // Snapshot of the local interface table (shared, read-only), used to resolve
+  // each matched reader's per-peer path-MTU budget when its locators change.
+  local_interfaces: Rc<[IfAddr]>,
+
+  // Minimum per-peer datagram-payload budget over all matched readers. The
+  // aggregated / packed datagram is a single packet shared by every reader
+  // (sent to `EntityId::UNKNOWN`), so it must fit the smallest reader's path
+  // MTU. Recomputed whenever a reader is added, updated, or removed. Falls back
+  // to `FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE` when there are no matched readers.
+  min_datagram_payload: usize,
+
   // By default, this writer is a StatefulWriter (see RTPS spec section 8.4.9)
   // If like_stateless is true, then the writer mimics the behavior of a Best-Effort
   // StatelessWriter. This behavior is needed only for a single built-in discovery topic of
@@ -266,6 +277,7 @@ impl Writer {
     timed_event_timer: SharedTimer<DpTimerEvent>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     interface_observations: Rc<RefCell<InterfaceObservations>>,
+    local_interfaces: Rc<[IfAddr]>,
   ) -> Self {
     // If writer should behave statelessly, only BestEffort QoS is currently
     // supported
@@ -332,9 +344,10 @@ impl Writer {
       nackfrag_response_delay: NACK_RESPONSE_DELAY, // default value from dp_event_loop
       repairfrags_continue_delay: std::time::Duration::from_millis(1),
       nack_suppression_duration: NACK_SUPPRESSION_DURATION,
-      data_max_size_serialized: 1024,
-      // ^^ TODO: Maybe a smarter selection would be in order.
-      // We should get the minimum over all outgoing interfaces.
+      // Constant RTPS fragment size. Must be fixed per Writer and identical for
+      // all remote Readers (RTPS v2.5 8.4.14.1.1); per-peer MTU only changes how
+      // many fragments we pack per DATAFRAG/datagram, never this size.
+      data_max_size_serialized: FRAGMENT_SIZE,
       my_guid: i.guid,
       doorbell_registration: i.doorbell_registration,
       doorbell: i.doorbell,
@@ -343,6 +356,8 @@ impl Writer {
       requested_incompatible_qos_count: 0,
       udp_sender,
       interface_observations,
+      local_interfaces,
+      min_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
       my_topic_name: i.topic_name,
       send_buffer: i.send_buffer,
       last_sent: SequenceNumber::zero(),
@@ -503,6 +518,17 @@ impl Writer {
   // --------------------------------------------------------------
   // --------------------------------------------------------------
   // --------------------------------------------------------------
+  // Per-peer UDP-payload budget (bytes for RTPS submessages in one datagram)
+  // for a send: the specific reader's resolved path-MTU budget for a directed
+  // send, or the writer-wide minimum over all matched readers for a
+  // multicast-to-all send (one datagram shared by every reader).
+  fn datagram_budget(&self, target_reader_opt: Option<&RtpsReaderProxy>) -> usize {
+    match target_reader_opt {
+      Some(reader) => reader.max_datagram_payload(),
+      None => self.min_datagram_payload,
+    }
+  }
+
   fn num_frags_and_frag_size(&self, payload_size: usize) -> (u32, u16) {
     let fragment_size = self.data_max_size_serialized as u32; // TODO: overflow check
     let data_size = payload_size as u32; // TODO: overflow check
@@ -616,10 +642,12 @@ impl Writer {
       );
 
       // Always include the first sample (even if it alone exceeds the budget, so
-      // we make progress); otherwise stop before overflowing the datagram.
+      // we make progress); otherwise stop before overflowing the datagram. The
+      // budget is the minimum per-peer path-MTU over all matched readers, since
+      // this datagram is multicast to all of them.
       if count > 0
         && builder.len_serialized() + sample.submessage_bytes_len() + hb_reserve
-          > MAX_AGGREGATED_DATAGRAM_SIZE
+          > self.min_datagram_payload
       {
         break;
       }
@@ -1430,6 +1458,9 @@ impl Writer {
           reader_guid.entity_id, // reader
           self.my_guid,          // writer
           frag_num,
+          // Repair responds to specifically-NACKed fragment numbers (possibly
+          // non-contiguous), so retransmit one fragment per submessage.
+          1,
           fragment_size as u16, // TODO: overflow check
           data_size,
           self.endianness,
@@ -1862,12 +1893,14 @@ impl Writer {
       .entry(updated_reader_proxy.remote_reader_guid)
       .and_modify(|rp| {
         rp.update(updated_reader_proxy, &self.my_topic_name);
-        // Locators may have changed; refresh the interface-aware send route.
+        // Locators may have changed; refresh the interface-aware send route and
+        // the per-peer path-MTU budget.
         rp.resolve_send_route(
           &self.interface_observations.borrow(),
           &multicast_ifaces,
           &DefaultRouteSelector,
         );
+        rp.resolve_path_mtu(&self.local_interfaces);
       })
       .or_insert_with(|| {
         is_new = true;
@@ -1883,9 +1916,26 @@ impl Writer {
           &multicast_ifaces,
           &DefaultRouteSelector,
         );
+        new_proxy.resolve_path_mtu(&self.local_interfaces);
         new_proxy
       });
+    // A reader was added or its locators changed: refresh the writer-wide
+    // minimum datagram budget used for packing.
+    self.recompute_min_datagram_payload();
     is_new
+  }
+
+  /// Recompute [`min_datagram_payload`](Self::min_datagram_payload) as the
+  /// minimum per-peer budget over all matched readers. The aggregated/packed
+  /// datagram is one packet multicast to every reader, so it must fit the
+  /// smallest path MTU. With no matched readers, fall back to the default.
+  fn recompute_min_datagram_payload(&mut self) {
+    self.min_datagram_payload = self
+      .readers
+      .values()
+      .map(RtpsReaderProxy::max_datagram_payload)
+      .min()
+      .unwrap_or(FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE);
   }
 
   /// Refresh the [`SendRoute`](crate::rtps::transmit::SendRoute) of every
@@ -1893,12 +1943,16 @@ impl Writer {
   /// observations for that participant may have arrived (e.g. periodic SPDP).
   pub fn recompute_routes_for(&mut self, prefix: GuidPrefix) {
     let multicast_ifaces = self.udp_sender.multicast_interfaces();
-    let observations = self.interface_observations.borrow();
-    for rp in self.readers.values_mut() {
-      if rp.remote_reader_guid.prefix == prefix {
-        rp.resolve_send_route(&observations, &multicast_ifaces, &DefaultRouteSelector);
+    {
+      let observations = self.interface_observations.borrow();
+      for rp in self.readers.values_mut() {
+        if rp.remote_reader_guid.prefix == prefix {
+          rp.resolve_send_route(&observations, &multicast_ifaces, &DefaultRouteSelector);
+          rp.resolve_path_mtu(&self.local_interfaces);
+        }
       }
     }
+    self.recompute_min_datagram_payload();
   }
 
   fn matched_reader_remove(&mut self, guid: GUID) -> Option<RtpsReaderProxy> {
@@ -1929,6 +1983,8 @@ impl Writer {
         guid
       );
       self.matched_reader_remove(guid);
+      // Removing a reader may relax (raise) the writer-wide minimum budget.
+      self.recompute_min_datagram_payload();
       // self.matched_readers_count_total -= 1; // this never decreases
       self.send_status(DataWriterStatus::PublicationMatched {
         total: CountWithChange::new(self.matched_readers_count_total, 0),
@@ -1989,6 +2045,49 @@ impl HasQoSPolicy for Writer {
   }
 }
 
+// Serialized overhead of one DATAFRAG submessage excluding its payload:
+// submessage header (4) + extraFlags (2) + octetsToInlineQos (2) + readerId (4)
+// + writerId (4) + writerSN (8) + fragmentStartingNum (4) +
+// fragmentsInSubmessage (2) + fragmentSize (2) + sampleSize (4) = 36 bytes.
+// Inline QoS (e.g. related sample identity) would add more; ignoring it only
+// risks a slight overestimate, which degrades to benign IP fragmentation rather
+// than data loss.
+const DATAFRAG_SUBMESSAGE_OVERHEAD: usize = 36;
+
+// Adaptive packing: how many contiguous fragments (starting at 1-based `start`)
+// to place in a single DATAFRAG submessage so the datagram stays within
+// `budget` bytes. `header_len` is the datagram size already committed (RTPS
+// header + optional INFO_TS/INFO_DST). The fragment *size* is constant; only
+// the count adapts. Always returns at least 1 (we emit progress even if a lone
+// fragment exceeds the budget, letting IP fragmentation handle the overflow).
+fn frags_per_datafrag(
+  header_len: usize,
+  budget: usize,
+  start: u32,
+  num_frags: u32,
+  fragment_size: u16,
+  data_size: usize,
+) -> u32 {
+  let fragment_size = fragment_size as usize;
+  let remaining_frags = num_frags - (start - 1);
+  // Bytes available in this datagram for the DATAFRAG payload.
+  let payload_cap = budget
+    .saturating_sub(header_len)
+    .saturating_sub(DATAFRAG_SUBMESSAGE_OVERHEAD);
+  // Bytes from the first fragment of this run to the end of the sample.
+  let start_byte = (start as usize - 1) * fragment_size;
+  let bytes_to_end = data_size.saturating_sub(start_byte);
+
+  let k = if payload_cap >= bytes_to_end {
+    // The rest of the sample (including a shorter final fragment) fits.
+    remaining_frags
+  } else {
+    // Only whole fragments fit; take as many as the budget allows (>= 1).
+    ((payload_cap / fragment_size) as u32).max(1)
+  };
+  k.min(remaining_frags)
+}
+
 struct FragmentationIter<'a> {
   writer: &'a Writer,
   cache_change: &'a CacheChange,
@@ -2024,10 +2123,11 @@ impl<'a> FragmentationIter<'a> {
         SampleCursor::Fresh => FragmentedState::TargetReader,
         SampleCursor::Frag(start) => {
           let (num_frags, fragment_size) = writer.num_frags_and_frag_size(data_size);
-          FragmentedState::Fragments(
-            FragmentNumber::range_inclusive(start, FragmentNumber::new(num_frags)),
+          FragmentedState::Fragments {
+            next: u32::from(start),
+            num_frags,
             fragment_size,
-          )
+          }
         }
         SampleCursor::Heartbeat => FragmentedState::Heartbeat,
       };
@@ -2059,7 +2159,15 @@ enum FragmentationIterState {
 
 enum FragmentedState {
   TargetReader,
-  Fragments(FragmentNumberRange, u16),
+  // Adaptive-packing DATAFRAG cursor: the next 1-based fragment number to send,
+  // the total fragment count, and the (constant) fragment size. Each `next()`
+  // emits one datagram carrying a single DATAFRAG submessage that packs as many
+  // contiguous fragments as the destination's path-MTU budget allows.
+  Fragments {
+    next: u32,
+    num_frags: u32,
+    fragment_size: u16,
+  },
   Heartbeat,
 }
 
@@ -2084,13 +2192,11 @@ impl<'a> Iterator for FragmentationIter<'a> {
         match state {
           FragmentedState::TargetReader => {
             let (num_frags, fragment_size) = writer.num_frags_and_frag_size(*data_size);
-            *state = FragmentedState::Fragments(
-              FragmentNumber::range_inclusive(
-                FragmentNumber::new(1),
-                FragmentNumber::new(num_frags),
-              ),
+            *state = FragmentedState::Fragments {
+              next: 1,
+              num_frags,
               fragment_size,
-            );
+            };
 
             // If sending to a single reader, add a GAP message with pending gaps if any
             if let Some(reader) = target_reader_opt {
@@ -2110,12 +2216,21 @@ impl<'a> Iterator for FragmentationIter<'a> {
             }
             self.next()
           }
-          FragmentedState::Fragments(fragments, fragment_size) => {
-            if let Some(frag_num) = fragments.next() {
+          FragmentedState::Fragments {
+            next,
+            num_frags,
+            fragment_size,
+          } => {
+            if *next <= *num_frags {
+              let start = *next;
+              let fragment_size = *fragment_size;
+              let num_frags = *num_frags;
+              let data_size = *data_size;
+
               let mut message_builder = MessageBuilder::new(); // fresh builder
 
               if let Some(src_ts) = cc.write_options.source_timestamp() {
-                // Add timestamp
+                // Add timestamp (applies to the DATAFRAG that follows).
                 message_builder = message_builder.ts_msg(writer.endianness, Some(src_ts));
               }
 
@@ -2125,20 +2240,40 @@ impl<'a> Iterator for FragmentationIter<'a> {
                   .dst_submessage(writer.endianness, reader.remote_reader_guid.prefix);
               }
 
+              // Per-peer datagram budget: the destination reader's path-MTU
+              // budget for a directed send, or the writer-wide minimum (over all
+              // matched readers) for a multicast-to-all send.
+              let budget = writer.datagram_budget(target_reader_opt);
+              // How many contiguous fragments (starting at `start`) fit in one
+              // DATAFRAG submessage within the remaining datagram budget. Fragment
+              // *size* is constant (RTPS rule); only the *count* per submessage
+              // adapts to the path MTU.
+              let k = frags_per_datafrag(
+                message_builder.len_serialized(),
+                budget,
+                start,
+                num_frags,
+                fragment_size,
+                data_size,
+              );
+
               message_builder = message_builder.data_frag_msg(
                 cc,
                 reader_entity_id, // reader
                 writer.my_guid,
-                frag_num,
-                *fragment_size,
-                (*data_size).try_into().unwrap(),
+                FragmentNumber::new(start),
+                k as u16,
+                fragment_size,
+                data_size.try_into().unwrap(),
                 writer.endianness,
                 writer.security_plugins.as_ref(),
               );
 
+              *next = start + k;
               let datafrag_msg = message_builder.add_header_and_build(writer.my_guid.prefix);
-              // If this fragment blocks, resume exactly here next time.
-              return Some((SampleCursor::Frag(frag_num), datafrag_msg));
+              // If this datagram blocks, resume from its first fragment next time
+              // (the same K is recomputed deterministically).
+              return Some((SampleCursor::Frag(FragmentNumber::new(start)), datafrag_msg));
             }
             *state = FragmentedState::Heartbeat;
             self.next()
@@ -2241,6 +2376,54 @@ mod tests {
 
   use byteorder::LittleEndian;
   use log::info;
+
+  use super::frags_per_datafrag;
+
+  // At a 1500-byte-MTU budget, a two-fragment "1 KB" sample (its serialized form
+  // is slightly over the 1024-byte fragment size) packs BOTH fragments into one
+  // DATAFRAG submessage, so it goes out in a single datagram instead of two.
+  #[test]
+  fn small_mtu_packs_1k_sample_into_one_datafrag() {
+    // header_len 20 (RTPS header only), budget 1452, fragment size 1024,
+    // sample 1036 bytes => 2 fragments.
+    assert_eq!(frags_per_datafrag(20, 1452, 1, 2, 1024, 1036), 2);
+  }
+
+  // A large sample at a 1500-byte MTU can only fit one 1024-byte fragment per
+  // datagram (2 * 1024 would overflow), so K collapses to 1.
+  #[test]
+  fn small_mtu_large_sample_one_fragment_per_datagram() {
+    assert_eq!(frags_per_datafrag(20, 1452, 1, 10, 1024, 10240), 1);
+  }
+
+  // A jumbo-frame budget packs several whole fragments per DATAFRAG.
+  #[test]
+  fn jumbo_mtu_packs_several_fragments() {
+    // budget 8952 (9000 MTU - 48), header 20 => payload_cap 8900 => 8 * 1024.
+    assert_eq!(frags_per_datafrag(20, 8952, 1, 10, 1024, 10240), 8);
+  }
+
+  // The final run (including the shorter tail fragment) is taken whole when it
+  // fits.
+  #[test]
+  fn tail_run_includes_partial_last_fragment() {
+    // Fragments 9 and 10 of a 10240-byte sample: 1024 + (partial) with a large
+    // budget => both fit.
+    assert_eq!(frags_per_datafrag(20, 100_000, 9, 10, 1024, 10240), 2);
+  }
+
+  // A pathologically small budget still emits at least one fragment (progress),
+  // accepting benign IP fragmentation for the overflow.
+  #[test]
+  fn tiny_budget_still_emits_one_fragment() {
+    assert_eq!(frags_per_datafrag(20, 100, 1, 5, 1024, 5120), 1);
+  }
+
+  // K never exceeds the number of fragments actually remaining.
+  #[test]
+  fn k_capped_by_remaining_fragments() {
+    assert_eq!(frags_per_datafrag(20, 100_000, 1, 3, 1024, 2600), 3);
+  }
 
   use crate::{
     dds::{

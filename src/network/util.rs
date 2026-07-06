@@ -1,110 +1,145 @@
 use std::{
   collections::HashMap,
   io,
-  net::{IpAddr, SocketAddr},
+  net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 use log::{error, warn};
 
-use crate::{rtps::transmit::InterfaceSelector, structure::locator::Locator};
+use crate::{
+  rtps::{
+    constant::{payload_budget_for_mtu, FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE},
+    transmit::InterfaceSelector,
+  },
+  structure::locator::Locator,
+};
 
 /// Platform-neutral view of one network-interface address.
 ///
-/// The interface-enumeration crates differ per platform (and expose different
-/// data), so we normalize into this small struct. The inner helper functions
-/// then operate on `IfAddr` alone, which keeps them free of any
-/// platform/enumeration dependency and makes them trivially unit-testable.
+/// [`netdev`] gives us a single cross-platform enumeration; we normalize its
+/// per-interface data into this small struct (one entry per assigned IP). The
+/// inner helper functions then operate on `IfAddr` alone, which keeps them free
+/// of any enumeration dependency and makes them trivially unit-testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IfAddr {
+pub(crate) struct IfAddr {
   /// An IP address bound to the interface.
-  ip: IpAddr,
-  /// OS interface index. `0` when unknown / not applicable (e.g. Windows,
-  /// where the index is not consumed).
-  index: u32,
-  is_loopback: bool,
-  /// Whether the interface is multicast-capable. On platforms that do not
-  /// expose the flag (Windows), this is approximated as "not loopback".
-  is_multicast: bool,
+  pub ip: IpAddr,
+  /// OS interface index. `0` when unknown / not applicable.
+  pub index: u32,
+  pub is_loopback: bool,
+  /// Whether the interface is multicast-capable.
+  pub is_multicast: bool,
+  /// IPv4 subnet mask for `ip` (only populated for IPv4 addresses). Used to
+  /// decide whether a peer is on the same subnet (i.e. reachable in one hop).
+  pub netmask: Option<Ipv4Addr>,
+  /// Interface MTU in bytes, when the OS reports it. Drives the per-peer
+  /// datagram-payload budget for same-subnet peers.
+  pub mtu: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
-// Platform-specific interface enumeration
+// Interface enumeration (cross-platform, via netdev)
 // ---------------------------------------------------------------------------
 
-/// Enumerate all interface addresses on Unix-like systems (Linux, macOS, BSD).
+/// Enumerate all interface addresses across platforms using [`netdev`].
 ///
-/// Uses `getifaddrs(3)` via the `nix` crate (already a dependency for
-/// `recvmsg`/`IP_PKTINFO`), so no dedicated interface-enumeration crate is
-/// needed here.
-#[cfg(unix)]
+/// `netdev::get_interfaces()` yields one [`netdev::Interface`] per interface
+/// with its index, MTU, loopback/multicast flags and the list of assigned
+/// IPv4/IPv6 prefixes. We flatten this into one [`IfAddr`] per assigned IP so
+/// the existing locator/multicast/ifindex helpers keep working unchanged, while
+/// the new fields (`netmask`, `mtu`) enable per-peer path-MTU resolution.
+///
+/// This is infallible in practice (netdev returns an empty list rather than an
+/// error), but the signature is kept as `io::Result` for API compatibility with
+/// the previous per-platform implementations.
 fn enumerate_interfaces() -> io::Result<Vec<IfAddr>> {
-  use nix::{
-    ifaddrs::getifaddrs,
-    net::if_::{if_nametoindex, InterfaceFlags},
-  };
-
-  let addrs = getifaddrs().map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-
-  // Cache name -> index so we call if_nametoindex once per interface.
-  let mut index_cache: HashMap<String, u32> = HashMap::new();
   let mut result = Vec::new();
 
-  for ifa in addrs {
-    let Some(ip) = ifa.address.and_then(sockaddr_to_ipaddr) else {
-      // Skip entries without an IP address (e.g. AF_PACKET link-layer on Linux).
-      continue;
-    };
+  for iface in netdev::get_interfaces() {
+    let index = iface.index;
+    let is_loopback = iface.is_loopback();
+    let is_multicast = iface.is_multicast();
+    let mtu = iface.mtu;
 
-    let index = *index_cache
-      .entry(ifa.interface_name.clone())
-      .or_insert_with(|| if_nametoindex(ifa.interface_name.as_str()).unwrap_or(0));
-
-    result.push(IfAddr {
-      ip,
-      index,
-      is_loopback: ifa.flags.contains(InterfaceFlags::IFF_LOOPBACK),
-      is_multicast: ifa.flags.contains(InterfaceFlags::IFF_MULTICAST),
-    });
+    for net in &iface.ipv4 {
+      result.push(IfAddr {
+        ip: IpAddr::V4(net.addr()),
+        index,
+        is_loopback,
+        is_multicast,
+        netmask: Some(net.netmask()),
+        mtu,
+      });
+    }
+    for net in &iface.ipv6 {
+      result.push(IfAddr {
+        ip: IpAddr::V6(net.addr()),
+        index,
+        is_loopback,
+        is_multicast,
+        // IPv4-only subnet matching for now; IPv6 peers fall back to default.
+        netmask: None,
+        mtu,
+      });
+    }
   }
 
   Ok(result)
 }
 
-/// Convert a `nix` `SockaddrStorage` into a `std` [`IpAddr`], if it is an
-/// IPv4 or IPv6 address.
-#[cfg(unix)]
-fn sockaddr_to_ipaddr(addr: nix::sys::socket::SockaddrStorage) -> Option<IpAddr> {
-  if let Some(v4) = addr.as_sockaddr_in() {
-    Some(IpAddr::V4(v4.ip()))
-  } else {
-    addr.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
+// ---------------------------------------------------------------------------
+// Per-peer path-MTU resolution
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the local interface table, used by writers to resolve a per-peer
+/// datagram budget. Built once (and refreshed on interface-set changes) and
+/// shared with each `Writer` via the event loop.
+pub fn local_interface_table() -> Vec<IfAddr> {
+  match enumerate_interfaces() {
+    Ok(ifaces) => ifaces,
+    Err(e) => {
+      error!("Cannot enumerate local interfaces for path-MTU resolution: {e:?}");
+      Vec::new()
+    }
   }
 }
 
-/// Enumerate all interface addresses on Windows.
+/// Resolve the per-peer UDP-payload budget (bytes available for RTPS submessages
+/// in one datagram) for `peer_ip`, using the "local egress-interface MTU"
+/// heuristic:
 ///
-/// Uses the `if-addrs` crate. Windows does not expose a multicast-capability
-/// flag through this API, so non-loopback interfaces are assumed to be
-/// multicast-capable; multicast joins/sends degrade gracefully (with a
-/// warning) if that assumption is wrong. The interface index is not consumed
-/// on Windows (it is only used by the Unix `IP_PKTINFO` receive path).
-#[cfg(windows)]
-fn enumerate_interfaces() -> io::Result<Vec<IfAddr>> {
-  let ifaces = if_addrs::get_if_addrs()?;
-  Ok(
-    ifaces
-      .into_iter()
-      .map(|iface| {
-        let is_loopback = iface.is_loopback();
-        IfAddr {
-          ip: iface.ip(),
-          index: iface.index.unwrap_or(0),
-          is_loopback,
-          is_multicast: !is_loopback,
+/// * If some local IPv4 interface's subnet contains `peer_ip`, the peer is
+///   reachable in one hop, so we use that interface's MTU (minus headers).
+///   Loopback peers (e.g. `127.0.0.1`) naturally match `lo`/`lo0` and inherit
+///   its (often large) MTU.
+/// * Otherwise the peer is behind a router (or IPv6 / unresolved), where the
+///   real path MTU is unknown; fall back to [`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`]
+///   (a conservative ~1500-byte-Ethernet budget).
+///
+/// An overestimate is a soft failure (IP fragmentation), never data loss, so
+/// this errs toward the safe default when unsure.
+pub fn path_mtu_payload_for_peer(ifaces: &[IfAddr], peer_ip: IpAddr) -> usize {
+  if let IpAddr::V4(peer) = peer_ip {
+    for ifa in ifaces {
+      let (IpAddr::V4(local), Some(mask)) = (ifa.ip, ifa.netmask) else {
+        continue;
+      };
+      if same_subnet_v4(local, mask, peer) {
+        if let Some(mtu) = ifa.mtu {
+          return payload_budget_for_mtu(mtu);
         }
-      })
-      .collect(),
-  )
+        // Same subnet but MTU unknown: keep scanning in case another matching
+        // interface reports one; otherwise we fall through to the default.
+      }
+    }
+  }
+  FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE
+}
+
+/// True when `local` and `peer` share the IPv4 subnet defined by `mask`.
+fn same_subnet_v4(local: Ipv4Addr, mask: Ipv4Addr, peer: Ipv4Addr) -> bool {
+  let m = u32::from(mask);
+  (u32::from(local) & m) == (u32::from(peer) & m)
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +260,9 @@ mod tests {
 
   use super::{
     build_ifindex_map_inner, get_local_multicast_ip_addrs_inner, get_local_unicast_locators_inner,
-    IfAddr, InterfaceSelector,
+    path_mtu_payload_for_peer, IfAddr, InterfaceSelector,
   };
-  use crate::structure::locator::Locator;
+  use crate::{rtps::constant::FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, structure::locator::Locator};
 
   fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
@@ -239,6 +274,26 @@ mod tests {
       index,
       is_loopback,
       is_multicast,
+      netmask: None,
+      mtu: None,
+    }
+  }
+
+  // Build an interface entry with an IPv4 subnet mask and MTU, for path-MTU
+  // resolution tests.
+  fn iface_v4(a: u8, b: u8, c: u8, d: u8, prefix: u8, mtu: u32, is_loopback: bool) -> IfAddr {
+    let mask = if prefix == 0 {
+      0u32
+    } else {
+      u32::MAX << (32 - u32::from(prefix))
+    };
+    IfAddr {
+      ip: v4(a, b, c, d),
+      index: 1,
+      is_loopback,
+      is_multicast: !is_loopback,
+      netmask: Some(Ipv4Addr::from(mask)),
+      mtu: Some(mtu),
     }
   }
 
@@ -343,6 +398,71 @@ mod tests {
       map.get(&3),
       Some(&InterfaceSelector::Ip(v4(10, 0, 0, 7))),
       "should prefer the IPv4 address"
+    );
+  }
+
+  // A peer on the same /24 as a local interface uses that interface's MTU
+  // (minus the 48-byte IPv4+UDP+RTPS header overhead).
+  #[test]
+  fn path_mtu_same_subnet_uses_iface_mtu() {
+    let ifaces = vec![
+      iface_v4(127, 0, 0, 1, 8, 16384, true),
+      iface_v4(192, 168, 1, 10, 24, 1500, false),
+    ];
+    assert_eq!(
+      path_mtu_payload_for_peer(&ifaces, v4(192, 168, 1, 55)),
+      1500 - 48
+    );
+  }
+
+  // A loopback peer matches the loopback interface and inherits its large MTU.
+  #[test]
+  fn path_mtu_loopback_peer_uses_loopback_mtu() {
+    let ifaces = vec![
+      iface_v4(127, 0, 0, 1, 8, 16384, true),
+      iface_v4(192, 168, 1, 10, 24, 1500, false),
+    ];
+    assert_eq!(
+      path_mtu_payload_for_peer(&ifaces, v4(127, 0, 0, 1)),
+      16384 - 48
+    );
+  }
+
+  // A peer not in any local subnet is assumed to be behind a router: use the
+  // conservative Ethernet default.
+  #[test]
+  fn path_mtu_behind_router_uses_default() {
+    let ifaces = vec![iface_v4(192, 168, 1, 10, 24, 1500, false)];
+    assert_eq!(
+      path_mtu_payload_for_peer(&ifaces, v4(10, 20, 30, 40)),
+      FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE
+    );
+  }
+
+  // An IPv6 peer has no IPv4 subnet to match: fall back to the default.
+  #[test]
+  fn path_mtu_ipv6_peer_uses_default() {
+    let ifaces = vec![iface_v4(192, 168, 1, 10, 24, 9000, false)];
+    let peer = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    assert_eq!(
+      path_mtu_payload_for_peer(&ifaces, peer),
+      FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE
+    );
+  }
+
+  // A jumbo-frame interface yields a correspondingly large budget.
+  #[test]
+  fn path_mtu_jumbo_frame() {
+    let ifaces = vec![iface_v4(10, 0, 0, 1, 8, 9000, false)];
+    assert_eq!(path_mtu_payload_for_peer(&ifaces, v4(10, 1, 2, 3)), 9000 - 48);
+  }
+
+  // Empty table -> default.
+  #[test]
+  fn path_mtu_empty_table_uses_default() {
+    assert_eq!(
+      path_mtu_payload_for_peer(&[], v4(192, 168, 1, 1)),
+      FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE
     );
   }
 }

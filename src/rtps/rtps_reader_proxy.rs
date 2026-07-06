@@ -1,6 +1,7 @@
 use std::{
   cmp::max,
   collections::{BTreeMap, BTreeSet},
+  net::SocketAddr,
 };
 
 use bit_vec::BitVec;
@@ -11,6 +12,7 @@ use crate::{
   dds::{participant::DomainParticipant, qos::QosPolicies},
   discovery::sedp_messages::DiscoveredReaderData,
   messages::submessages::submessage::AckSubmessage,
+  network::util::{path_mtu_payload_for_peer, IfAddr},
   rtps::{
     constant::*,
     transmit::{InterfaceObservations, InterfaceSelector, RouteSelector, SendRoute},
@@ -69,6 +71,15 @@ pub(crate) struct RtpsReaderProxy {
   // recomputed when locators or observations change. Defaults to the fallback
   // (legacy all-locators) route until resolved.
   send_route: SendRoute,
+
+  // Per-peer path-MTU budget: the number of bytes available for RTPS
+  // submessages in one datagram sent to this reader, derived from the local
+  // egress interface's MTU (same-subnet peer) or the conservative default
+  // (`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`) for peers behind a router / unresolved.
+  // Recomputed alongside `send_route`. Used to bound submessage packing and
+  // multi-fragment DATAFRAG datagrams. An overestimate only causes IP
+  // fragmentation, never data loss.
+  max_datagram_payload: usize,
 }
 
 impl RtpsReaderProxy {
@@ -87,6 +98,7 @@ impl RtpsReaderProxy {
       qos,
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
+      max_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
     }
   }
 
@@ -197,6 +209,7 @@ impl RtpsReaderProxy {
       qos: reader.qos_policy.clone(),
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
+      max_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
     }
   }
 
@@ -249,6 +262,7 @@ impl RtpsReaderProxy {
       qos: discovered_reader_data.subscription_topic_data.qos(),
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
+      max_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
     }
   }
 
@@ -272,6 +286,34 @@ impl RtpsReaderProxy {
       observed,
       local_multicast_ifaces,
     );
+  }
+
+  /// The per-peer datagram-payload budget (bytes for RTPS submessages in one
+  /// datagram) resolved for this reader. Defaults to
+  /// [`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`] until [`resolve_path_mtu`] runs.
+  ///
+  /// [`resolve_path_mtu`]: Self::resolve_path_mtu
+  pub fn max_datagram_payload(&self) -> usize {
+    self.max_datagram_payload
+  }
+
+  /// Recompute this reader's [`max_datagram_payload`](Self::max_datagram_payload)
+  /// from its advertised unicast locators and the local interface table.
+  ///
+  /// We take the minimum budget over all of the reader's unicast locators so
+  /// that whichever path the [`SendRoute`] ends up using, the datagram fits.
+  /// Loopback locators were already stripped from `unicast_locator_list`, so a
+  /// same-host peer is resolved via its LAN address (whose egress interface is
+  /// the one actually configured for that subnet). When the reader advertises
+  /// no unicast locators, we keep the conservative default.
+  pub fn resolve_path_mtu(&mut self, local_interfaces: &[IfAddr]) {
+    let budget = self
+      .unicast_locator_list
+      .iter()
+      .filter(|l| l.is_udp())
+      .map(|l| path_mtu_payload_for_peer(local_interfaces, SocketAddr::from(*l).ip()))
+      .min();
+    self.max_datagram_payload = budget.unwrap_or(FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE);
   }
 
   pub fn handle_ack_nack(

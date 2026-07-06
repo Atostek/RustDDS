@@ -58,13 +58,46 @@ pub const MAX_UNSENT_CHANGES_PER_READER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 // oldest gap (those old samples are given up as lost) so the map stays bounded.
 pub const MAX_TRACKED_CHANGES_PER_WRITER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 
-// Upper bound on the serialized size (RTPS header + submessages) of an
-// aggregated datagram built by the writer's DATA-coalescing path. Kept below a
-// typical Ethernet MTU (1500) minus IPv4 (20) + UDP (8) headers = 1472, with a
-// small margin, so aggregated datagrams do not trigger IP fragmentation. Only
-// unfragmented samples are coalesced; a single sample larger than this still
-// goes out on its own (equivalent to the non-aggregated path).
-pub const MAX_AGGREGATED_DATAGRAM_SIZE: usize = 1452;
+// Default / fallback UDP-payload budget (RTPS header + submessages) used to
+// size datagrams built by the writer's DATA-coalescing and DATAFRAG packing
+// paths when the per-peer path MTU is unknown (peer behind a router, IPv6, or
+// unresolved). Kept below a typical Ethernet MTU (1500) minus IPv4 (20) +
+// UDP (8) headers = 1472, with a small margin, so datagrams do not trigger IP
+// fragmentation. When the peer's egress-interface MTU is known, the per-reader
+// budget (see `payload_budget_for_mtu`) is used instead; this constant is the
+// conservative default (not an absolute maximum). A single submessage larger
+// than the budget still goes out on its own (equivalent to the non-packed path).
+pub const FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE: usize = 1452;
+
+// Overhead subtracted from an interface MTU to obtain the RTPS-message (UDP
+// payload) budget usable for submessage/fragment packing: IPv4 (20) + UDP (8) +
+// RTPS message header (20) = 48 bytes. Matches
+// `FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE` for a 1500-byte MTU (1500 - 48 = 1452).
+pub const DATAGRAM_HEADER_OVERHEAD: usize = 48;
+
+// Constant RTPS fragment size (serialized-payload bytes per fragment) used by
+// the writer when a sample must be sent as DATAFRAG. The RTPS spec requires the
+// fragment size to be fixed for a given Writer and identical for all remote
+// Readers (v2.5 Section 8.4.14.1.1), so this is a constant and must NOT be
+// varied per peer. Per-peer path MTU only controls how many fragments we pack
+// into each DATAFRAG submessage / datagram, never the fragment size itself.
+pub const FRAGMENT_SIZE: usize = 256;
+
+/// Convert an interface MTU into the RTPS-message (UDP payload) budget usable
+/// for submessage/fragment packing: `mtu - DATAGRAM_HEADER_OVERHEAD`, floored
+/// so a pathologically small MTU still yields a usable (if tiny) budget. The
+/// caller always emits at least the first submessage even if it exceeds the
+/// budget, so an underestimate degrades to one submessage per datagram rather
+/// than dropping data.
+pub const fn payload_budget_for_mtu(mtu: u32) -> usize {
+  let mtu = mtu as usize;
+  if mtu <= DATAGRAM_HEADER_OVERHEAD {
+    // Nonsensical / tiny MTU: fall back to a minimal but non-zero budget.
+    64
+  } else {
+    mtu - DATAGRAM_HEADER_OVERHEAD
+  }
+}
 
 // Serialized size of a trailing HEARTBEAT submessage (4-byte submessage header +
 // readerId 4 + writerId 4 + firstSN 8 + lastSN 8 + count 4). The coalescing loop

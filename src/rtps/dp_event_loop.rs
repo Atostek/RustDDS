@@ -23,7 +23,11 @@ use crate::{
     sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
   },
   messages::submessages::submessages::AckSubmessage,
-  network::{udp_listener::UDPListener, udp_sender::UDPSender},
+  network::{
+    udp_listener::UDPListener,
+    udp_sender::UDPSender,
+    util::{local_interface_table, IfAddr},
+  },
   polling::{new_shared_timer, SharedTimer},
   //qos::HasQoSPolicy,
   rtps::{
@@ -115,6 +119,12 @@ pub struct DPEventLoop {
   // Interface-aware transmit: per-remote observed receive interfaces/addresses,
   // shared (intra-thread) with the MessageReceiver that populates it.
   interface_observations: Rc<RefCell<InterfaceObservations>>,
+
+  // Snapshot of the local interface table (IP, IPv4 subnet, MTU, flags) used to
+  // resolve each matched reader's per-peer path-MTU budget. Shared (read-only)
+  // with every Writer. Rebuilt on interface-set changes (same trigger points as
+  // the send-route recompute).
+  local_interfaces: Rc<[IfAddr]>,
 
   // One timer shared by all Readers, Writers and the periodic loop tasks.
   // Endpoints hold cloned handles to schedule timeouts; the loop owns it,
@@ -258,6 +268,7 @@ impl DPEventLoop {
     let security_plugins_opt = security_plugins_opt.and(None); // make sure it is None an consume value
 
     let interface_observations = Rc::new(RefCell::new(InterfaceObservations::new()));
+    let local_interfaces: Rc<[IfAddr]> = Rc::from(local_interface_table());
 
     Self {
       domain_info,
@@ -274,6 +285,7 @@ impl DPEventLoop {
         Rc::clone(&interface_observations),
       ),
       interface_observations,
+      local_interfaces,
       #[cfg(feature = "security")]
       security_plugins_opt,
       add_reader_receiver,
@@ -1138,6 +1150,7 @@ impl DPEventLoop {
       self.shared_timer.clone(),
       self.participant_status_sender.clone(),
       Rc::clone(&self.interface_observations),
+      Rc::clone(&self.local_interfaces),
     );
 
     self

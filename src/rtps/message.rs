@@ -394,12 +394,14 @@ impl MessageBuilder {
   // This whole MessageBuilder structure should be refactored into something more
   // coherent. Now it just looks messy.
   #[allow(clippy::too_many_arguments)]
+  #[allow(clippy::too_many_arguments)]
   pub fn data_frag_msg(
     mut self,
     cache_change: &CacheChange,
     reader_entity_id: EntityId,
     writer_guid: GUID,
-    fragment_number: FragmentNumber, // We support only submessages with one fragment
+    fragment_starting_num: FragmentNumber, // 1-based number of the first fragment in this submessage
+    fragments_in_submessage: u16,          // how many contiguous fragments this submessage carries
     fragment_size: u16,
     sample_size: u32, // all fragments together
     endianness: Endianness,
@@ -446,10 +448,13 @@ impl MessageBuilder {
 
     let have_inline_qos = !param_list.is_empty(); // we need this later also
 
-    // fragments are numbered starting from 1, not 0.
-    let from_byte: usize = (usize::from(fragment_number) - 1) * usize::from(fragment_size);
+    // fragments are numbered starting from 1, not 0. This submessage carries the
+    // contiguous run [start, start + K) of fragments, i.e. up to
+    // `fragments_in_submessage * fragment_size` payload bytes (the final run is
+    // shorter when it reaches the end of the sample).
+    let from_byte: usize = (usize::from(fragment_starting_num) - 1) * usize::from(fragment_size);
     let up_to_before_byte: usize = min(
-      usize::from(fragment_number) * usize::from(fragment_size),
+      from_byte + usize::from(fragments_in_submessage) * usize::from(fragment_size),
       sample_size.try_into().unwrap(),
     );
 
@@ -494,8 +499,8 @@ impl MessageBuilder {
       reader_id: reader_entity_id,
       writer_id: writer_entity_id,
       writer_sn: cache_change.sequence_number,
-      fragment_starting_num: fragment_number,
-      fragments_in_submessage: 1,
+      fragment_starting_num,
+      fragments_in_submessage,
       data_size: sample_size, // total, assembled data (SerializedPayload) size
       fragment_size,
       inline_qos: if have_inline_qos {

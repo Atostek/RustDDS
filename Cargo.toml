@@ -84,6 +84,12 @@ thiserror = "2.0.9"
 cdr-encoding = { version="0.11" }
 cdr-encoding-size = { version="^0.5" }
 futures = "0.3"
+# Cross-platform network-interface enumeration (index, IPv4 subnet, MTU,
+# loopback/multicast flags) used for per-peer path-MTU resolution and locator
+# selection. `default-features = false` drops the `gateway` feature (default
+# route / gateway lookup, which pulls in netlink on Linux); we only need
+# `get_interfaces()`.
+netdev = { version = "0.45", default-features = false }
 
 # For DDS Security:
 serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated XML config files
@@ -100,10 +106,6 @@ bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 const-oid = { version = "0.9" , optional = true } # more ASN.1
 openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.10", optional = true }
-[target.'cfg(windows)'.dependencies]
-# Interface enumeration on Windows. On Unix we use nix::ifaddrs instead.
-if-addrs = "0.14"
-
 [target.'cfg(unix)'.dependencies]
 # Used to capture the receiving interface of incoming UDP datagrams via
 # recvmsg()/IP_PKTINFO for interface-aware transmit-locator selection.

@@ -62,6 +62,9 @@ impl AssemblyBuffer {
   pub fn insert_frags(&mut self, datafrag: &DataFrag, frag_size: u16) {
     // TODO: Sanity checks? E.g. datafrag.fragment_size == frag_size
     // Or is this even guaranteed? Can Writer vary fragment size?
+    // Answer: Writer must guarantee constant fragment size per SequenceNumber.
+    // So yes, it is guaranteed. RTPS spec v2.5 Section 8.4.14.1.1 "How to select the fragment size"
+    // even says that the frag size is fixed per-writer.
 
     let frag_size = usize::from(frag_size); // - payload_header;
     let frags_in_submessage = usize::from(datafrag.fragments_in_submessage);
@@ -261,5 +264,70 @@ impl FragmentAssembler {
         Box::new(iter)
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use bytes::Bytes;
+
+  use super::AssemblyBuffer;
+  use crate::{
+    messages::submessages::submessages::DataFrag,
+    structure::sequence_number::FragmentNumber,
+  };
+
+  // Build a DATAFRAG submessage carrying the contiguous run of `k` fragments
+  // starting at 1-based `start`, with the given payload bytes.
+  fn datafrag(start: u32, k: u16, frag_size: u16, data_size: u32, payload: Vec<u8>) -> DataFrag {
+    DataFrag {
+      fragment_starting_num: FragmentNumber::new(start),
+      fragments_in_submessage: k,
+      fragment_size: frag_size,
+      data_size,
+      serialized_payload: Bytes::from(payload),
+      ..Default::default()
+    }
+  }
+
+  // A DATAFRAG that packs K > 1 fragments in one submessage must reassemble the
+  // same bytes as one-fragment-per-submessage would. This exercises the
+  // adaptive-packing writer path against the (unchanged) receiver.
+  #[test]
+  fn reassemble_multi_fragment_datafrag() {
+    let frag_size = 1024u16;
+    let data_size = 2600u32; // 3 fragments: 1024, 1024, 552
+    let whole: Vec<u8> = (0..data_size as usize).map(|i| (i % 251) as u8).collect();
+
+    // First submessage packs fragments 1 and 2 (K = 2, 2048 payload bytes).
+    let first = datafrag(1, 2, frag_size, data_size, whole[0..2048].to_vec());
+    let mut ab = AssemblyBuffer::new(&first);
+    assert!(!ab.is_complete());
+    ab.insert_frags(&first, frag_size);
+    assert!(!ab.is_complete(), "still missing the tail fragment");
+
+    // Trailing submessage carries the shorter final fragment 3 (552 bytes).
+    let tail = datafrag(3, 1, frag_size, data_size, whole[2048..2600].to_vec());
+    ab.insert_frags(&tail, frag_size);
+    assert!(ab.is_complete(), "all fragments received");
+    assert_eq!(
+      &ab.buffer_bytes[..],
+      &whole[..],
+      "reassembled bytes must match the original sample"
+    );
+  }
+
+  // A single DATAFRAG carrying the whole sample in one multi-fragment run.
+  #[test]
+  fn reassemble_single_submessage_all_fragments() {
+    let frag_size = 512u16;
+    let data_size = 1500u32; // 3 fragments: 512, 512, 476
+    let whole: Vec<u8> = (0..data_size as usize).map(|i| (i % 97) as u8).collect();
+
+    let all = datafrag(1, 3, frag_size, data_size, whole.clone());
+    let mut ab = AssemblyBuffer::new(&all);
+    ab.insert_frags(&all, frag_size);
+    assert!(ab.is_complete());
+    assert_eq!(&ab.buffer_bytes[..], &whole[..]);
   }
 }
