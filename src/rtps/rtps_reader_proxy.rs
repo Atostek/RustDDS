@@ -350,6 +350,34 @@ impl RtpsReaderProxy {
   /// its only effect is to give a same-host-only peer (which advertises *only*
   /// loopback) the large loopback budget instead of the conservative default.
   /// When the reader advertises no unicast locators at all, we keep the default.
+  ///
+  /// # Design note: current vs. ideal (future work)
+  ///
+  /// What could be improved: today a peer only gets a larger-than-fallback
+  /// budget if *every* advertised unicast address clears the bar (IPv4,
+  /// same-subnet as a local interface, OS-reported MTU > 1500), or if it
+  /// advertises loopback only. Ideally it should suffice that the *single
+  /// locator we actually send to* has a large MTU (e.g. one jumbo-frame
+  /// same-subnet address should win even when the peer also advertises an
+  /// ordinary 1500-MTU address).
+  ///
+  /// Why we take the conservative `min` now: the budget is a single per-reader
+  /// scalar, fixed here and consumed at message-build time, and the resulting
+  /// datagram can legitimately be sent to *all* of the peer's locators (the
+  /// `SendRoute { fallback: true }` path in `Writer::send_message_to_readers`,
+  /// and the multicast-to-all path via `min_datagram_payload`). So it must fit
+  /// the smallest MTU among them; an overestimate would cause IP fragmentation
+  /// on the copies aimed at the smaller-MTU locators.
+  ///
+  /// Three things missing before "some locator suffices" would be correct:
+  /// 1. MTU resolved *per chosen route/locator* rather than as this per-reader
+  ///    `min` scalar decoupled from route selection.
+  /// 2. A route selector that *deterministically prefers* the large-MTU locator
+  ///    (today `DefaultRouteSelector::select_unicast` narrows by observed source
+  ///    IP, not by subnet/MTU, and otherwise falls back to all locators).
+  /// 3. A guarantee that a datagram built with the larger budget is sent to
+  ///    *only* that one locator (today the fallback and multicast-to-all paths
+  ///    reuse one datagram across many locators).
   pub fn resolve_path_mtu(&mut self, local_interfaces: &[IfAddr]) {
     let budget = self
       .unicast_locator_list

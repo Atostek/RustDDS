@@ -20,8 +20,8 @@ use rustdds::{
   dds::statusevents, with_key::Sample, DomainParticipantBuilder, Keyed, QosPolicyBuilder,
   StatusEvented, TopicDescription, TopicKind,
 };
-use rustdds::policy::{Deadline, Durability, History, Reliability}; /* import all QoS
-                                                                     * policies directly */
+use rustdds::policy::{Deadline, Durability, History, Reliability, DataRepresentation};
+use rustdds::policy::{XCDR2_DATA_REPRESENTATION, XCDR_DATA_REPRESENTATION};
 use serde::{Deserialize, Serialize};
 use clap::{Arg, ArgMatches, Command}; // command line argument processing
 use mio_06::{Events, Poll, PollOpt, Ready, Token}; // polling
@@ -155,13 +155,21 @@ fn main() {
     "QoS policy Ownership Strength is not yet implemented."
   );
 
-  // The interoperability test harness always passes -x (data representation).
-  // RustDDS does not expose representation as a selectable QoS, so we accept the
-  // flag for CLI compatibility but do not act on it (the default wire encoding is
-  // used). Plain ShapeType encodes identically under XCDR1/XCDR2.
-  let _ = matches.get_one::<String>("representation");
+  // Match the OMG shape_main default (XCDR1) so cross-vendor interop advertises
+  // PID_DATA_REPRESENTATION in discovery. Honor -x for XCDR2 incompatibility tests.
+  let data_representation = match matches.get_one::<String>("representation").map(String::as_str) {
+    Some("2") => DataRepresentation {
+      value: vec![XCDR2_DATA_REPRESENTATION],
+    },
+    Some("1") | None => DataRepresentation {
+      value: vec![XCDR_DATA_REPRESENTATION],
+    },
+    Some(other) => panic!("unsupported data representation {other} (use 1 or 2)"),
+  };
 
-  let qos = qos_b.build();
+  let qos = qos_b
+    .build()
+    .with_data_representation(data_representation);
 
   let loop_delay: Duration = match deadline_policy {
     None => Duration::from_millis(200), // This is the default rate
