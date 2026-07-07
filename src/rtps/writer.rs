@@ -181,14 +181,10 @@ pub(crate) struct Writer {
   #[allow(dead_code)]
   pub nack_suppression_duration: std::time::Duration,
 
-  /// The maximum size of any
-  /// SerializedPayload that may be sent by the Writer.
-  /// This is used to decide when to send DATA or DATAFRAG.
-  /// Supposedly "fragment size" limitations apply here, so must be <= 64k.
-  /// RTPS spec v2.5 Section "8.4.14.1 Large Data"
-  // Note: Writer can choose the max size at initialization, but is not allowed to change it later.
-  // RTPS spec v2.5 Section 8.4.14.1.1:
-  // "The fragment size must be fixed for a given Writer and is identical for all remote Readers"
+  /// Largest serialized payload advertised at writer creation (discovery
+  /// metadata fallback). Transmit decisions use
+  /// [`Self::max_unfragmented_serialized_payload`] instead.
+  #[allow(dead_code)]
   pub data_max_size_serialized: usize,
 
   my_guid: GUID,
@@ -207,6 +203,21 @@ pub(crate) struct Writer {
 
   // Sending mechanism
   udp_sender: Rc<UDPSender>,
+
+  // Extra fixed unicast destinations that every outgoing message from this
+  // writer is *also* sent to, bypassing route selection. Empty for all writers
+  // except the built-in SPDP participant writer, which uses it for the
+  // "localhost SPDP peers" (127.0.0.1:<well-known SPDP ports>) so same-host
+  // participants discover each other with no external network. Unlike loopback
+  // locators discovered from peers, these are unconditional (they are how we
+  // bootstrap same-host discovery in the first place). See
+  // `src/rtps/loopback_same_host_design.md`.
+  extra_unicast_destinations: Vec<Locator>,
+
+  // Whether route selection may prefer a same-host peer's loopback locator.
+  // Mirrors the participant-builder `same_host_loopback` knob; `true` by
+  // default. Passed into `DefaultRouteSelector` on every route resolution.
+  prefer_loopback_same_host: bool,
 
   // Interface-aware transmit: per-remote observed receive interfaces/addresses,
   // shared (intra-thread) with the MessageReceiver that records them. Consulted
@@ -344,10 +355,8 @@ impl Writer {
       nackfrag_response_delay: NACK_RESPONSE_DELAY, // default value from dp_event_loop
       repairfrags_continue_delay: std::time::Duration::from_millis(1),
       nack_suppression_duration: NACK_SUPPRESSION_DURATION,
-      // Constant RTPS fragment size. Must be fixed per Writer and identical for
-      // all remote Readers (RTPS v2.5 8.4.14.1.1); per-peer MTU only changes how
-      // many fragments we pack per DATAFRAG/datagram, never this size.
-      data_max_size_serialized: FRAGMENT_SIZE,
+      // Conservative fallback for any discovery advertisement of max sample size.
+      data_max_size_serialized: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
       my_guid: i.guid,
       doorbell_registration: i.doorbell_registration,
       doorbell: i.doorbell,
@@ -355,6 +364,8 @@ impl Writer {
       matched_readers_count_total: 0,
       requested_incompatible_qos_count: 0,
       udp_sender,
+      extra_unicast_destinations: Vec::new(),
+      prefer_loopback_same_host: true,
       interface_observations,
       local_interfaces,
       min_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
@@ -529,8 +540,26 @@ impl Writer {
     }
   }
 
+  /// Largest serialized payload that fits in one unfragmented DATA submessage
+  /// within the per-peer datagram budget. Fragmentation is triggered only when
+  /// the payload exceeds this, not when it exceeds [`FRAGMENT_SIZE`].
+  fn max_unfragmented_serialized_payload(
+    &self,
+    target_reader_opt: Option<&RtpsReaderProxy>,
+  ) -> usize {
+    let budget = self.datagram_budget(target_reader_opt);
+    let hb_reserve = if self.is_reliable() && !self.like_stateless {
+      HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE
+    } else {
+      0
+    };
+    budget
+      .saturating_sub(hb_reserve)
+      .saturating_sub(DATA_SUBMESSAGE_OVERHEAD)
+  }
+
   fn num_frags_and_frag_size(&self, payload_size: usize) -> (u32, u16) {
-    let fragment_size = self.data_max_size_serialized as u32; // TODO: overflow check
+    let fragment_size = FRAGMENT_SIZE as u32;
     let data_size = payload_size as u32; // TODO: overflow check
                                          // Formula from RTPS spec v2.5 Section "8.3.8.3.5 Logical Interpretation"
     let num_frags = (data_size / fragment_size) + u32::from(data_size % fragment_size != 0); // rounding up
@@ -566,7 +595,7 @@ impl Writer {
   // (multicast-to-all). Fragmented or single-reader samples keep the existing
   // per-sample / per-fragment path.
   fn is_aggregatable(&self, cc: &CacheChange) -> bool {
-    cc.data_value.payload_size() <= self.data_max_size_serialized
+    cc.data_value.payload_size() <= self.max_unfragmented_serialized_payload(None)
       && cc.write_options.to_single_reader().is_none()
   }
 
@@ -1450,7 +1479,7 @@ impl Writer {
           message_builder = message_builder.ts_msg(self.endianness, Some(src_ts));
         }
 
-        let fragment_size: u32 = self.data_max_size_serialized as u32; // TODO: overflow check
+        let fragment_size: u32 = FRAGMENT_SIZE as u32;
         let data_size: u32 = cache_change.data_value.payload_size() as u32; // TODO: overflow check
 
         message_builder = message_builder.data_frag_msg(
@@ -1737,6 +1766,10 @@ impl Writer {
             }
           }
         }
+
+        // Fixed extra unicast destinations (SPDP localhost peers): send the same
+        // datagram unconditionally, deduplicated against everything already sent.
+        send_legacy!(self.extra_unicast_destinations);
       }
       Err(e) => error!("Failed to send message to readers. Encoding failed: {e:?}"),
     }
@@ -1778,6 +1811,20 @@ impl Writer {
           warn!("send_status - io error {e:?}");
         }
       });
+  }
+
+  /// Set the fixed unicast destinations every outgoing message is also sent to
+  /// (in addition to matched readers), bypassing route selection. Used only for
+  /// the built-in SPDP writer's "localhost SPDP peers". See
+  /// [`Self::extra_unicast_destinations`].
+  pub fn set_extra_unicast_destinations(&mut self, locators: Vec<Locator>) {
+    self.extra_unicast_destinations = locators;
+  }
+
+  /// Enable/disable preferring a same-host peer's loopback locator during route
+  /// selection. See the participant-builder `same_host_loopback` knob.
+  pub fn set_prefer_loopback_same_host(&mut self, enabled: bool) {
+    self.prefer_loopback_same_host = enabled;
   }
 
   pub fn update_reader_proxy(
@@ -1888,6 +1935,7 @@ impl Writer {
     let is_volatile = self.qos().is_volatile(); // Get this in advance to work with the borrow checker
                                                 // Capture the interface set once; resolution consults current observations.
     let multicast_ifaces = self.udp_sender.multicast_interfaces();
+    let selector = DefaultRouteSelector::new(self.prefer_loopback_same_host);
     self
       .readers
       .entry(updated_reader_proxy.remote_reader_guid)
@@ -1898,13 +1946,16 @@ impl Writer {
         rp.resolve_send_route(
           &self.interface_observations.borrow(),
           &multicast_ifaces,
-          &DefaultRouteSelector,
+          &selector,
         );
         rp.resolve_path_mtu(&self.local_interfaces);
       })
       .or_insert_with(|| {
         is_new = true;
         let mut new_proxy = updated_reader_proxy.clone();
+        // Ensure loopback stays in the gated bucket even for proxies that
+        // arrive with it inline (e.g. the built-in get_builtin_reader_proxy path).
+        new_proxy.normalize_loopback();
         if is_volatile {
           // With Durabilty::Volatile QoS we won't send the sequence numbers which existed
           // before matching with this reader. Therefore we set the reader as pending GAP
@@ -1914,7 +1965,7 @@ impl Writer {
         new_proxy.resolve_send_route(
           &self.interface_observations.borrow(),
           &multicast_ifaces,
-          &DefaultRouteSelector,
+          &selector,
         );
         new_proxy.resolve_path_mtu(&self.local_interfaces);
         new_proxy
@@ -1943,11 +1994,12 @@ impl Writer {
   /// observations for that participant may have arrived (e.g. periodic SPDP).
   pub fn recompute_routes_for(&mut self, prefix: GuidPrefix) {
     let multicast_ifaces = self.udp_sender.multicast_interfaces();
+    let selector = DefaultRouteSelector::new(self.prefer_loopback_same_host);
     {
       let observations = self.interface_observations.borrow();
       for rp in self.readers.values_mut() {
         if rp.remote_reader_guid.prefix == prefix {
-          rp.resolve_send_route(&observations, &multicast_ifaces, &DefaultRouteSelector);
+          rp.resolve_send_route(&observations, &multicast_ifaces, &selector);
           rp.resolve_path_mtu(&self.local_interfaces);
         }
       }
@@ -2045,6 +2097,11 @@ impl HasQoSPolicy for Writer {
   }
 }
 
+// Serialized overhead of one DATA submessage excluding its serialized payload
+// and inline QoS. Conservative fixed fields only; underestimating inline QoS
+// causes earlier fragmentation (safe), never datagram overflow.
+const DATA_SUBMESSAGE_OVERHEAD: usize = 48;
+
 // Serialized overhead of one DATAFRAG submessage excluding its payload:
 // submessage header (4) + extraFlags (2) + octetsToInlineQos (2) + readerId (4)
 // + writerId (4) + writerSN (8) + fragmentStartingNum (4) +
@@ -2116,7 +2173,8 @@ impl<'a> FragmentationIter<'a> {
       target_reader_opt.map_or(EntityId::UNKNOWN, |p| p.remote_reader_guid.entity_id);
 
     let data_size = cache_change.data_value.payload_size();
-    let fragmentation_needed = data_size > writer.data_max_size_serialized;
+    let fragmentation_needed =
+      data_size > writer.max_unfragmented_serialized_payload(target_reader_opt);
 
     let state = if fragmentation_needed {
       let fragmented = match cursor {

@@ -44,6 +44,13 @@ pub(crate) struct RtpsReaderProxy {
   /// empty
   pub multicast_locator_list: Vec<Locator>,
 
+  /// Loopback unicast locators the reader advertised (e.g. `127.0.0.1`). These
+  /// are kept out of `unicast_locator_list` so the legacy all-locators fallback
+  /// never sends to a *remote* host's loopback, but are retained here so route
+  /// selection can prefer them once the peer is positively confirmed to be on
+  /// the same host. See `src/rtps/loopback_same_host_design.md`.
+  pub loopback_unicast_locators: Vec<Locator>,
+
   /// Specifies whether the remote matched RTPS Reader expects in-line QoS to be
   /// sent along with any data.
   expects_in_line_qos: bool,
@@ -89,6 +96,7 @@ impl RtpsReaderProxy {
       remote_group_entity_id: EntityId::UNKNOWN,
       unicast_locator_list: Vec::default(),
       multicast_locator_list: Vec::default(),
+      loopback_unicast_locators: Vec::default(),
       expects_in_line_qos,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
@@ -128,9 +136,19 @@ impl RtpsReaderProxy {
         "Multicast:\n Old={:?}\n  New={:?}",
         self.multicast_locator_list, update.multicast_locator_list
       );
-      let mut unicasts = update.unicast_locator_list.clone();
-      unicasts.retain(Self::not_loopback);
+      // The incoming proxy may carry loopback either inline (built-in path via
+      // `get_builtin_reader_proxy`) or already split into its bucket (discovered
+      // path). Recombine both before splitting so the invariant holds regardless
+      // of how `update` was constructed.
+      let combined: Vec<Locator> = update
+        .unicast_locator_list
+        .iter()
+        .chain(update.loopback_unicast_locators.iter())
+        .copied()
+        .collect();
+      let (unicasts, loopbacks) = Self::split_loopback(&combined);
       self.unicast_locator_list = unicasts;
+      self.loopback_unicast_locators = loopbacks;
       self
         .multicast_locator_list
         .clone_from(&update.multicast_locator_list);
@@ -200,6 +218,10 @@ impl RtpsReaderProxy {
       remote_group_entity_id: EntityId::UNKNOWN, // TODO
       unicast_locator_list,
       multicast_locator_list,
+      // `from_reader` builds the proxy we *advertise* for a local reader (via
+      // SEDP), so loopback stays in `unicast_locator_list` here; the bucket is
+      // only meaningful for proxies used as live send destinations.
+      loopback_unicast_locators: Vec::new(),
       expects_in_line_qos: false,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
@@ -221,15 +243,33 @@ impl RtpsReaderProxy {
     }
   }
 
-  // OpenDDS seems to advertise also loopback address as its Locator over SPDP,
-  // which is problematic, if we are not on the same host.
-  fn not_loopback(l: &Locator) -> bool {
-    let is_loopback = l.is_loopback();
-    if is_loopback {
-      info!("Ignoring loopback address {l:?}");
-    }
+  // OpenDDS (and RustDDS itself) advertise the loopback address as a Locator,
+  // which is problematic if we are *not* on the same host. Rather than discard
+  // it outright, partition the advertised unicast locators into non-loopback
+  // (returned first, used by the normal/fallback send path) and loopback
+  // (returned second, used only once the peer is confirmed same-host). See
+  // `src/rtps/loopback_same_host_design.md`.
+  fn split_loopback(locators: &[Locator]) -> (Vec<Locator>, Vec<Locator>) {
+    locators.iter().copied().partition(|l| !l.is_loopback())
+  }
 
-    !is_loopback
+  /// Enforce the loopback-bucket invariant: any loopback address in
+  /// `unicast_locator_list` is moved into `loopback_unicast_locators`. Idempotent.
+  /// Applied to freshly-inserted proxies (e.g. the built-in `get_builtin_reader_proxy`
+  /// path, which fills `unicast_locator_list` inline) so loopback is never used by
+  /// the non-same-host send path. See `src/rtps/loopback_same_host_design.md`.
+  pub fn normalize_loopback(&mut self) {
+    if self.unicast_locator_list.iter().any(Locator::is_loopback) {
+      let combined: Vec<Locator> = self
+        .unicast_locator_list
+        .iter()
+        .chain(self.loopback_unicast_locators.iter())
+        .copied()
+        .collect();
+      let (unicasts, loopbacks) = Self::split_loopback(&combined);
+      self.unicast_locator_list = unicasts;
+      self.loopback_unicast_locators = loopbacks;
+    }
   }
 
   pub fn from_discovered_reader_data(
@@ -237,11 +277,12 @@ impl RtpsReaderProxy {
     default_unicast_locators: &[Locator],
     default_multicast_locators: &[Locator],
   ) -> Self {
-    let mut unicast_locator_list = Self::discovered_or_default(
+    let advertised_unicast = Self::discovered_or_default(
       &discovered_reader_data.reader_proxy.unicast_locator_list,
       default_unicast_locators,
     );
-    unicast_locator_list.retain(Self::not_loopback);
+    let (unicast_locator_list, loopback_unicast_locators) =
+      Self::split_loopback(&advertised_unicast);
 
     let multicast_locator_list = Self::discovered_or_default(
       &discovered_reader_data.reader_proxy.multicast_locator_list,
@@ -253,6 +294,7 @@ impl RtpsReaderProxy {
       remote_group_entity_id: EntityId::UNKNOWN, // TODO
       unicast_locator_list,
       multicast_locator_list,
+      loopback_unicast_locators,
       expects_in_line_qos: discovered_reader_data.reader_proxy.expects_inline_qos,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
@@ -283,6 +325,7 @@ impl RtpsReaderProxy {
     self.send_route = selector.select(
       &self.unicast_locator_list,
       &self.multicast_locator_list,
+      &self.loopback_unicast_locators,
       observed,
       local_multicast_ifaces,
     );
@@ -300,16 +343,18 @@ impl RtpsReaderProxy {
   /// Recompute this reader's [`max_datagram_payload`](Self::max_datagram_payload)
   /// from its advertised unicast locators and the local interface table.
   ///
-  /// We take the minimum budget over all of the reader's unicast locators so
-  /// that whichever path the [`SendRoute`] ends up using, the datagram fits.
-  /// Loopback locators were already stripped from `unicast_locator_list`, so a
-  /// same-host peer is resolved via its LAN address (whose egress interface is
-  /// the one actually configured for that subnet). When the reader advertises
-  /// no unicast locators, we keep the conservative default.
+  /// We take the minimum budget over all of the reader's unicast locators
+  /// (including the loopback bucket) so that whichever path the [`SendRoute`]
+  /// ends up using, the datagram fits. A loopback locator resolves to the
+  /// (typically large) loopback-interface MTU, so it never lowers the minimum;
+  /// its only effect is to give a same-host-only peer (which advertises *only*
+  /// loopback) the large loopback budget instead of the conservative default.
+  /// When the reader advertises no unicast locators at all, we keep the default.
   pub fn resolve_path_mtu(&mut self, local_interfaces: &[IfAddr]) {
     let budget = self
       .unicast_locator_list
       .iter()
+      .chain(self.loopback_unicast_locators.iter())
       .filter(|l| l.is_udp())
       .map(|l| path_mtu_payload_for_peer(local_interfaces, SocketAddr::from(*l).ip()))
       .min();
@@ -690,7 +735,7 @@ mod route_tests {
     rp.resolve_send_route(
       &observations,
       &[iface([10, 0, 0, 1])],
-      &DefaultRouteSelector,
+      &DefaultRouteSelector::default(),
     );
     assert!(rp.send_route().fallback);
   }
@@ -712,7 +757,7 @@ mod route_tests {
     rp.resolve_send_route(
       &observations,
       &[iface([10, 0, 0, 1])],
-      &DefaultRouteSelector,
+      &DefaultRouteSelector::default(),
     );
 
     let route = rp.send_route();
@@ -722,5 +767,57 @@ mod route_tests {
       route.multicast,
       Some((udp([239, 255, 0, 1], 7401), iface([10, 0, 0, 1])))
     );
+  }
+
+  #[test]
+  fn update_partitions_loopback_into_bucket() {
+    let prefix = GuidPrefix::new(&[7; 12]);
+    let mut rp = proxy_with_prefix(prefix);
+
+    // An incoming update carrying a loopback and a LAN locator inline (as the
+    // built-in reader-proxy path does).
+    let mut update = proxy_with_prefix(prefix);
+    update.unicast_locator_list = vec![udp([127, 0, 0, 1], 7413), udp([10, 0, 0, 5], 7413)];
+
+    rp.update(&update, "topic");
+
+    // Loopback is kept out of the normal list but retained in the bucket.
+    assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7413)]);
+    assert_eq!(rp.loopback_unicast_locators, vec![udp([127, 0, 0, 1], 7413)]);
+  }
+
+  #[test]
+  fn normalize_loopback_moves_inline_loopback_to_bucket() {
+    // Mimics a freshly built built-in reader proxy with loopback inline.
+    let mut rp = proxy_with_prefix(GuidPrefix::new(&[5; 12]));
+    rp.unicast_locator_list = vec![udp([127, 0, 0, 1], 7410), udp([10, 0, 0, 5], 7410)];
+    rp.normalize_loopback();
+    assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7410)]);
+    assert_eq!(rp.loopback_unicast_locators, vec![udp([127, 0, 0, 1], 7410)]);
+    // Idempotent.
+    rp.normalize_loopback();
+    assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7410)]);
+    assert_eq!(rp.loopback_unicast_locators, vec![udp([127, 0, 0, 1], 7410)]);
+  }
+
+  #[test]
+  fn same_host_route_selects_bucket_loopback() {
+    let prefix = GuidPrefix::new(&[8; 12]);
+    let mut rp = proxy_with_prefix(prefix);
+    rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7413)];
+    rp.loopback_unicast_locators = vec![udp([127, 0, 0, 1], 7413)];
+
+    let mut observations = InterfaceObservations::new();
+    observations.record(
+      prefix,
+      None,
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7410),
+    );
+
+    rp.resolve_send_route(&observations, &[], &DefaultRouteSelector::default());
+
+    let route = rp.send_route();
+    assert!(!route.fallback);
+    assert_eq!(route.unicast, Some(udp([127, 0, 0, 1], 7413)));
   }
 }

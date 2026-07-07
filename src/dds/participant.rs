@@ -72,6 +72,8 @@ pub struct DomainParticipantBuilder {
   only_networks: Option<Vec<IpAddr>>, /* optional IP address filter for discovery advertisements
                                        * and multicast setup */
 
+  same_host_loopback: bool, // prefer loopback for same-host peers + localhost SPDP discovery peers
+
   socket_receive_buffer_size: usize,
   socket_send_buffer_size: usize,
 
@@ -86,6 +88,7 @@ impl DomainParticipantBuilder {
     DomainParticipantBuilder {
       domain_id,
       only_networks: None,
+      same_host_loopback: true,
       socket_receive_buffer_size: Self::DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE,
       socket_send_buffer_size: Self::DEFAULT_SOCKET_SEND_BUFFER_SIZE,
       #[cfg(feature = "security")]
@@ -105,6 +108,20 @@ impl DomainParticipantBuilder {
   /// wildcard addresses for the selected ports.
   pub fn with_only_networks(mut self, addrs: impl IntoIterator<Item = impl Into<IpAddr>>) -> Self {
     self.only_networks = Some(addrs.into_iter().map(Into::into).collect());
+    self
+  }
+
+  /// Enable/disable same-host communication over loopback (default: enabled).
+  ///
+  /// When enabled, the participant (a) additionally announces SPDP to the
+  /// "localhost peers" (`127.0.0.1:<well-known SPDP ports>`), letting two
+  /// participants on the same host discover each other even with no external
+  /// network or loopback multicast, and (b) prefers a peer's advertised
+  /// loopback locator once that peer is positively confirmed to be on the same
+  /// host. Disable to force all traffic onto regular (LAN) interfaces. See
+  /// `src/rtps/loopback_same_host_design.md`.
+  pub fn same_host_loopback(mut self, enabled: bool) -> Self {
+    self.same_host_loopback = enabled;
     self
   }
 
@@ -306,6 +323,7 @@ impl DomainParticipantBuilder {
       self.socket_receive_buffer_size,
       self.socket_send_buffer_size,
       self.only_networks,
+      self.same_host_loopback,
     )?;
 
     // outer DP wrapper
@@ -839,6 +857,7 @@ impl DomainParticipantDisc {
     socket_receive_buffer_size: usize,
     socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
+    same_host_loopback: bool,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -853,6 +872,7 @@ impl DomainParticipantDisc {
       socket_receive_buffer_size,
       socket_send_buffer_size,
       only_networks,
+      same_host_loopback,
     )?;
 
     Ok(Self {
@@ -1076,6 +1096,7 @@ impl DomainParticipantInner {
     socket_receive_buffer_size: usize,
     socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
+    same_host_loopback: bool,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
@@ -1246,6 +1267,7 @@ impl DomainParticipantInner {
           security_plugins_clone,
           only_networks_for_ev_loop,
           socket_send_buffer_size,
+          same_host_loopback,
         );
         dp_event_loop.event_loop();
       })?;

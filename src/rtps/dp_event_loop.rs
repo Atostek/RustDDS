@@ -24,9 +24,10 @@ use crate::{
   },
   messages::submessages::submessages::AckSubmessage,
   network::{
+    constant::SPDP_LOCALHOST_PEER_COUNT,
     udp_listener::UDPListener,
     udp_sender::UDPSender,
-    util::{local_interface_table, IfAddr},
+    util::{local_interface_table, localhost_spdp_peer_locators, IfAddr},
   },
   polling::{new_shared_timer, SharedTimer},
   //qos::HasQoSPolicy,
@@ -135,6 +136,12 @@ pub struct DPEventLoop {
 
   discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
   discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
+
+  // Same-host loopback feature (participant-builder `same_host_loopback` knob):
+  // when true, the SPDP writer announces to the localhost peers and writers may
+  // route same-host peers over loopback. See
+  // `src/rtps/loopback_same_host_design.md`.
+  same_host_loopback: bool,
 }
 
 impl DPEventLoop {
@@ -158,6 +165,7 @@ impl DPEventLoop {
     security_plugins_opt: Option<SecurityPluginsHandle>,
     only_networks: Option<Arc<[IpAddr]>>,
     socket_send_buffer_size: usize,
+    same_host_loopback: bool,
   ) -> Self {
     let poll = Poll::new().expect("Unable to create new poll.");
     let (acknack_sender, acknack_receiver) =
@@ -301,6 +309,7 @@ impl DPEventLoop {
       discovery_update_notification_receiver,
       participant_status_sender,
       discovery_command_sender,
+      same_host_loopback,
     }
   }
 
@@ -805,6 +814,14 @@ impl DPEventLoop {
       (readers_init_list, writers_init_list)
     };
 
+    // Never create send-destinations (built-in reader proxies) toward our *own*
+    // participant. We already know our own endpoints locally, so a self reader
+    // proxy would only ever be a reliable writer target that never ACKs, causing
+    // an endless retransmit flood onto the metatraffic multicast group (the self
+    // proxy's loopback unicast is split into the observation-gated bucket, so its
+    // route falls back to multicast). Reflection in the DiscoveryDB (recognizing
+    // our own announcements) is kept; only self send-matching is skipped.
+
     // Update local writers, i.e. reader_proxies inside them
     for (writer_eid, reader_eid, reader_endpoint_set_elem, reader_qos) in &readers_init_list {
       if let Some(writer) = self.writers.get_mut(writer_eid) {
@@ -1144,7 +1161,7 @@ impl DPEventLoop {
   fn add_local_writer(&mut self, writer_ing: WriterIngredients) {
     // The writer schedules its timeouts on the loop's shared timer (already
     // registered in `new()`), so there is no per-writer timer to register.
-    let new_writer = Writer::new(
+    let mut new_writer = Writer::new(
       writer_ing,
       self.udp_sender.clone(),
       self.shared_timer.clone(),
@@ -1152,6 +1169,23 @@ impl DPEventLoop {
       Rc::clone(&self.interface_observations),
       Rc::clone(&self.local_interfaces),
     );
+
+    // Same-host loopback feature (gated by the `same_host_loopback` knob):
+    // - the built-in SPDP writer additionally announces to the localhost SPDP
+    //   peers so same-host participants discover each other with no external
+    //   network / no loopback multicast;
+    // - every writer may route a confirmed same-host peer over loopback.
+    // See `src/rtps/loopback_same_host_design.md`.
+    new_writer.set_prefer_loopback_same_host(self.same_host_loopback);
+    if self.same_host_loopback
+      && new_writer.guid().entity_id == EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER
+    {
+      new_writer.set_extra_unicast_destinations(localhost_spdp_peer_locators(
+        self.domain_info.domain_id,
+        self.domain_info.participant_id,
+        SPDP_LOCALHOST_PEER_COUNT,
+      ));
+    }
 
     self
       .poll
@@ -1388,6 +1422,7 @@ mod tests {
         None,
         None,
         0,
+        true,
       );
       dp_event_loop
         .poll

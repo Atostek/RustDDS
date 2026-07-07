@@ -151,6 +151,31 @@ pub fn get_local_multicast_locators(port: u16) -> Vec<Locator> {
   vec![Locator::from(saddr)]
 }
 
+/// Build the unicast "localhost SPDP peer" locators for same-host discovery.
+///
+/// Returns `127.0.0.1:spdp_well_known_unicast_port(domain_id, pid)` for every
+/// `pid` in `0..max_participants`, skipping `own_participant_id` (there is no
+/// need to announce to ourselves; multicast + the self reader-proxy already
+/// cover that). Sending SPDP to these fixed destinations lets two participants
+/// on the same host find each other with no external network and without
+/// relying on loopback multicast. See
+/// `src/rtps/loopback_same_host_design.md`.
+pub fn localhost_spdp_peer_locators(
+  domain_id: u16,
+  own_participant_id: u16,
+  max_participants: u16,
+) -> Vec<Locator> {
+  (0..max_participants)
+    .filter(|pid| *pid != own_participant_id)
+    .map(|pid| {
+      Locator::from(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        crate::network::constant::spdp_well_known_unicast_port(domain_id, pid),
+      ))
+    })
+    .collect()
+}
+
 pub fn get_local_unicast_locators_filtered(
   port: u16,
   only_networks: Option<&[IpAddr]>,
@@ -196,10 +221,9 @@ fn get_local_unicast_locators_inner(
 pub fn get_local_multicast_ip_addrs_filtered(
   only_networks: Option<&[IpAddr]>,
 ) -> io::Result<Vec<IpAddr>> {
-  Ok(get_local_multicast_ip_addrs_inner(
-    &enumerate_interfaces()?,
-    only_networks,
-  ))
+  let ifaces = enumerate_interfaces()?;
+  let result = get_local_multicast_ip_addrs_inner(&ifaces, only_networks);
+  Ok(result)
 }
 
 /// Inner implementation of [`get_local_multicast_ip_addrs_filtered`], factored
@@ -260,9 +284,12 @@ mod tests {
 
   use super::{
     build_ifindex_map_inner, get_local_multicast_ip_addrs_inner, get_local_unicast_locators_inner,
-    path_mtu_payload_for_peer, IfAddr, InterfaceSelector,
+    localhost_spdp_peer_locators, path_mtu_payload_for_peer, IfAddr, InterfaceSelector,
   };
-  use crate::{rtps::constant::FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, structure::locator::Locator};
+  use crate::{
+    network::constant::spdp_well_known_unicast_port,
+    rtps::constant::FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, structure::locator::Locator,
+  };
 
   fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
@@ -464,5 +491,24 @@ mod tests {
       path_mtu_payload_for_peer(&[], v4(192, 168, 1, 1)),
       FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE
     );
+  }
+
+  #[test]
+  fn localhost_spdp_peers_cover_range_excluding_self() {
+    let domain = 0;
+    let own = 2;
+    let peers = localhost_spdp_peer_locators(domain, own, 4);
+    // pids 0,1,3 (not 2), all on 127.0.0.1 at the well-known SPDP unicast ports.
+    let expected: Vec<Locator> = [0u16, 1, 3]
+      .iter()
+      .map(|pid| {
+        Locator::from(SocketAddr::new(
+          IpAddr::V4(Ipv4Addr::LOCALHOST),
+          spdp_well_known_unicast_port(domain, *pid),
+        ))
+      })
+      .collect();
+    assert_eq!(peers, expected);
+    assert!(peers.iter().all(|l| SocketAddr::from(*l).ip().is_loopback()));
   }
 }

@@ -360,7 +360,6 @@ impl UDPListener {
         }
       };
       // Something was received.
-
       // The buffer length is still MAX_MESSAGE_SIZE, set before the receive so
       // the kernel had room to write into. Shrink it back to the number of bytes
       // actually received, so that the padding + split below only consume this

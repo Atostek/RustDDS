@@ -107,6 +107,13 @@ pub struct ObservedRoutes {
   /// Updated with hysteresis (see [`STICKY_SWITCH_MARGIN`]) so it does not flip
   /// on a single stray packet arriving on another interface.
   current_interface: Option<InterfaceSelector>,
+  /// Sticky: set once we have seen *any* traffic from this participant arrive
+  /// from a loopback source address, which positively confirms it is on the
+  /// same host. Never cleared while the participant is known — a same-host peer
+  /// remains same-host even if it later also reaches us over a LAN address. Used
+  /// to authorize sending to the peer's loopback locators (see
+  /// `src/rtps/loopback_same_host_design.md`).
+  seen_from_loopback: bool,
 }
 
 impl ObservedRoutes {
@@ -124,6 +131,9 @@ impl ObservedRoutes {
     margin: Duration,
   ) {
     self.last_source = Some(source);
+    if source.ip().is_loopback() {
+      self.seen_from_loopback = true;
+    }
     if let Some(iface) = iface {
       self
         .by_iface
@@ -163,6 +173,12 @@ impl ObservedRoutes {
   /// The most recently observed source address, if any.
   pub fn last_source(&self) -> Option<SocketAddr> {
     self.last_source
+  }
+
+  /// Whether this participant has been positively confirmed to be on the same
+  /// host (traffic seen arriving from a loopback source address). Sticky.
+  pub fn is_same_host(&self) -> bool {
+    self.seen_from_loopback
   }
 
   /// The local interface currently chosen to reach this participant.
@@ -229,6 +245,7 @@ pub trait RouteSelector {
     &self,
     advertised_unicast: &[Locator],
     advertised_multicast: &[Locator],
+    advertised_loopback_unicast: &[Locator],
     observed: Option<&ObservedRoutes>,
     local_multicast_ifaces: &[InterfaceSelector],
   ) -> SendRoute;
@@ -244,8 +261,30 @@ pub trait RouteSelector {
 ///   locator is advertised but its interface cannot be determined, or several
 ///   unicast candidates cannot be disambiguated), it returns the fallback route
 ///   rather than guessing.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DefaultRouteSelector;
+#[derive(Clone, Copy, Debug)]
+pub struct DefaultRouteSelector {
+  /// When `true` (the default), a peer positively confirmed to be on the same
+  /// host is routed over its advertised loopback locator. Set `false` to
+  /// disable the same-host loopback preference (see the participant-builder
+  /// `same_host_loopback` knob).
+  pub prefer_loopback_same_host: bool,
+}
+
+impl Default for DefaultRouteSelector {
+  fn default() -> Self {
+    Self {
+      prefer_loopback_same_host: true,
+    }
+  }
+}
+
+impl DefaultRouteSelector {
+  pub fn new(prefer_loopback_same_host: bool) -> Self {
+    Self {
+      prefer_loopback_same_host,
+    }
+  }
+}
 
 fn first_reachable_udp(locators: &[Locator]) -> Option<Locator> {
   locators
@@ -259,6 +298,7 @@ impl RouteSelector for DefaultRouteSelector {
     &self,
     advertised_unicast: &[Locator],
     advertised_multicast: &[Locator],
+    advertised_loopback_unicast: &[Locator],
     observed: Option<&ObservedRoutes>,
     local_multicast_ifaces: &[InterfaceSelector],
   ) -> SendRoute {
@@ -266,6 +306,25 @@ impl RouteSelector for DefaultRouteSelector {
     let Some(obs) = observed else {
       return SendRoute::fallback();
     };
+
+    // Same-host fast path: if we have positively confirmed the peer is on this
+    // host and it advertised a loopback locator, prefer loopback outright. This
+    // is the only situation in which we ever send to a loopback locator, which
+    // is why it is safe (a remote host's 127.0.0.1 is never selected). See
+    // `src/rtps/loopback_same_host_design.md`.
+    if self.prefer_loopback_same_host && obs.is_same_host() {
+      if let Some(lo) = advertised_loopback_unicast
+        .iter()
+        .copied()
+        .find(|l| l.is_udp())
+      {
+        return SendRoute {
+          unicast: Some(lo),
+          multicast: None,
+          fallback: false,
+        };
+      }
+    }
 
     let mc_advertised = first_reachable_udp(advertised_multicast);
 
@@ -350,18 +409,19 @@ mod tests {
 
   #[test]
   fn no_observation_is_fallback() {
-    let sel = DefaultRouteSelector;
-    let route = sel.select(&[udp([10, 0, 0, 5], 7410)], &[], None, &[]);
+    let sel = DefaultRouteSelector::default();
+    let route = sel.select(&[udp([10, 0, 0, 5], 7410)], &[], &[], None, &[]);
     assert!(route.fallback);
   }
 
   #[test]
   fn single_unicast_with_observation_narrows() {
-    let sel = DefaultRouteSelector;
+    let sel = DefaultRouteSelector::default();
     let mut obs = ObservedRoutes::default();
     obs.record(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
     let route = sel.select(
       &[udp([10, 0, 0, 5], 7410)],
+      &[],
       &[],
       Some(&obs),
       &[iface([10, 0, 0, 1])],
@@ -373,13 +433,14 @@ mod tests {
 
   #[test]
   fn multicast_tagged_with_observed_interface() {
-    let sel = DefaultRouteSelector;
+    let sel = DefaultRouteSelector::default();
     let mut obs = ObservedRoutes::default();
     obs.record(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
     let mc = udp([239, 255, 0, 1], 7401);
     let route = sel.select(
       &[udp([10, 0, 0, 5], 7410)],
       &[mc],
+      &[],
       Some(&obs),
       &[iface([10, 0, 0, 1])],
     );
@@ -389,7 +450,7 @@ mod tests {
 
   #[test]
   fn advertised_multicast_but_unknown_interface_falls_back() {
-    let sel = DefaultRouteSelector;
+    let sel = DefaultRouteSelector::default();
     let mut obs = ObservedRoutes::default();
     // Observation without a resolvable local interface (unicast only source).
     obs.record(None, sockaddr([10, 0, 0, 5], 7410));
@@ -397,6 +458,7 @@ mod tests {
     let route = sel.select(
       &[udp([10, 0, 0, 5], 7410)],
       &[mc],
+      &[],
       Some(&obs),
       &[iface([10, 0, 0, 1])],
     );
@@ -405,12 +467,13 @@ mod tests {
 
   #[test]
   fn ambiguous_multi_unicast_without_source_match_falls_back() {
-    let sel = DefaultRouteSelector;
+    let sel = DefaultRouteSelector::default();
     let mut obs = ObservedRoutes::default();
     obs.record(None, sockaddr([172, 16, 0, 9], 7410));
     // Two advertised addresses, neither matching the observed source IP.
     let route = sel.select(
       &[udp([10, 0, 0, 5], 7410), udp([192, 168, 1, 5], 7410)],
+      &[],
       &[],
       Some(&obs),
       &[],
@@ -420,11 +483,12 @@ mod tests {
 
   #[test]
   fn multi_unicast_disambiguated_by_source() {
-    let sel = DefaultRouteSelector;
+    let sel = DefaultRouteSelector::default();
     let mut obs = ObservedRoutes::default();
     obs.record(Some(iface([10, 0, 0, 1])), sockaddr([192, 168, 1, 5], 7410));
     let route = sel.select(
       &[udp([10, 0, 0, 5], 7410), udp([192, 168, 1, 5], 7410)],
+      &[],
       &[],
       Some(&obs),
       &[iface([10, 0, 0, 1])],
@@ -549,5 +613,87 @@ mod tests {
       );
     }
     assert_eq!(obs.best_interface(), Some(current));
+  }
+
+  #[test]
+  fn loopback_source_marks_same_host() {
+    let mut obs = ObservedRoutes::default();
+    assert!(!obs.is_same_host());
+    obs.record(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
+    assert!(!obs.is_same_host());
+    // A single packet observed from a loopback source is enough, and it sticks.
+    obs.record(None, sockaddr([127, 0, 0, 1], 7410));
+    assert!(obs.is_same_host());
+    obs.record(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
+    assert!(obs.is_same_host());
+  }
+
+  #[test]
+  fn same_host_prefers_advertised_loopback() {
+    let sel = DefaultRouteSelector::default();
+    let mut obs = ObservedRoutes::default();
+    obs.record(None, sockaddr([127, 0, 0, 1], 7410));
+    let lo = udp([127, 0, 0, 1], 7413);
+    let route = sel.select(
+      &[udp([10, 0, 0, 5], 7413)],
+      &[udp([239, 255, 0, 1], 7401)],
+      &[lo],
+      Some(&obs),
+      &[iface([10, 0, 0, 1])],
+    );
+    assert!(!route.fallback);
+    assert_eq!(route.unicast, Some(lo));
+    assert_eq!(route.multicast, None);
+  }
+
+  #[test]
+  fn same_host_without_loopback_advertised_uses_normal_route() {
+    let sel = DefaultRouteSelector::default();
+    let mut obs = ObservedRoutes::default();
+    // Same host, but the peer did not advertise any loopback locator.
+    obs.record(Some(iface([10, 0, 0, 1])), sockaddr([127, 0, 0, 1], 7410));
+    let route = sel.select(
+      &[udp([10, 0, 0, 5], 7413)],
+      &[],
+      &[],
+      Some(&obs),
+      &[iface([10, 0, 0, 1])],
+    );
+    assert_eq!(route.unicast, Some(udp([10, 0, 0, 5], 7413)));
+  }
+
+  #[test]
+  fn not_same_host_never_uses_loopback() {
+    let sel = DefaultRouteSelector::default();
+    let mut obs = ObservedRoutes::default();
+    // Only LAN traffic seen: even though a loopback locator is advertised (as
+    // e.g. OpenDDS does), it must not be selected.
+    obs.record(Some(iface([10, 0, 0, 1])), sockaddr([10, 0, 0, 5], 7410));
+    let lo = udp([127, 0, 0, 1], 7413);
+    let route = sel.select(
+      &[udp([10, 0, 0, 5], 7413)],
+      &[],
+      &[lo],
+      Some(&obs),
+      &[iface([10, 0, 0, 1])],
+    );
+    assert_eq!(route.unicast, Some(udp([10, 0, 0, 5], 7413)));
+    assert_ne!(route.unicast, Some(lo));
+  }
+
+  #[test]
+  fn disabled_selector_ignores_same_host_loopback() {
+    let sel = DefaultRouteSelector::new(false);
+    let mut obs = ObservedRoutes::default();
+    obs.record(Some(iface([10, 0, 0, 1])), sockaddr([127, 0, 0, 1], 7410));
+    let lo = udp([127, 0, 0, 1], 7413);
+    let route = sel.select(
+      &[udp([10, 0, 0, 5], 7413)],
+      &[],
+      &[lo],
+      Some(&obs),
+      &[iface([10, 0, 0, 1])],
+    );
+    assert_eq!(route.unicast, Some(udp([10, 0, 0, 5], 7413)));
   }
 }
