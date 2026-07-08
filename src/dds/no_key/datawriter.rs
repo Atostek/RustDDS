@@ -331,35 +331,23 @@ where
     self.keyed_datawriter.assert_liveliness()
   }
 
+  /// Placeholder only — not implemented. **Will panic if called.**
+  #[deprecated(note = "placeholder only; will panic if called")]
+  pub fn get_matched_subscriptions(&self) -> Vec<SubscriptionBuiltinTopicData> {
+    #[allow(deprecated)]
+    self.keyed_datawriter.get_matched_subscriptions()
+  }
+
+  /*
   /// Unimplemented. <b>Do not use</b>.
   ///
   /// # Examples
   // TODO: enable run when implemented
   /// ```no_run ignore
-  /// # use serde::{Serialize, Deserialize};
-  /// # use rustdds::*;
-  /// # use rustdds::no_key::DataWriter;
-  /// # use rustdds::serialization::CDRSerializerAdapter;
-  /// #
-  /// let domain_participant = DomainParticipant::new(0).unwrap();
-  /// let qos = QosPolicyBuilder::new().build();
-  /// let publisher = domain_participant.create_publisher(&qos).unwrap();
-  ///
-  /// # #[derive(Serialize, Deserialize)]
-  /// # struct SomeType {}
-  /// #
-  /// // NoKey is important
-  /// let topic = domain_participant.create_topic("some_topic".to_string(), "SomeType".to_string(), &qos, TopicKind::NoKey).unwrap();
-  /// let data_writer = publisher.create_datawriter_no_key::<SomeType, CDRSerializerAdapter<_>>(topic, None).unwrap();
-  ///
   /// for sub in data_writer.get_matched_subscriptions().iter() {
   ///   // handle subscriptions
   /// }
   /// ```
-  pub fn get_matched_subscriptions(&self) -> Vec<SubscriptionBuiltinTopicData> {
-    self.keyed_datawriter.get_matched_subscriptions()
-  }
-  /*
   /// Gets mio receiver for all implemented Status changes
   ///
   /// # Examples

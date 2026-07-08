@@ -706,11 +706,13 @@ where
     Ok(result)
   }
 
-  /// Return values:
-  /// true - got all historical data
-  /// false - timeout before all historical data was received
+  /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// When implemented, this should return `true` if all historical data was
+  /// received before the timeout and `false` otherwise.
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn wait_for_historical_data(&mut self, _max_wait: Duration) -> bool {
-    todo!()
+    unreachable!("wait_for_historical_data is a placeholder only and must not be called")
   }
 
   // Spec calls for two separate functions:

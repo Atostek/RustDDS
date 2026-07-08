@@ -167,14 +167,16 @@ impl Reader {
     let topic_cache_name = i.topic_cache_handle.lock().unwrap().topic_name();
     if i.topic_name != topic_cache_name {
       panic!(
-        "Topic name = {} and topic cache name = {} not equal when creating a Reader",
+        "RustDDS internal bug: topic name {} and topic cache name {} differ when creating a Reader",
         i.topic_name, topic_cache_name
       );
     }
 
     // If reader should be stateless, only BestEffort QoS is supported
     if i.like_stateless && i.qos_policy.is_reliable() {
-      panic!("Attempted to create a stateless Reader with other than BestEffort reliability");
+      panic!(
+        "RustDDS internal bug: attempted to create a stateless Reader with Reliable QoS"
+      );
     }
 
     Self {
@@ -843,7 +845,10 @@ impl Reader {
         let res = worker(self, &mut wp);
         let x = self.matched_writers.insert(writer_guid, wp); // re-insert
         if x.is_some() {
-          panic!("with_mutable_writer_proxy: Worker inserted writer proxy behind my back!")
+          panic!(
+            "RustDDS internal bug: with_mutable_writer_proxy worker re-inserted a writer proxy \
+             for {writer_guid:?}"
+          )
         }
         Some(res)
       }
@@ -1412,8 +1417,8 @@ impl Reader {
   fn acquire_the_topic_cache_guard(&self) -> MutexGuard<'_, TopicCache> {
     self.topic_cache.lock().unwrap_or_else(|e| {
       panic!(
-        "The topic cache of topic {} is poisoned. Error: {}",
-        self.topic_name, e
+        "RustDDS internal bug: topic cache of topic {} is poisoned after a prior panic: {e}",
+        self.topic_name
       )
     })
   }

@@ -45,7 +45,9 @@ impl<D, K> Sample<D, K> {
   pub fn unwrap(self) -> D {
     match self {
       Sample::Value(d) => d,
-      Sample::Dispose(_k) => panic!("Unwrap called on a Sample with no data"),
+      Sample::Dispose(_k) => panic!(
+        "Unwrap called on a Sample with no data (Dispose notification). Use Sample::value() instead."
+      ),
     }
   }
 

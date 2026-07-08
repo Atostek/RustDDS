@@ -764,42 +764,10 @@ where
     }
   }
 
-  /// Unimplemented. <b>Do not use</b>.
-  ///
-  /// # Examples
-  ///
-  /// ```no_run
-  // TODO: enable when available
-  /// # use serde::{Serialize, Deserialize};
-  /// # use rustdds::*;
-  /// # use rustdds::with_key::DataWriter;
-  /// # use rustdds::serialization::CDRSerializerAdapter;
-  /// #
-  /// let domain_participant = DomainParticipant::new(0).unwrap();
-  /// let qos = QosPolicyBuilder::new().build();
-  /// let publisher = domain_participant.create_publisher(&qos).unwrap();
-  ///
-  /// #[derive(Serialize, Deserialize, Debug)]
-  /// struct SomeType { a: i32 }
-  /// impl Keyed for SomeType {
-  ///   type K = i32;
-  ///
-  ///   fn key(&self) -> Self::K {
-  ///     self.a
-  ///   }
-  /// }
-  ///
-  /// // WithKey is important
-  /// let topic = domain_participant.create_topic("some_topic".to_string(),
-  /// "SomeType".to_string(), &qos, TopicKind::WithKey).unwrap();
-  /// let data_writer = publisher.create_datawriter::<SomeType,
-  /// CDRSerializerAdapter<_>>(&topic, None).unwrap();
-  ///
-  /// for sub in data_writer.get_matched_subscriptions().iter() {
-  ///   // do something
-  /// }
+  /// Placeholder only — not implemented. **Will panic if called.**
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn get_matched_subscriptions(&self) -> Vec<SubscriptionBuiltinTopicData> {
-    todo!()
+    unreachable!("get_matched_subscriptions is a placeholder only and must not be called")
   }
 
   /// Disposes data instance with specified key

@@ -1525,7 +1525,7 @@ impl DomainParticipantInner {
     let db = self
       .discovery_db
       .read()
-      .unwrap_or_else(|e| panic!("DiscoveryDB is poisoned. {e:?}"));
+      .unwrap_or_else(|e| panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}"));
 
     db.all_user_topics().cloned().collect()
   }

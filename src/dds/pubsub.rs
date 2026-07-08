@@ -121,7 +121,7 @@ impl Publisher {
     self
       .inner
       .lock()
-      .unwrap_or_else(|e| panic!("Inner publisher lock fail! {e:?}"))
+      .unwrap_or_else(|e| panic!("RustDDS internal bug: InnerPublisher lock poisoned after a prior panic: {e:?}"))
   }
 
   /// Creates DDS [DataWriter](struct.With_Key_DataWriter.html) for Keyed topic
@@ -282,16 +282,16 @@ impl Publisher {
   // Suspend and resume publications are performance optimization methods.
   // The minimal correct implementation is to do nothing. See DDS spec 2.2.2.4.1.8
   // and .9
-  /// **NOT IMPLEMENTED. DO NOT USE**
-  #[deprecated(note = "unimplemented")]
+  /// Placeholder only — not implemented. **Will panic if called.**
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn suspend_publications(&self) {
-    unimplemented!();
+    unreachable!("suspend_publications is a placeholder only and must not be called")
   }
 
-  /// **NOT IMPLEMENTED. DO NOT USE**
-  #[deprecated(note = "unimplemented")]
+  /// Placeholder only — not implemented. **Will panic if called.**
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn resume_publications(&self) {
-    unimplemented!();
+    unreachable!("resume_publications is a placeholder only and must not be called")
   }
 
   // coherent change set
@@ -309,10 +309,13 @@ impl Publisher {
 
   // Wait for all matched reliable DataReaders acknowledge data written so far,
   // or timeout.
-  /// **NOT IMPLEMENTED. DO NOT USE**
-  #[deprecated(note = "unimplemented")]
+  /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// Use [`WithKeyDataWriter::wait_for_acknowledgments`](crate::with_key::DataWriter::wait_for_acknowledgments)
+  /// on individual writers instead.
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn wait_for_acknowledgments(&self, _max_wait: Duration) -> WaitResult<()> {
-    unimplemented!();
+    unreachable!("wait_for_acknowledgments is a placeholder only and must not be called")
   }
 
   // What is the use case for this? (is it useful in Rust style of programming?

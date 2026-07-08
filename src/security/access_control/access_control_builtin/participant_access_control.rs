@@ -346,7 +346,9 @@ impl ParticipantAccessControl for AccessControlBuiltin {
   }
 
   fn set_listener(&self) -> SecurityResult<()> {
-    todo!();
+    Err(create_security_error_and_log!(
+      "set_listener not supported. Use status events in DataReader/DataWriter instead."
+    ))
   }
 
   fn get_participant_sec_attributes(

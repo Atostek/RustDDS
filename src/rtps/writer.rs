@@ -293,7 +293,9 @@ impl Writer {
     // If writer should behave statelessly, only BestEffort QoS is currently
     // supported
     if i.like_stateless && i.qos_policies.is_reliable() {
-      panic!("Attempted to create a stateless-like Writer with other than BestEffort reliability");
+      panic!(
+        "RustDDS internal bug: attempted to create a stateless-like Writer with Reliable QoS"
+      );
     }
 
     let heartbeat_period = i

@@ -385,7 +385,9 @@ where
       if let Some(imd) = self.instance_map.get_mut(inst) {
         imd.last_generation_accessed = *gen;
       } else {
-        panic!("Instance disappeared!?!!1!");
+        panic!(
+          "RustDDS internal bug: instance disappeared from cache between selection and access"
+        );
       }
     }
   }

@@ -106,7 +106,7 @@ pub(crate) fn discovery_db_read(
 ) -> RwLockReadGuard<'_, DiscoveryDB> {
   match discovery_db.read() {
     Ok(db) => db,
-    Err(e) => panic!("DiscoveryDB is poisoned {e:?}."),
+    Err(e) => panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}."),
   }
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn discovery_db_write(
 ) -> RwLockWriteGuard<'_, DiscoveryDB> {
   match discovery_db.write() {
     Ok(db) => db,
-    Err(e) => panic!("DiscoveryDB is poisoned {e:?}."),
+    Err(e) => panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}."),
   }
 }
 

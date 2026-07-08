@@ -432,9 +432,8 @@ where
   fn acquire_the_topic_cache_guard(&self) -> MutexGuard<'_, TopicCache> {
     self.topic_cache.lock().unwrap_or_else(|e| {
       panic!(
-        "The topic cache of topic {} is poisoned. Error: {}",
-        self.my_topic.name(),
-        e
+        "RustDDS internal bug: topic cache of topic {} is poisoned after a prior panic: {e}",
+        self.my_topic.name()
       )
     })
   }
