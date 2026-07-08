@@ -72,7 +72,10 @@ fn main() {
   let is_auto_test = std::env::var("auto_test").is_ok();
 
   // Build the DomainParticipant
-  let dp_builder = DomainParticipantBuilder::new(*domain_id);
+  let mut dp_builder = DomainParticipantBuilder::new(*domain_id);
+  if matches.get_flag("no_same_host_loopback") {
+    dp_builder = dp_builder.same_host_loopback(false);
+  }
   #[cfg(feature = "security")]
   let dp_builder = if let Some(sec_dir_path) = matches.get_one::<String>("security") {
     match (
@@ -569,6 +572,12 @@ fn get_matches() -> ArgMatches {
         .long("pkcs11-pin")
         .value_name("pkcs11-pin")
         .requires("pkcs11-token"),
+    )
+    .arg(
+      Arg::new("no_same_host_loopback")
+        .help("Disable same-host loopback routing and localhost SPDP peers")
+        .long("no-same-host-loopback")
+        .action(clap::ArgAction::SetTrue),
     )
     .arg(
       Arg::new("representation")

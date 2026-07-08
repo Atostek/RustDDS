@@ -28,6 +28,7 @@ use rustdds::{
     statusevents::{DataReaderStatus, DataWriterStatus},
   },
   policy::{Deadline, Durability, History, Lifespan, Ownership, Reliability, TimeBasedFilter},
+  policy::{DataRepresentation, XCDR2_DATA_REPRESENTATION, XCDR_DATA_REPRESENTATION},
   with_key::Sample,
   DomainParticipantBuilder, Duration, Keyed, QosPolicyBuilder, StatusEvented, TopicDescription,
   TopicKind,
@@ -127,6 +128,10 @@ struct Args {
   /// durability (v: VOLATILE, l: TRANSIENT_LOCAL, t: TRANSIENT, p: PERSISTENT)
   #[arg(short = 'D')]
   durability: Option<String>,
+
+  /// disable same-host loopback routing and localhost SPDP peer discovery
+  #[arg(long = "no-same-host-loopback", default_value_t = false)]
+  no_same_host_loopback: bool,
 
   /// data representation (1: XCDR, 2: XCDR2). RustDDS only supports XCDR1.
   #[arg(short = 'x')]
@@ -279,6 +284,9 @@ fn main() {
         println!("shape_main: restricting to interfaces {addrs:?}");
         builder = builder.with_only_networks(addrs);
       }
+    }
+    if args.no_same_host_loopback {
+      builder = builder.same_host_loopback(false);
     }
     builder
       .build()
@@ -516,7 +524,17 @@ fn build_qos(args: &Args) -> rustdds::QosPolicies {
     });
   }
 
-  b.build()
+  let data_representation = match args.data_representation.as_deref() {
+    Some("2") => DataRepresentation {
+      value: vec![XCDR2_DATA_REPRESENTATION],
+    },
+    Some("1") | None => DataRepresentation {
+      value: vec![XCDR_DATA_REPRESENTATION],
+    },
+    Some(other) => panic!("unsupported data representation {other} (use 1 or 2)"),
+  };
+
+  b.build().with_data_representation(data_representation)
 }
 
 /// Determine the write period: an explicit `--write-period` wins; otherwise
