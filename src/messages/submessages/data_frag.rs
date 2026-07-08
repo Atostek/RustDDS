@@ -234,6 +234,54 @@ impl DataFrag {
       )));
     }
 
+    if fragments_in_submessage < 1 {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("DataFrag fragmentsInSubmessage={fragments_in_submessage} must be >= 1."),
+      ));
+    }
+
+    let start_u32 = u32::from(fragment_starting_num);
+    let count_u32 = u32::from(fragments_in_submessage);
+    let total_u32 = u32::from(expected_total);
+    let last_frag = start_u32
+      .checked_add(count_u32)
+      .and_then(|n| n.checked_sub(1));
+    match last_frag {
+      None => {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          format!(
+            "DataFrag fragment span overflow: fragmentStartingNum={start_u32} \
+             fragmentsInSubmessage={count_u32}."
+          ),
+        ));
+      }
+      Some(last) if last > total_u32 => {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          format!(
+            "DataFrag fragment span exceeds total: last fragment {last} > expected_total \
+             {total_u32} (fragmentStartingNum={start_u32}, fragmentsInSubmessage={count_u32})."
+          ),
+        ));
+      }
+      _ => {}
+    }
+
+    let max_payload_bytes = (count_u32 as usize) * (fragment_size as usize);
+    if datafrag.serialized_payload.len() > max_payload_bytes {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+          "DataFrag serializedData length={} exceeds fragmentsInSubmessage={} x fragmentSize={}.",
+          datafrag.serialized_payload.len(),
+          fragments_in_submessage,
+          fragment_size
+        ),
+      ));
+    }
+
     Ok(datafrag)
   }
 }
@@ -267,5 +315,64 @@ impl HasEntityIds for DataFrag {
   }
   fn sender_entity_id(&self) -> EntityId {
     self.writer_id
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use bytes::Bytes;
+  use enumflags2::BitFlags;
+  use speedy::{Endianness, Writable};
+
+  use super::*;
+  use crate::messages::submessages::submessages::DATAFRAG_Flags;
+
+  fn serialize_body(df: &DataFrag) -> Bytes {
+    let mut buf = Vec::new();
+    df.write_to_stream_with_ctx(Endianness::LittleEndian, &mut buf)
+      .expect("serialize DataFrag body");
+    Bytes::from(buf)
+  }
+
+  #[test]
+  fn deserialize_accepts_valid_multi_fragment_span() {
+    let df = DataFrag {
+      fragment_starting_num: FragmentNumber::new(1),
+      fragments_in_submessage: 2,
+      fragment_size: 256,
+      data_size: 512,
+      serialized_payload: Bytes::from(vec![0u8; 512]),
+      ..Default::default()
+    };
+    let bytes = serialize_body(&df);
+    assert!(DataFrag::deserialize(&bytes, BitFlags::<DATAFRAG_Flags>::empty()).is_ok());
+  }
+
+  #[test]
+  fn deserialize_rejects_fragment_span_beyond_total() {
+    let df = DataFrag {
+      fragment_starting_num: FragmentNumber::new(2),
+      fragments_in_submessage: 2,
+      fragment_size: 256,
+      data_size: 512,
+      serialized_payload: Bytes::from(vec![0u8; 256]),
+      ..Default::default()
+    };
+    let bytes = serialize_body(&df);
+    assert!(DataFrag::deserialize(&bytes, BitFlags::<DATAFRAG_Flags>::empty()).is_err());
+  }
+
+  #[test]
+  fn deserialize_rejects_zero_fragments_in_submessage() {
+    let df = DataFrag {
+      fragment_starting_num: FragmentNumber::new(1),
+      fragments_in_submessage: 0,
+      fragment_size: 256,
+      data_size: 512,
+      serialized_payload: Bytes::from(vec![0u8; 256]),
+      ..Default::default()
+    };
+    let bytes = serialize_body(&df);
+    assert!(DataFrag::deserialize(&bytes, BitFlags::<DATAFRAG_Flags>::empty()).is_err());
   }
 }

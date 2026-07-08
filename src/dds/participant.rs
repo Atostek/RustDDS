@@ -1016,7 +1016,9 @@ impl Drop for DomainParticipantDisc {
 
     debug!("Waiting for Discovery join.");
     if let Ok(handle) = self.discovery_join_handle.try_recv() {
-      handle.join().unwrap();
+      handle
+        .join()
+        .unwrap_or_else(|e| warn!("Failed to join discovery thread: {e:?}"));
       debug!("Joined Discovery.");
     }
   }
@@ -1230,6 +1232,8 @@ impl DomainParticipantInner {
 
     let (stop_poll_sender, stop_poll_receiver) = mio_channel::channel();
 
+    let (ev_ready_tx, ev_ready_rx) = std::sync::mpsc::sync_channel::<CreateResult<()>>(1);
+
     // Launch the background thread for DomainParticipant
     let disc_db_clone = discovery_db.clone();
     let security_plugins_clone = security_plugins_handle.clone();
@@ -1237,7 +1241,7 @@ impl DomainParticipantInner {
     let ev_loop_handle = thread::Builder::new()
       .name(format!("RustDDS Participant {participant_id} event loop"))
       .spawn(move || {
-        let dp_event_loop = DPEventLoop::new(
+        match DPEventLoop::new(
           domain_info_clone,
           dds_cache_clone,
           listeners,
@@ -1268,9 +1272,24 @@ impl DomainParticipantInner {
           only_networks_for_ev_loop,
           socket_send_buffer_size,
           same_host_loopback,
-        );
-        dp_event_loop.event_loop();
+        ) {
+          Ok(dp_event_loop) => {
+            let _ = ev_ready_tx.send(Ok(()));
+            dp_event_loop.event_loop();
+          }
+          Err(e) => {
+            let _ = ev_ready_tx.send(Err(e));
+          }
+        }
       })?;
+
+    match ev_ready_rx.recv() {
+      Ok(Ok(())) => {}
+      Ok(Err(e)) => return Err(e),
+      Err(e) => {
+        return create_error_poisoned!("dp_event_loop ready handshake failed: {e:?}");
+      }
+    }
 
     #[cfg(feature = "security")]
     let have_security = true;

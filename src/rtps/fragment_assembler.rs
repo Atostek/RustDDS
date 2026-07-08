@@ -32,46 +32,69 @@ struct AssemblyBuffer {
 }
 
 impl AssemblyBuffer {
-  pub fn new(datafrag: &DataFrag) -> Self {
-    let data_size: usize = datafrag.data_size.try_into().unwrap();
-    // We have unwrap here, but it will succeed as long as usize >= u32.
+  pub fn new(datafrag: &DataFrag) -> Option<Self> {
+    let data_size: usize = datafrag.data_size.try_into().ok()?;
     let fragment_size: u16 = datafrag.fragment_size;
     debug!("new AssemblyBuffer data_size={data_size} frag_size={fragment_size}");
 
-    assert!(fragment_size as usize <= data_size); // This is validated at DataFrag deserializer
-    assert!(fragment_size > 0); // This is validated at DataFrag deserializer
-                                // Note: Technically RTPS spec allows fragment_size == 0.
+    if fragment_size == 0 || fragment_size as usize > data_size {
+      error!("Cannot create AssemblyBuffer: fragment_size={fragment_size} data_size={data_size}");
+      return None;
+    }
 
     let mut buffer_bytes = BytesMut::with_capacity(data_size);
-    buffer_bytes.resize(data_size, 0); // TODO: Can we replace this with faster (and unsafer) .set_len and live with
-                                       // uninitialized data?
+    buffer_bytes.resize(data_size, 0);
 
     let fragment_count = usize::from(datafrag.total_number_of_fragments());
+    if fragment_count == 0 {
+      error!("Cannot create AssemblyBuffer: zero fragment count");
+      return None;
+    }
 
     let now = Timestamp::now();
 
-    Self {
+    Some(Self {
       buffer_bytes,
       fragment_count,
       received_bitmap: BitVec::from_elem(fragment_count, false),
       created_time: now,
       modified_time: now,
-    }
+    })
   }
 
-  pub fn insert_frags(&mut self, datafrag: &DataFrag, frag_size: u16) {
+  /// Returns `false` if the fragment run is invalid or out of bounds.
+  pub fn insert_frags(&mut self, datafrag: &DataFrag, frag_size: u16) -> bool {
     // TODO: Sanity checks? E.g. datafrag.fragment_size == frag_size
     // Or is this even guaranteed? Can Writer vary fragment size?
     // Answer: Writer must guarantee constant fragment size per SequenceNumber.
     // So yes, it is guaranteed. RTPS spec v2.5 Section 8.4.14.1.1 "How to select
     // the fragment size" even says that the frag size is fixed per-writer.
 
-    let frag_size = usize::from(frag_size); // - payload_header;
+    let frag_size = usize::from(frag_size);
     let frags_in_submessage = usize::from(datafrag.fragments_in_submessage);
-    let fragment_starting_num: usize = u32::from(datafrag.fragment_starting_num)
-      .try_into()
-      .unwrap();
-    let start_frag_from_0 = fragment_starting_num - 1; // number of first fragment in this DataFrag, indexing from 0
+    if frags_in_submessage == 0 {
+      error!("insert_frags: fragments_in_submessage is zero");
+      return false;
+    }
+    let fragment_starting_num: usize = match u32::from(datafrag.fragment_starting_num).try_into() {
+      Ok(n) if n >= 1 => n,
+      _ => {
+        error!(
+          "insert_frags: invalid fragment_starting_num {:?}",
+          datafrag.fragment_starting_num
+        );
+        return false;
+      }
+    };
+    let start_frag_from_0 = fragment_starting_num - 1;
+    if start_frag_from_0 + frags_in_submessage > self.fragment_count {
+      error!(
+        "insert_frags: fragment span out of bounds: start={fragment_starting_num} \
+         count={frags_in_submessage} total={}",
+        self.fragment_count
+      );
+      return false;
+    }
 
     debug!(
       "insert_frags: datafrag.writer_sn = {:?}, frag_size = {:?}, datafrag.fragment_size = {:?}, \
@@ -100,6 +123,12 @@ impl AssemblyBuffer {
         ),
       self.buffer_bytes.len(),
     );
+    if from_byte > to_before_byte {
+      error!(
+        "insert_frags: invalid byte range from_byte={from_byte} to_before_byte={to_before_byte}"
+      );
+      return false;
+    }
     let payload_size = to_before_byte - from_byte;
 
     // sanity check data size
@@ -134,6 +163,7 @@ impl AssemblyBuffer {
       self.received_bitmap.set(start_frag_from_0 + f, true);
     }
     self.modified_time = Timestamp::now();
+    true
   }
 
   pub fn is_complete(&self) -> bool {
@@ -185,12 +215,24 @@ impl FragmentAssembler {
     let writer_sn = datafrag.writer_sn;
     let frag_size = self.fragment_size;
 
-    let assembly_buffer = self
-      .assembly_buffers
-      .entry(datafrag.writer_sn)
-      .or_insert_with(|| AssemblyBuffer::new(datafrag));
+    let sn = datafrag.writer_sn;
+    if !self.assembly_buffers.contains_key(&sn) {
+      let Some(buf) = AssemblyBuffer::new(datafrag) else {
+        error!("new_datafrag: failed to create AssemblyBuffer for {sn:?}");
+        return None;
+      };
+      self.assembly_buffers.insert(sn, buf);
+    }
 
-    assembly_buffer.insert_frags(datafrag, frag_size);
+    let Some(assembly_buffer) = self.assembly_buffers.get_mut(&sn) else {
+      error!("new_datafrag: AssemblyBuffer missing for {sn:?}");
+      return None;
+    };
+
+    if !assembly_buffer.insert_frags(datafrag, frag_size) {
+      error!("new_datafrag: rejected invalid DATAFRAG for {sn:?}");
+      return None;
+    }
 
     if assembly_buffer.is_complete() {
       debug!("new_datafrag: COMPLETED FRAGMENT");
@@ -300,7 +342,7 @@ mod tests {
 
     // First submessage packs fragments 1 and 2 (K = 2, 2048 payload bytes).
     let first = datafrag(1, 2, frag_size, data_size, whole[0..2048].to_vec());
-    let mut ab = AssemblyBuffer::new(&first);
+    let mut ab = AssemblyBuffer::new(&first).expect("valid first fragment");
     assert!(!ab.is_complete());
     ab.insert_frags(&first, frag_size);
     assert!(!ab.is_complete(), "still missing the tail fragment");
@@ -324,9 +366,37 @@ mod tests {
     let whole: Vec<u8> = (0..data_size as usize).map(|i| (i % 97) as u8).collect();
 
     let all = datafrag(1, 3, frag_size, data_size, whole.clone());
-    let mut ab = AssemblyBuffer::new(&all);
+    let mut ab = AssemblyBuffer::new(&all).expect("valid fragment set");
     ab.insert_frags(&all, frag_size);
     assert!(ab.is_complete());
     assert_eq!(&ab.buffer_bytes[..], &whole[..]);
+  }
+
+  // Malformed span (starting at last fragment but claiming multiple fragments)
+  // must not panic and must not falsely complete reassembly.
+  #[test]
+  fn reject_fragment_span_beyond_total() {
+    let frag_size = 256u16;
+    let data_size = 512u32; // 2 fragments total
+    let bad = datafrag(2, 2, frag_size, data_size, vec![0u8; 256]);
+    let mut ab = AssemblyBuffer::new(&bad).expect("buffer for valid data_size");
+    assert!(!ab.insert_frags(&bad, frag_size));
+    assert!(!ab.is_complete());
+  }
+
+  #[test]
+  fn fragment_assembler_rejects_span_beyond_total() {
+    use enumflags2::BitFlags;
+
+    use super::FragmentAssembler;
+    use crate::messages::submessages::submessages::DATAFRAG_Flags;
+
+    let frag_size = 256u16;
+    let data_size = 512u32;
+    let bad = datafrag(2, 2, frag_size, data_size, vec![0u8; 256]);
+    let mut fa = FragmentAssembler::new(frag_size);
+    assert!(fa
+      .new_datafrag(&bad, BitFlags::<DATAFRAG_Flags>::empty())
+      .is_none());
   }
 }

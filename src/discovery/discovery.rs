@@ -368,16 +368,17 @@ impl Discovery {
           discovery_publisher_qos.clone()
         };
 
-        let topic = domain_participant
-          .create_topic(
+        let topic = try_construct!(
+          domain_participant.create_topic(
             $topic_name.to_string(),
             $topic_type_name.to_string(),
             topic_qos_ref,
             $has_key::TOPIC_KIND,
-          )
-          .expect("Unable to create topic. ");
+          ),
+          "Unable to create discovery topic."
+        );
         paste! {
-          let reader =
+          let reader = try_construct!(
             discovery_subscriber
             . [< create_datareader_with_entity_id_ $has_key >]
               ::<$message_type, [<$repr DeserializerAdapter>] <$message_type>>(
@@ -385,20 +386,25 @@ impl Discovery {
               $reader_entity_id,
               $endpoint_qos_opt,
               $stateless_RTPS,
-            ).expect("Unable to create DataReader. ");
+            ),
+            "Unable to create discovery DataReader."
+          );
 
-          let writer =
+          let writer = try_construct!(
               discovery_publisher.[< create_datawriter_with_entity_id_ $has_key >]
                 ::<$message_type, [<$repr SerializerAdapter>] <$message_type>>(
                 $writer_entity_id,
                 &topic,
                 Some(publisher_qos),
                 $stateless_RTPS,
-              ).expect("Unable to create DataWriter .");
+              ),
+            "Unable to create discovery DataWriter."
+          );
         }
-        poll
-          .register(&reader, $reader_token, Ready::readable(), PollOpt::edge())
-          .expect("Failed to register a discovery reader to poll.");
+        try_construct!(
+          poll.register(&reader, $reader_token, Ready::readable(), PollOpt::edge()),
+          "Failed to register a discovery reader to poll."
+        );
 
         // Per-topic timers are gone; all periodic discovery tasks now share one
         // timer registered under DISCOVERY_TIMER_TOKEN. The former timer token
@@ -715,10 +721,10 @@ impl Discovery {
     }
     drop(db);
 
-    self
-      .discovery_started_sender
-      .send(Ok(()))
-      .expect("Discovery start notification send failure!");
+    if self.discovery_started_sender.send(Ok(())).is_err() {
+      error!("Discovery start notification send failed: main thread receiver dropped");
+      return;
+    }
     // If this triggers, then discovery_started channel has been
     // closed, which likely means the receiver (app thread) has paniced also.
     // They will wait for up to 10 sec for us to send this handshake.

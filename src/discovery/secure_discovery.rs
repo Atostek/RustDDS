@@ -127,10 +127,9 @@ impl SecureDiscovery {
 
     let participant_guid_prefix = domain_participant.guid().prefix;
 
-    let property_qos = domain_participant
-      .qos()
-      .property()
-      .expect("No property QoS defined even though security is enabled");
+    let property_qos = domain_participant.qos().property().ok_or_else(|| {
+      create_security_error_and_log!("No property QoS defined even though security is enabled")
+    })?;
 
     let identity_token = plugins
       .get_identity_token(participant_guid_prefix)

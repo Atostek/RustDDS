@@ -15,6 +15,7 @@ use mio_extras::channel as mio_channel;
 use crate::{
   dds::{
     qos::policy,
+    result::{CreateError, CreateResult},
     statusevents::{DomainParticipantStatusEvent, StatusChannelSender},
   },
   discovery::{
@@ -166,101 +167,118 @@ impl DPEventLoop {
     only_networks: Option<Arc<[IpAddr]>>,
     socket_send_buffer_size: usize,
     same_host_loopback: bool,
-  ) -> Self {
-    let poll = Poll::new().expect("Unable to create new poll.");
+  ) -> CreateResult<Self> {
+    macro_rules! try_init {
+      ($result:expr, $msg:literal) => {
+        match $result {
+          Ok(v) => v,
+          Err(e) => {
+            return Err(CreateError::OutOfResources {
+              reason: format!("{}: {:?}", $msg, e),
+            });
+          }
+        }
+      };
+    }
+
+    let poll = try_init!(Poll::new(), "Unable to create new poll");
     let (acknack_sender, acknack_receiver) =
       mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(100);
     let mut udp_listeners = udp_listeners;
     for (token, listener) in &mut udp_listeners {
-      poll
-        .register(
+      try_init!(
+        poll.register(
           listener.mio_socket(),
           *token,
           Ready::readable(),
-          // Level-triggered: the event loop caps how many datagrams it drains
-          // from a listener per poll iteration (see the bounded drain in the
-          // listener token handler). Level-triggering guarantees that any
-          // packets left after the cap re-fire on the next poll, so a bulk
-          // flood on the user-traffic socket cannot starve discovery/control.
           PollOpt::level(),
-        )
-        .expect("Failed to register listener.");
+        ),
+        "Failed to register listener"
+      );
     }
 
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &add_reader_receiver.receiver,
         add_reader_receiver.token,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register reader adder.");
+      ),
+      "Failed to register reader adder"
+    );
 
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &remove_reader_receiver.receiver,
         remove_reader_receiver.token,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register reader remover.");
-    poll
-      .register(
+      ),
+      "Failed to register reader remover"
+    );
+    try_init!(
+      poll.register(
         &add_writer_receiver.receiver,
         add_writer_receiver.token,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register add writer channel");
+      ),
+      "Failed to register add writer channel"
+    );
 
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &remove_writer_receiver.receiver,
         remove_writer_receiver.token,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register remove writer channel");
+      ),
+      "Failed to register remove writer channel"
+    );
 
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &stop_poll_receiver,
         STOP_POLL_TOKEN,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register stop poll channel");
+      ),
+      "Failed to register stop poll channel"
+    );
 
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &acknack_receiver,
         ACKNACK_MESSAGE_TO_LOCAL_WRITER_TOKEN,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register AckNack submessage sending from MessageReceiver to DPEventLoop");
+      ),
+      "Failed to register AckNack submessage sending from MessageReceiver to DPEventLoop"
+    );
 
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &discovery_update_notification_receiver,
         DISCOVERY_UPDATE_NOTIFICATION_TOKEN,
         Ready::readable(),
         PollOpt::edge(),
-      )
-      .expect("Failed to register reader update notification.");
+      ),
+      "Failed to register reader update notification"
+    );
 
     // The single shared timer for this event loop. Register it once here and
     // seed the periodic loop tasks. Reader/Writer timeouts are scheduled later
     // through cloned handles passed into Reader::new / Writer::new.
     let shared_timer = new_shared_timer::<DpTimerEvent>();
-    poll
-      .register(
+    try_init!(
+      poll.register(
         &*shared_timer.borrow(),
         DPEV_TIMER_TOKEN,
         Ready::readable(),
         PollOpt::level(),
-      )
-      .expect("Failed to register dp_event_loop shared timer");
+      ),
+      "Failed to register dp_event_loop shared timer"
+    );
     {
       let mut t = shared_timer.borrow_mut();
       t.set_timeout(PREEMPTIVE_ACKNACK_PERIOD, DpTimerEvent::PreemptiveAcknack);
@@ -268,9 +286,10 @@ impl DPEventLoop {
     }
 
     // port number 0 means OS chooses an available port number.
-    let udp_sender =
-      UDPSender::new_with_networks(0, only_networks.as_deref(), socket_send_buffer_size)
-        .expect("UDPSender construction fail"); // TODO
+    let udp_sender = try_init!(
+      UDPSender::new_with_networks(0, only_networks.as_deref(), socket_send_buffer_size),
+      "UDPSender construction fail"
+    );
 
     #[cfg(not(feature = "security"))]
     let security_plugins_opt = security_plugins_opt.and(None); // make sure it is None an consume value
@@ -278,7 +297,7 @@ impl DPEventLoop {
     let interface_observations = Rc::new(RefCell::new(InterfaceObservations::new()));
     let local_interfaces: Rc<[IfAddr]> = Rc::from(local_interface_table());
 
-    Self {
+    Ok(Self {
       domain_info,
       poll,
       dds_cache,
@@ -310,7 +329,7 @@ impl DPEventLoop {
       participant_status_sender,
       discovery_command_sender,
       same_host_loopback,
-    }
+    })
   }
 
   pub fn event_loop(self) {
@@ -332,10 +351,13 @@ impl DPEventLoop {
       } else {
         Duration::from_millis(2)
       };
-      ev_wrapper
-        .poll
-        .poll(&mut events, Some(poll_timeout))
-        .expect("Failed in waiting of poll.");
+      match ev_wrapper.poll.poll(&mut events, Some(poll_timeout)) {
+        Ok(_) => {}
+        Err(e) => {
+          error!("dp_event_loop poll failed: {e:?}");
+          break;
+        }
+      }
 
       // liveness watchdog
       let now = Instant::now();
@@ -1423,7 +1445,8 @@ mod tests {
         None,
         0,
         true,
-      );
+      )
+      .expect("DPEventLoop::new in test");
       dp_event_loop
         .poll
         .register(

@@ -154,10 +154,10 @@ impl UDPListener {
     let std_socket = std::net::UdpSocket::from(raw_socket);
     std_socket
       .set_nonblocking(true)
-      .expect("Failed to set std socket to non blocking.");
+      .map_err(|e| io::Error::other(format!("Failed to set std socket to non blocking: {e}")))?;
 
-    let mio_socket =
-      mio_06::net::UdpSocket::from_socket(std_socket).expect("Unable to create mio socket");
+    let mio_socket = mio_06::net::UdpSocket::from_socket(std_socket)
+      .map_err(|e| io::Error::other(format!("Unable to create mio socket: {e}")))?;
     info!(
       "UDPListener: new socket with address {:?}",
       mio_socket.local_addr()
