@@ -63,8 +63,8 @@ impl AssemblyBuffer {
     // TODO: Sanity checks? E.g. datafrag.fragment_size == frag_size
     // Or is this even guaranteed? Can Writer vary fragment size?
     // Answer: Writer must guarantee constant fragment size per SequenceNumber.
-    // So yes, it is guaranteed. RTPS spec v2.5 Section 8.4.14.1.1 "How to select the fragment size"
-    // even says that the frag size is fixed per-writer.
+    // So yes, it is guaranteed. RTPS spec v2.5 Section 8.4.14.1.1 "How to select
+    // the fragment size" even says that the frag size is fixed per-writer.
 
     let frag_size = usize::from(frag_size); // - payload_header;
     let frags_in_submessage = usize::from(datafrag.fragments_in_submessage);
@@ -142,14 +142,14 @@ impl AssemblyBuffer {
 }
 
 // Upper bound on the number of concurrent (incomplete) reassembly buffers kept
-// per writer. Fragments belonging to one sample normally arrive back-to-back, so
-// only a handful of samples are ever mid-reassembly at once; this cap is far
+// per writer. Fragments belonging to one sample normally arrive back-to-back,
+// so only a handful of samples are ever mid-reassembly at once; this cap is far
 // above that. Its purpose is to bound memory when samples never complete, e.g.
 // under best-effort overload where fragments are dropped: without it, one
 // incomplete `AssemblyBuffer` (a full sample-sized allocation) accrues per lost
 // sample and is only reclaimed by a 10 s idle timeout, growing to gigabytes.
-// When exceeded we evict the oldest (lowest sequence number) buffer, which under
-// best effort is lost anyway and under reliable will be re-requested.
+// When exceeded we evict the oldest (lowest sequence number) buffer, which
+// under best effort is lost anyway and under reliable will be re-requested.
 const MAX_ASSEMBLY_BUFFERS: usize = 128;
 
 // Assembles fragments from a single (remote) Writer
@@ -273,8 +273,7 @@ mod tests {
 
   use super::AssemblyBuffer;
   use crate::{
-    messages::submessages::submessages::DataFrag,
-    structure::sequence_number::FragmentNumber,
+    messages::submessages::submessages::DataFrag, structure::sequence_number::FragmentNumber,
   };
 
   // Build a DATAFRAG submessage carrying the contiguous run of `k` fragments

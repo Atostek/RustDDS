@@ -27,8 +27,10 @@ use rustdds::{
     result::WriteError,
     statusevents::{DataReaderStatus, DataWriterStatus},
   },
-  policy::{Deadline, Durability, History, Lifespan, Ownership, Reliability, TimeBasedFilter},
-  policy::{DataRepresentation, XCDR2_DATA_REPRESENTATION, XCDR_DATA_REPRESENTATION},
+  policy::{
+    DataRepresentation, Deadline, Durability, History, Lifespan, Ownership, Reliability,
+    TimeBasedFilter, XCDR2_DATA_REPRESENTATION, XCDR_DATA_REPRESENTATION,
+  },
   with_key::Sample,
   DomainParticipantBuilder, Duration, Keyed, QosPolicyBuilder, StatusEvented, TopicDescription,
   TopicKind,

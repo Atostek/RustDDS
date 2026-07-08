@@ -174,9 +174,7 @@ impl Reader {
 
     // If reader should be stateless, only BestEffort QoS is supported
     if i.like_stateless && i.qos_policy.is_reliable() {
-      panic!(
-        "RustDDS internal bug: attempted to create a stateless Reader with Reliable QoS"
-      );
+      panic!("RustDDS internal bug: attempted to create a stateless Reader with Reliable QoS");
     }
 
     Self {
@@ -1241,9 +1239,7 @@ impl Reader {
     _destination_guid: GUID,
     dst_locator_list: &[Locator],
   ) {
-    let bytes = message
-      .write_to_vec_fast(Endianness::LittleEndian)
-      .unwrap(); //TODO!
+    let bytes = message.write_to_vec_fast(Endianness::LittleEndian).unwrap(); //TODO!
     let _dummy = message; // consume it to avoid clippy warning
     self
       .udp_sender

@@ -271,17 +271,17 @@ impl WriterSendBuffer {
     inner.last_seq = seq;
 
     // KeepLast "newest wins" bound. Applied on insert for:
-    //  - non-blocking best-effort writes: never throttled at admission
-    //    (`has_room` returns true), and the only other eviction path is the
-    //    periodic cache-cleaning timer, which starves under a sustained flood --
-    //    so without this the buffer grows without bound (confirmed multi-GB leak);
+    //  - non-blocking best-effort writes: never throttled at admission (`has_room`
+    //    returns true), and the only other eviction path is the periodic
+    //    cache-cleaning timer, which starves under a sustained flood -- so without
+    //    this the buffer grows without bound (confirmed multi-GB leak);
     //  - reliable writers with NO matched reliable reader yet: there is nobody to
     //    repair to, so retaining unacknowledged samples is pointless. A reliable
     //    writer that produces flat-out before discovery completes (discovery is
-    //    CPU-starved under load and can lag ~1 s) would otherwise race thousands
-    //    of samples ahead, and when the reader finally matches it faces a huge
-    //    unacknowledged backlog that must be recovered via repair at the slow
-    //    (100 ms) heartbeat cadence -- collapsing reliable throughput. Trimming to
+    //    CPU-starved under load and can lag ~1 s) would otherwise race thousands of
+    //    samples ahead, and when the reader finally matches it faces a huge
+    //    unacknowledged backlog that must be recovered via repair at the slow (100
+    //    ms) heartbeat cadence -- collapsing reliable throughput. Trimming to
     //    KeepLast here keeps only the recent samples (correct for volatile
     //    durability); once a reliable reader matches, `reliable_readers_present`
     //    flips true and we retain everything again for repair.

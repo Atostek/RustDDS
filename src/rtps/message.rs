@@ -55,14 +55,14 @@ impl Message {
   /// submessage body into a throwaway `Vec` and then splices those bytes into
   /// the output, and speedy's `write_to_vec_with_ctx` additionally runs a full
   /// sizing pass first (`bytes_needed`) that repeats that temp-alloc + payload
-  /// copy. This method instead appends directly into one `Vec` (a `&mut Vec<u8>`
-  /// is an `io::Write`, so each write appends): no per-submessage temporary
-  /// allocation, and no separate sizing pass.
+  /// copy. This method instead appends directly into one `Vec` (a `&mut
+  /// Vec<u8>` is an `io::Write`, so each write appends): no per-submessage
+  /// temporary allocation, and no separate sizing pass.
   ///
   /// The byte output is identical to `write_to_vec_with_ctx(endianness)`: the
   /// RTPS header and each submessage header are written in `endianness`, and
-  /// each body in its own endianness (from the submessage header flags), exactly
-  /// mirroring the generic `Submessage::write_to`.
+  /// each body in its own endianness (from the submessage header flags),
+  /// exactly mirroring the generic `Submessage::write_to`.
   pub(crate) fn write_to_vec_fast(&self, endianness: Endianness) -> Result<Vec<u8>, speedy::Error> {
     // Capacity hint only: `content_length` already includes the 4-byte payload
     // padding (see `Data::len_serialized`). If it were ever off the `Vec` simply
@@ -81,7 +81,8 @@ impl Message {
       // is written in the message endianness, the body in its own endianness.
       sm.header.write_to_stream_with_ctx(endianness, &mut buf)?;
       let body_endianness = endianness_flag(sm.header.flags);
-      sm.body.write_to_stream_with_ctx(body_endianness, &mut buf)?;
+      sm.body
+        .write_to_stream_with_ctx(body_endianness, &mut buf)?;
     }
     debug_assert_eq!(buf.len(), total);
     Ok(buf)
@@ -151,7 +152,8 @@ impl<C: Context> Writable<C> for Message {
 /// Serialized size of the fixed RTPS [`Header`] that `add_header_and_build`
 /// prepends (protocol id + version + vendor id + guid prefix).
 pub(crate) const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
-/// Serialized size of a [`SubmessageHeader`] (kind + flags + octetsToNextHeader).
+/// Serialized size of a [`SubmessageHeader`] (kind + flags +
+/// octetsToNextHeader).
 const SUBMESSAGE_HEADER_SIZE: usize = 4;
 
 #[derive(Default, Clone)]
@@ -400,8 +402,9 @@ impl MessageBuilder {
     cache_change: &CacheChange,
     reader_entity_id: EntityId,
     writer_guid: GUID,
-    fragment_starting_num: FragmentNumber, // 1-based number of the first fragment in this submessage
-    fragments_in_submessage: u16,          // how many contiguous fragments this submessage carries
+    fragment_starting_num: FragmentNumber, /* 1-based number of the first fragment in this
+                                            * submessage */
+    fragments_in_submessage: u16, // how many contiguous fragments this submessage carries
     fragment_size: u16,
     sample_size: u32, // all fragments together
     endianness: Endianness,
@@ -903,9 +906,7 @@ mod tests {
 
     // The fast serializer must match the generic path byte-for-byte, and both
     // must reproduce the original capture.
-    let generic = msg
-      .write_to_vec_with_ctx(Endianness::LittleEndian)
-      .unwrap();
+    let generic = msg.write_to_vec_with_ctx(Endianness::LittleEndian).unwrap();
     let fast = msg.write_to_vec_fast(Endianness::LittleEndian).unwrap();
     assert_eq!(generic, fast);
     assert_eq!(&generic[..], &bits[..]);

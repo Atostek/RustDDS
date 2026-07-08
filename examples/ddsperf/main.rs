@@ -559,12 +559,12 @@ fn cpu_usage_printer_closure() -> impl FnMut() {
 
 // macOS has no procfs. Use libproc's proc_pidinfo(PROC_PIDTASKINFO) to read the
 // current resident set size (pti_resident_size, in bytes) and the accumulated
-// user/system CPU time (pti_total_user/system, in nanoseconds). 
+// user/system CPU time (pti_total_user/system, in nanoseconds).
 //
 // This is functionally equivalent to the Linux version above (user %, sys %,
 // current RSS), but it is NOT a portable replacement for it: it relies on
 // libc::proc_pidinfo / PROC_PIDTASKINFO / proc_taskinfo, which the `libc` crate
-// only exposes on Apple targets. 
+// only exposes on Apple targets.
 #[cfg(target_os = "macos")]
 fn cpu_usage_printer_closure() -> impl FnMut() {
   fn task_info() -> Option<libc::proc_taskinfo> {
@@ -604,7 +604,10 @@ fn cpu_usage_printer_closure() -> impl FnMut() {
         );
       }
       (_, Some(c)) => {
-        println!("user  ?% sys  ?% RSS {}B", format_count(c.pti_resident_size));
+        println!(
+          "user  ?% sys  ?% RSS {}B",
+          format_count(c.pti_resident_size)
+        );
       }
       _ => println!("(cpu/rss unavailable)"),
     }

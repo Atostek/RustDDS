@@ -52,10 +52,11 @@ pub const MAX_UNSENT_CHANGES_PER_READER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 
 // Memory-safety backstop for the per-matched-writer map of received/irrelevant
 // sequence numbers a Reader tracks (`RtpsWriterProxy::changes`). Entries below
-// `ack_base` are pruned eagerly, but under best-effort loss `ack_base` can stall
-// at a permanently missing sample while received sequence numbers pile up above
-// it. When the map exceeds this cap, `ack_base` is forced forward past the
-// oldest gap (those old samples are given up as lost) so the map stays bounded.
+// `ack_base` are pruned eagerly, but under best-effort loss `ack_base` can
+// stall at a permanently missing sample while received sequence numbers pile up
+// above it. When the map exceeds this cap, `ack_base` is forced forward past
+// the oldest gap (those old samples are given up as lost) so the map stays
+// bounded.
 pub const MAX_TRACKED_CHANGES_PER_WRITER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 
 // Default / fallback UDP-payload budget (RTPS header + submessages) used to
@@ -66,13 +67,15 @@ pub const MAX_TRACKED_CHANGES_PER_WRITER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 // fragmentation. When the peer's egress-interface MTU is known, the per-reader
 // budget (see `payload_budget_for_mtu`) is used instead; this constant is the
 // conservative default (not an absolute maximum). A single submessage larger
-// than the budget still goes out on its own (equivalent to the non-packed path).
+// than the budget still goes out on its own (equivalent to the non-packed
+// path).
 pub const FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE: usize = 1452;
 
 // Overhead subtracted from an interface MTU to obtain the RTPS-message (UDP
 // payload) budget usable for submessage/fragment packing: IPv4 (20) + UDP (8) +
 // RTPS message header (20) = 48 bytes. Matches
-// `FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE` for a 1500-byte MTU (1500 - 48 = 1452).
+// `FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE` for a 1500-byte MTU (1500 - 48 =
+// 1452).
 pub const DATAGRAM_HEADER_OVERHEAD: usize = 48;
 
 // Constant RTPS fragment size (serialized-payload bytes per fragment) used by
@@ -99,10 +102,10 @@ pub const fn payload_budget_for_mtu(mtu: u32) -> usize {
   }
 }
 
-// Serialized size of a trailing HEARTBEAT submessage (4-byte submessage header +
-// readerId 4 + writerId 4 + firstSN 8 + lastSN 8 + count 4). The coalescing loop
-// reserves this much of the datagram budget for reliable writers so the single
-// trailing HEARTBEAT always fits after the last DATA.
+// Serialized size of a trailing HEARTBEAT submessage (4-byte submessage header
+// + readerId 4 + writerId 4 + firstSN 8 + lastSN 8 + count 4). The coalescing
+// loop reserves this much of the datagram budget for reliable writers so the
+// single trailing HEARTBEAT always fits after the last DATA.
 pub const HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE: usize = 32;
 
 // Helper list for initializing remote standard (non-secure) built-in readers

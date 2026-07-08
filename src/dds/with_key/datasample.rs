@@ -46,7 +46,8 @@ impl<D, K> Sample<D, K> {
     match self {
       Sample::Value(d) => d,
       Sample::Dispose(_k) => panic!(
-        "Unwrap called on a Sample with no data (Dispose notification). Use Sample::value() instead."
+        "Unwrap called on a Sample with no data (Dispose notification). Use Sample::value() \
+         instead."
       ),
     }
   }

@@ -110,8 +110,8 @@ pub struct ObservedRoutes {
   /// Sticky: set once we have seen *any* traffic from this participant arrive
   /// from a loopback source address, which positively confirms it is on the
   /// same host. Never cleared while the participant is known — a same-host peer
-  /// remains same-host even if it later also reaches us over a LAN address. Used
-  /// to authorize sending to the peer's loopback locators (see
+  /// remains same-host even if it later also reaches us over a LAN address.
+  /// Used to authorize sending to the peer's loopback locators (see
   /// `src/rtps/loopback_same_host_design.md`).
   seen_from_loopback: bool,
 }

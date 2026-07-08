@@ -1522,10 +1522,9 @@ impl DomainParticipantInner {
   }
 
   pub fn discovered_topics(&self) -> Vec<DiscoveredTopicData> {
-    let db = self
-      .discovery_db
-      .read()
-      .unwrap_or_else(|e| panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}"));
+    let db = self.discovery_db.read().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}")
+    });
 
     db.all_user_topics().cloned().collect()
   }

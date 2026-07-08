@@ -104,17 +104,18 @@ pub fn local_interface_table() -> Vec<IfAddr> {
   }
 }
 
-/// Resolve the per-peer UDP-payload budget (bytes available for RTPS submessages
-/// in one datagram) for `peer_ip`, using the "local egress-interface MTU"
-/// heuristic:
+/// Resolve the per-peer UDP-payload budget (bytes available for RTPS
+/// submessages in one datagram) for `peer_ip`, using the "local
+/// egress-interface MTU" heuristic:
 ///
 /// * If some local IPv4 interface's subnet contains `peer_ip`, the peer is
 ///   reachable in one hop, so we use that interface's MTU (minus headers).
 ///   Loopback peers (e.g. `127.0.0.1`) naturally match `lo`/`lo0` and inherit
 ///   its (often large) MTU.
 /// * Otherwise the peer is behind a router (or IPv6 / unresolved), where the
-///   real path MTU is unknown; fall back to [`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`]
-///   (a conservative ~1500-byte-Ethernet budget).
+///   real path MTU is unknown; fall back to
+///   [`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`] (a conservative
+///   ~1500-byte-Ethernet budget).
 ///
 /// An overestimate is a soft failure (IP fragmentation), never data loss, so
 /// this errs toward the safe default when unsure.
@@ -481,7 +482,10 @@ mod tests {
   #[test]
   fn path_mtu_jumbo_frame() {
     let ifaces = vec![iface_v4(10, 0, 0, 1, 8, 9000, false)];
-    assert_eq!(path_mtu_payload_for_peer(&ifaces, v4(10, 1, 2, 3)), 9000 - 48);
+    assert_eq!(
+      path_mtu_payload_for_peer(&ifaces, v4(10, 1, 2, 3)),
+      9000 - 48
+    );
   }
 
   // Empty table -> default.
@@ -509,6 +513,8 @@ mod tests {
       })
       .collect();
     assert_eq!(peers, expected);
-    assert!(peers.iter().all(|l| SocketAddr::from(*l).ip().is_loopback()));
+    assert!(peers
+      .iter()
+      .all(|l| SocketAddr::from(*l).ip().is_loopback()));
   }
 }

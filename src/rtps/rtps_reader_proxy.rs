@@ -254,10 +254,11 @@ impl RtpsReaderProxy {
   }
 
   /// Enforce the loopback-bucket invariant: any loopback address in
-  /// `unicast_locator_list` is moved into `loopback_unicast_locators`. Idempotent.
-  /// Applied to freshly-inserted proxies (e.g. the built-in `get_builtin_reader_proxy`
-  /// path, which fills `unicast_locator_list` inline) so loopback is never used by
-  /// the non-same-host send path. See `src/rtps/loopback_same_host_design.md`.
+  /// `unicast_locator_list` is moved into `loopback_unicast_locators`.
+  /// Idempotent. Applied to freshly-inserted proxies (e.g. the built-in
+  /// `get_builtin_reader_proxy` path, which fills `unicast_locator_list`
+  /// inline) so loopback is never used by the non-same-host send path. See
+  /// `src/rtps/loopback_same_host_design.md`.
   pub fn normalize_loopback(&mut self) {
     if self.unicast_locator_list.iter().any(Locator::is_loopback) {
       let combined: Vec<Locator> = self
@@ -340,8 +341,9 @@ impl RtpsReaderProxy {
     self.max_datagram_payload
   }
 
-  /// Recompute this reader's [`max_datagram_payload`](Self::max_datagram_payload)
-  /// from its advertised unicast locators and the local interface table.
+  /// Recompute this reader's
+  /// [`max_datagram_payload`](Self::max_datagram_payload) from its advertised
+  /// unicast locators and the local interface table.
   ///
   /// We take the minimum budget over all of the reader's unicast locators
   /// (including the loopback bucket) so that whichever path the [`SendRoute`]
@@ -349,7 +351,8 @@ impl RtpsReaderProxy {
   /// (typically large) loopback-interface MTU, so it never lowers the minimum;
   /// its only effect is to give a same-host-only peer (which advertises *only*
   /// loopback) the large loopback budget instead of the conservative default.
-  /// When the reader advertises no unicast locators at all, we keep the default.
+  /// When the reader advertises no unicast locators at all, we keep the
+  /// default.
   ///
   /// # Design note: current vs. ideal (future work)
   ///
@@ -373,8 +376,9 @@ impl RtpsReaderProxy {
   /// 1. MTU resolved *per chosen route/locator* rather than as this per-reader
   ///    `min` scalar decoupled from route selection.
   /// 2. A route selector that *deterministically prefers* the large-MTU locator
-  ///    (today `DefaultRouteSelector::select_unicast` narrows by observed source
-  ///    IP, not by subnet/MTU, and otherwise falls back to all locators).
+  ///    (today `DefaultRouteSelector::select_unicast` narrows by observed
+  ///    source IP, not by subnet/MTU, and otherwise falls back to all
+  ///    locators).
   /// 3. A guarantee that a datagram built with the larger budget is sent to
   ///    *only* that one locator (today the fallback and multicast-to-all paths
   ///    reuse one datagram across many locators).
@@ -657,7 +661,8 @@ mod bounded_unsent_tests {
     for i in 1..=50_000 {
       let sn = SequenceNumber::new(i);
       rp.notify_new_cache_change(sn);
-      rp.mark_change_sent(sn); // Writer::process_pending does this on Complete/drop.
+      rp.mark_change_sent(sn); // Writer::process_pending does this on
+                               // Complete/drop.
     }
     assert_eq!(
       rp.unsent_changes_count(),
@@ -811,7 +816,10 @@ mod route_tests {
 
     // Loopback is kept out of the normal list but retained in the bucket.
     assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7413)]);
-    assert_eq!(rp.loopback_unicast_locators, vec![udp([127, 0, 0, 1], 7413)]);
+    assert_eq!(
+      rp.loopback_unicast_locators,
+      vec![udp([127, 0, 0, 1], 7413)]
+    );
   }
 
   #[test]
@@ -821,11 +829,17 @@ mod route_tests {
     rp.unicast_locator_list = vec![udp([127, 0, 0, 1], 7410), udp([10, 0, 0, 5], 7410)];
     rp.normalize_loopback();
     assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7410)]);
-    assert_eq!(rp.loopback_unicast_locators, vec![udp([127, 0, 0, 1], 7410)]);
+    assert_eq!(
+      rp.loopback_unicast_locators,
+      vec![udp([127, 0, 0, 1], 7410)]
+    );
     // Idempotent.
     rp.normalize_loopback();
     assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7410)]);
-    assert_eq!(rp.loopback_unicast_locators, vec![udp([127, 0, 0, 1], 7410)]);
+    assert_eq!(
+      rp.loopback_unicast_locators,
+      vec![udp([127, 0, 0, 1], 7410)]
+    );
   }
 
   #[test]

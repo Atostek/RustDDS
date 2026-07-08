@@ -1171,9 +1171,9 @@ impl DPEventLoop {
     );
 
     // Same-host loopback feature (gated by the `same_host_loopback` knob):
-    // - the built-in SPDP writer additionally announces to the localhost SPDP
-    //   peers so same-host participants discover each other with no external
-    //   network / no loopback multicast;
+    // - the built-in SPDP writer additionally announces to the localhost SPDP peers
+    //   so same-host participants discover each other with no external network / no
+    //   loopback multicast;
     // - every writer may route a confirmed same-host peer over loopback.
     // See `src/rtps/loopback_same_host_design.md`.
     new_writer.set_prefer_loopback_same_host(self.same_host_loopback);

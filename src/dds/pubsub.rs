@@ -118,10 +118,9 @@ impl Publisher {
   }
 
   fn inner_lock(&self) -> MutexGuard<'_, InnerPublisher> {
-    self
-      .inner
-      .lock()
-      .unwrap_or_else(|e| panic!("RustDDS internal bug: InnerPublisher lock poisoned after a prior panic: {e:?}"))
+    self.inner.lock().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: InnerPublisher lock poisoned after a prior panic: {e:?}")
+    })
   }
 
   /// Creates DDS [DataWriter](struct.With_Key_DataWriter.html) for Keyed topic

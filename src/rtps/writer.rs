@@ -293,9 +293,7 @@ impl Writer {
     // If writer should behave statelessly, only BestEffort QoS is currently
     // supported
     if i.like_stateless && i.qos_policies.is_reliable() {
-      panic!(
-        "RustDDS internal bug: attempted to create a stateless-like Writer with Reliable QoS"
-      );
+      panic!("RustDDS internal bug: attempted to create a stateless-like Writer with Reliable QoS");
     }
 
     let heartbeat_period = i
@@ -744,7 +742,9 @@ impl Writer {
       // batching). `try_send_aggregated_batch` returns None when the first
       // sample is not eligible (fragmented or destined to a single reader), in
       // which case we fall through to the per-sample path below.
-      if self.push_mode && self.sample_cursor == SampleCursor::Fresh && self.security_plugins.is_none()
+      if self.push_mode
+        && self.sample_cursor == SampleCursor::Fresh
+        && self.security_plugins.is_none()
       {
         match self.try_send_aggregated_batch(sequence_number, last_available) {
           Some(BatchOutcome::Sent { last_seq }) | Some(BatchOutcome::Dropped { last_seq }) => {

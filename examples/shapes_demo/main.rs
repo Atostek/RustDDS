@@ -17,11 +17,14 @@ use log4rs::{
   Config,
 };
 use rustdds::{
-  dds::statusevents, with_key::Sample, DomainParticipantBuilder, Keyed, QosPolicyBuilder,
-  StatusEvented, TopicDescription, TopicKind,
+  dds::statusevents,
+  policy::{
+    DataRepresentation, Deadline, Durability, History, Reliability, XCDR2_DATA_REPRESENTATION,
+    XCDR_DATA_REPRESENTATION,
+  },
+  with_key::Sample,
+  DomainParticipantBuilder, Keyed, QosPolicyBuilder, StatusEvented, TopicDescription, TopicKind,
 };
-use rustdds::policy::{Deadline, Durability, History, Reliability, DataRepresentation};
-use rustdds::policy::{XCDR2_DATA_REPRESENTATION, XCDR_DATA_REPRESENTATION};
 use serde::{Deserialize, Serialize};
 use clap::{Arg, ArgMatches, Command}; // command line argument processing
 use mio_06::{Events, Poll, PollOpt, Ready, Token}; // polling
@@ -159,8 +162,12 @@ fn main() {
   );
 
   // Match the OMG shape_main default (XCDR1) so cross-vendor interop advertises
-  // PID_DATA_REPRESENTATION in discovery. Honor -x for XCDR2 incompatibility tests.
-  let data_representation = match matches.get_one::<String>("representation").map(String::as_str) {
+  // PID_DATA_REPRESENTATION in discovery. Honor -x for XCDR2 incompatibility
+  // tests.
+  let data_representation = match matches
+    .get_one::<String>("representation")
+    .map(String::as_str)
+  {
     Some("2") => DataRepresentation {
       value: vec![XCDR2_DATA_REPRESENTATION],
     },
@@ -170,9 +177,7 @@ fn main() {
     Some(other) => panic!("unsupported data representation {other} (use 1 or 2)"),
   };
 
-  let qos = qos_b
-    .build()
-    .with_data_representation(data_representation);
+  let qos = qos_b.build().with_data_representation(data_representation);
 
   let loop_delay: Duration = match deadline_policy {
     None => Duration::from_millis(200), // This is the default rate
