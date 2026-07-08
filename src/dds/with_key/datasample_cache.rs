@@ -101,6 +101,14 @@ where
     receive_timestamp: Timestamp,
     write_options: WriteOptions,
   ) {
+    // Defense in depth: the topic cache already hands us strictly monotonic (hence
+    // unique) receive timestamps, but if two ever collide here, probe forward by
+    // one tick to a free key instead of panicking or dropping the sample.
+    let mut receive_timestamp = receive_timestamp;
+    while self.datasamples.contains_key(&receive_timestamp) {
+      receive_timestamp = Timestamp::from_ticks(receive_timestamp.to_ticks().wrapping_add(1));
+    }
+
     let instance_key = match &new_sample {
       Sample::Value(d) => d.key(),
       Sample::Dispose(k) => k.clone(),
@@ -176,12 +184,13 @@ where
       .map_or_else(
         // None: ok
         || (),
-        // Some: key was there already!
-        // TODO: We should not outright panic here, but rather raise a serious error.
-        // This is a symptom that the receive timestamps are not unique identifiers like they are
-        // supposed to be.
+        // Some: key was there already! Should be unreachable after the probe above,
+        // but log rather than panic if the uniqueness invariant is ever broken.
         |_already_existed| {
-          panic!("Tried to add duplicate datasample with the same key {receive_timestamp:?}");
+          error!(
+            "Overwrote datasample with duplicate key {receive_timestamp:?}. This is a bug: \
+             receive timestamps are supposed to be unique."
+          );
         },
       );
 

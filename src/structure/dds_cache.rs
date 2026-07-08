@@ -123,7 +123,10 @@ pub(crate) struct TopicCache {
   // TODO: Change this to Option<u32>, where None means "no limit".
 
   // The main content of the cache is in this map.
-  // Timestamp is assumed to be unique id over all the CacheChanges.
+  // Timestamp is assumed to be unique id over all the CacheChanges. Uniqueness is
+  // enforced on insert (see `add_change_internal`) by never issuing a key that is
+  // not strictly greater than the previous one, so a coarse system clock that
+  // returns the same instant for two back-to-back receives cannot collide.
   changes: BTreeMap<Timestamp, CacheChange>,
 
   // The underlying Bytes buffers are reallocated after some time (once for each) in
@@ -131,6 +134,15 @@ pub(crate) struct TopicCache {
   // persists in the TopicCaceh for some time, it should no longer hold onto the receive buffer,
   // so we can recycle the buffers. Otherwise, we (practically) leak memory.
   changes_reallocated_up_to: Timestamp,
+
+  // The largest key ever inserted into `changes`. Used to keep the keys strictly
+  // monotonic: `receive_timestamp` is `Timestamp::now()` sampled per incoming
+  // message, but the system clock granularity can be coarser than the time it
+  // takes to process several aggregated DATA submessages, so two distinct samples
+  // may carry the same instant. We then bump the key by one tick (~0.233 ns) so it
+  // stays unique. This cannot outrun real time: regaining a whole second of skew
+  // would need 2^32 receives within it.
+  last_added_instant: Timestamp,
 
   // sequence_numbers is an index to "changes" by GUID and SN
   sequence_numbers: BTreeMap<GUID, BTreeMap<SequenceNumber, Timestamp>>,
@@ -154,6 +166,7 @@ impl TopicCache {
       max_keep_samples: 1, // dummy value, next call will overwrite this
       changes: BTreeMap::new(),
       changes_reallocated_up_to: Timestamp::ZERO,
+      last_added_instant: Timestamp::ZERO,
       sequence_numbers: BTreeMap::new(),
       received_reliably_before: BTreeMap::new(),
     };
@@ -265,17 +278,24 @@ impl TopicCache {
       None
     } else {
       // This is a new (to us) SequenceNumber, this is the default processing path.
-      self.insert_sn(*instant, &cache_change);
-      self
-        .changes
-        .insert(*instant, cache_change)
-        .inspect(|old_cc| {
-          // If this happens, cache changes were created at exactly same instant.
-          // This is bad, since we are using instants as keys and assume that they
-          // are unique.
-          error!("DDSHistoryCache already contained element with key {instant:?} !!!");
-          self.remove_sn(old_cc);
-        })
+      // Ensure a strictly monotonic (hence unique) key: if the clock did not
+      // advance since the previous insert (coarse clock vs. back-to-back receives),
+      // bump by one tick so distinct samples never share a key. Keys stay ordered,
+      // so time-range reads and GC are unaffected.
+      let key = if *instant > self.last_added_instant {
+        *instant
+      } else {
+        Timestamp::from_ticks(self.last_added_instant.to_ticks().wrapping_add(1))
+      };
+      self.last_added_instant = key;
+
+      self.insert_sn(key, &cache_change);
+      self.changes.insert(key, cache_change).inspect(|old_cc| {
+        // Should be unreachable now that keys are strictly monotonic, but keep the
+        // guard rather than silently overwriting if the invariant is ever broken.
+        error!("DDSHistoryCache already contained element with key {key:?} !!!");
+        self.remove_sn(old_cc);
+      })
     }
   }
 
