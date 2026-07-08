@@ -86,6 +86,12 @@ use crate::no_security::{security_plugins::SecurityPluginsHandle, EndpointSecuri
 ///
 /// let publisher = domain_participant.create_publisher(&qos);
 /// ```
+///
+/// # Panics
+///
+/// Panics if an internal mutex is poisoned (a prior panic occurred while
+/// holding the lock). This indicates a RustDDS internal defect, not user
+/// misuse.
 #[derive(Clone)]
 pub struct Publisher {
   inner: Arc<Mutex<InnerPublisher>>,
@@ -282,12 +288,20 @@ impl Publisher {
   // The minimal correct implementation is to do nothing. See DDS spec 2.2.2.4.1.8
   // and .9
   /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
   #[deprecated(note = "placeholder only; will panic if called")]
   pub fn suspend_publications(&self) {
     unreachable!("suspend_publications is a placeholder only and must not be called")
   }
 
   /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
   #[deprecated(note = "placeholder only; will panic if called")]
   pub fn resume_publications(&self) {
     unreachable!("resume_publications is a placeholder only and must not be called")
@@ -312,6 +326,10 @@ impl Publisher {
   ///
   /// Use [`WithKeyDataWriter::wait_for_acknowledgments`](crate::with_key::DataWriter::wait_for_acknowledgments)
   /// on individual writers instead.
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
   #[deprecated(note = "placeholder only; will panic if called")]
   pub fn wait_for_acknowledgments(&self, _max_wait: Duration) -> WaitResult<()> {
     unreachable!("wait_for_acknowledgments is a placeholder only and must not be called")
@@ -473,7 +491,7 @@ impl InnerPublisher {
       .modify_by(&optional_qos.unwrap_or_else(QosPolicies::qos_none));
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_WITH_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_WITH_KEY_USER_DEFINED)?;
     let dp = self
       .participant()
       .ok_or("upgrade fail")
@@ -684,7 +702,7 @@ impl InnerPublisher {
     SA: adapters::no_key::SerializerAdapter<D>,
   {
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_NO_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_NO_KEY_USER_DEFINED)?;
     let d = self.create_datawriter::<NoKeyWrapper<D>, SAWrapper<SA>>(
       outer,
       Some(entity_id),
@@ -711,10 +729,12 @@ impl InnerPublisher {
     &self,
     entity_id_opt: Option<EntityId>,
     entity_kind: EntityKind,
-  ) -> EntityId {
-    // If the entity_id is given, then just use that. If not, then pull an arbitrary
-    // number out of participant's hat.
-    entity_id_opt.unwrap_or_else(|| self.participant().unwrap().new_entity_id(entity_kind))
+  ) -> CreateResult<EntityId> {
+    let dp = self
+      .participant()
+      .ok_or("upgrade fail")
+      .or_else(|e| create_error_dropped!("Where is my DomainParticipant? {}", e))?;
+    Ok(entity_id_opt.unwrap_or_else(|| dp.new_entity_id(entity_kind)))
   }
 
   pub(crate) fn remove_writer(&self, guid: GUID) {
@@ -763,6 +783,12 @@ impl Debug for InnerPublisher {
 ///
 /// let subscriber = domain_participant.create_subscriber(&qos);
 /// ```
+///
+/// # Panics
+///
+/// Panics if an internal mutex is poisoned (a prior panic occurred while
+/// holding the lock). This indicates a RustDDS internal defect, not user
+/// misuse.
 #[derive(Clone)]
 pub struct Subscriber {
   inner: Arc<InnerSubscriber>,
@@ -1084,7 +1110,7 @@ impl InnerSubscriber {
       .modify_by(&optional_qos.unwrap_or_else(QosPolicies::qos_none));
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_WITH_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_WITH_KEY_USER_DEFINED)?;
 
     let dp = match self.participant() {
       Some(dp) => dp,
@@ -1287,7 +1313,7 @@ impl InnerSubscriber {
     }
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED)?;
 
     let d = self.create_datareader_internal::<NoKeyWrapper<D>, DAWrapper<SA>>(
       outer,
@@ -1315,7 +1341,7 @@ impl InnerSubscriber {
     }
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED)?;
 
     let d = self.create_simple_datareader_internal::<NoKeyWrapper<D>, DAWrapper<SA>>(
       outer,
@@ -1341,10 +1367,12 @@ impl InnerSubscriber {
     &self,
     entity_id_opt: Option<EntityId>,
     entity_kind: EntityKind,
-  ) -> EntityId {
-    // If the entity_id is given, then just use that. If not, then pull an arbitrary
-    // number out of participant's hat.
-    entity_id_opt.unwrap_or_else(|| self.participant().unwrap().new_entity_id(entity_kind))
+  ) -> CreateResult<EntityId> {
+    let dp = self
+      .participant()
+      .ok_or("upgrade fail")
+      .or_else(|e| create_error_dropped!("Where is my DomainParticipant? {}", e))?;
+    Ok(entity_id_opt.unwrap_or_else(|| dp.new_entity_id(entity_kind)))
   }
 }
 

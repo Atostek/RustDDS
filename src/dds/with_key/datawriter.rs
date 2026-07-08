@@ -765,6 +765,10 @@ where
   }
 
   /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
   #[deprecated(note = "placeholder only; will panic if called")]
   pub fn get_matched_subscriptions(&self) -> Vec<SubscriptionBuiltinTopicData> {
     unreachable!("get_matched_subscriptions is a placeholder only and must not be called")
@@ -895,7 +899,9 @@ where
 // async writing implementation
 //
 
-// A future for an asynchronous write operation
+// A future for an asynchronous write operation.
+//
+// Polling after completion returns [`WriteError::Internal`], not a panic.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct AsyncWrite<'a, D, SA>
 where

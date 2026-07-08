@@ -1675,7 +1675,13 @@ impl Writer {
 
     match encoded {
       Ok(message) => {
-        let buffer = message.write_to_vec_fast(self.endianness).unwrap();
+        let buffer = match message.write_to_vec_fast(self.endianness) {
+          Ok(b) => b,
+          Err(e) => {
+            error!("Failed to serialize RTPS message for send: {e:?}");
+            return blocked;
+          }
+        };
 
         // De-duplication of narrowed (interface-aware) sends across readers.
         let mut sent_routes: BTreeSet<RouteKey> = BTreeSet::new();
@@ -2317,6 +2323,14 @@ impl<'a> Iterator for FragmentationIter<'a> {
                 data_size,
               );
 
+              let sample_size_u32 = match u32::try_from(data_size) {
+                Ok(n) => n,
+                Err(_) => {
+                  error!("sample_to_samplestream: data_size {data_size} does not fit in u32");
+                  return None;
+                }
+              };
+
               message_builder = message_builder.data_frag_msg(
                 cc,
                 reader_entity_id, // reader
@@ -2324,7 +2338,7 @@ impl<'a> Iterator for FragmentationIter<'a> {
                 FragmentNumber::new(start),
                 k as u16,
                 fragment_size,
-                data_size.try_into().unwrap(),
+                sample_size_u32,
                 writer.endianness,
                 writer.security_plugins.as_ref(),
               );

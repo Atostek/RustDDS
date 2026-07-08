@@ -384,6 +384,12 @@ impl DomainParticipantBuilder {
 /// Domains are identified by a domain identifier, which is, in Rust terms, a
 /// `u16`. Domain identifier values are application-specific, but `0` is usually
 /// the default.
+///
+/// # Panics
+///
+/// Most methods panic if an internal mutex or lock is poisoned (a prior panic
+/// occurred in another thread while holding the lock). This indicates a RustDDS
+/// internal defect, not user misuse.
 #[derive(Clone)]
 // This is a smart pointer for DomainParticipant for easier manipulation.
 pub struct DomainParticipant {

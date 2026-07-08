@@ -332,6 +332,10 @@ where
   }
 
   /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
   #[deprecated(note = "placeholder only; will panic if called")]
   pub fn get_matched_subscriptions(&self) -> Vec<SubscriptionBuiltinTopicData> {
     #[allow(deprecated)]

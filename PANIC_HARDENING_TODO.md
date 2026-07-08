@@ -53,6 +53,23 @@ Still present inside block comments; no runtime effect:
 
 **Still open in Category C:** `secure_discovery.rs:2639` `.expect` on missing local participant data (internal state bug).
 
+### P2 hardening (2026-07-08)
+
+**Category D — send-path serialization**
+
+- [`writer.rs`](/home/juhe/RustDDS/src/rtps/writer.rs) `send_message_to_readers`: `write_to_vec_fast` failure logs and skips send.
+- [`reader.rs`](/home/juhe/RustDDS/src/rtps/reader.rs) `encode_and_send`: same for reader-originated messages.
+- [`message.rs`](/home/juhe/RustDDS/src/rtps/message.rs): `try_submessage_content_length`; related sample identity serialize errors log and skip submessage; `data_size`/`sample_size` checked conversions; no `content_length as u16` truncation.
+- [`writer.rs`](/home/juhe/RustDDS/src/rtps/writer.rs) fragment iterator: `u32::try_from(data_size)` instead of unwrap.
+- [`rtps_reader_proxy.rs`](/home/juhe/RustDDS/src/rtps/rtps_reader_proxy.rs): `mark_all_frags_requested` uses checked `usize::try_from`.
+- [`serialized_payload.rs`](/home/juhe/RustDDS/src/messages/submessages/elements/serialized_payload.rs): infallible `From<SerializedPayload> for Bytes` (manual header concat).
+
+**Category F — public API documentation and footguns**
+
+- [`Sample::unwrap`](/home/juhe/RustDDS/src/dds/with_key/datasample.rs): deprecated; use `value()` or match on variants.
+- [`pubsub.rs`](/home/juhe/RustDDS/src/dds/pubsub.rs): `unwrap_or_new_entity_id` returns `CreateResult` (no panic when participant dropped).
+- `# Panics` rustdoc on placeholder APIs, `Publisher`, `Subscriber`, `DomainParticipant`, `Sample::unwrap`, `AsyncWrite`.
+
 ---
 
 ## Category A — Internal invariants (panic acceptable)
@@ -100,17 +117,7 @@ Most P1 items addressed — see **P1 hardening** above. Remaining:
 
 ## Category D — Hot-path serialization / network `.unwrap()`
 
-Fragment bitmap / span validation **done** (P1). Remaining:
-
-| Item | File | Condition |
-|---|---|---|
-| `write_to_vec_fast` on send | `rtps/writer.rs`, `rtps/reader.rs` | Speedy serialization error |
-| Related sample identity serialization | `rtps/message.rs` | Inline QoS build failure |
-| `SerializedPayload` → `Bytes` | `messages/.../serialized_payload.rs:122` | Payload serialization failure |
-| `data_size` / fragment count `try_into` | `rtps/writer.rs`, `rtps_reader_proxy.rs` | `u32` → `usize` on 32-bit with huge samples |
-| `content_length as u16` truncation | `rtps/message.rs` | Submessage > 65535 bytes (TODO in source) |
-
-**Todo (P2):** Propagate serialization errors on send path (drop sample + log, or return error to writer). Use `TryFrom` for remaining size conversions.
+Fragment bounds (P1) and send-path serialization (P2) **done**. No remaining P2 items.
 
 ---
 
@@ -128,13 +135,11 @@ Fragment bitmap / span validation **done** (P1). Remaining:
 
 ## Category F — User / API footguns (document or harden)
 
+Most P2 items addressed — see **P2 hardening** above. Remaining:
+
 | Item | File | Mitigation |
 |---|---|---|
-| `Sample::unwrap()` on dispose sample | `dds/with_key/datasample.rs` | Improved panic message; prefer `value()` |
-| `participant().unwrap()` when creating endpoints | `dds/pubsub.rs` | Panics if participant dropped; could return `CreateResult::Err` |
-| `AsyncWrite` timeout `sample.take().unwrap()` | `datawriter.rs` | Invariant: sample always `Some` when future constructed |
-
-**Todo:** Add `# Panics` sections to rustdoc for public methods that can panic on misuse.
+| `AsyncWrite` timeout `sample.take().unwrap()` | `datawriter.rs` | Internal invariant; documented on `AsyncWrite` |
 
 ---
 
@@ -150,7 +155,7 @@ Fragment bitmap / span validation **done** (P1). Remaining:
 
 1. ~~**P1:** Category D fragment bounds validation (network input)~~ **Done**
 2. ~~**P1:** Category C discovery/participant startup `expect` → `Result`~~ **Done** (except secure_discovery internal `.expect`)
-3. **P2:** Category D send-path serialization unwrap → log + drop
-4. **P2:** Category F public API panic documentation
+3. ~~**P2:** Category D send-path serialization unwrap → log + drop~~ **Done**
+4. ~~**P2:** Category F public API panic documentation~~ **Done**
 5. **P3:** Category B poison handling strategy (project-wide policy)
 6. **P3:** Category E timestamp arithmetic

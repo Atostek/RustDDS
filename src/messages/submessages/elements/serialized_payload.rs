@@ -114,12 +114,13 @@ impl<C: Context> Writable<C> for SerializedPayload {
   }
 }
 
-// TODO: Should this be fallible try_from instead?
-// The speedy write_to_buffer() call could in theory fail, but it is hard to see
-// how.
+// Infallible: payload is already in memory as Bytes with a fixed 4-byte header.
 impl From<SerializedPayload> for Bytes {
   fn from(sp: SerializedPayload) -> Bytes {
-    let buf = sp.write_to_vec().unwrap(); //TODO: deal with (unlikely) error
-    buf.into()
+    let mut b = BytesMut::with_capacity(sp.len_serialized());
+    b.extend_from_slice(&sp.representation_identifier.bytes);
+    b.extend_from_slice(&sp.representation_options);
+    b.extend_from_slice(&sp.value);
+    b.freeze()
   }
 }

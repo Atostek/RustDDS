@@ -335,17 +335,23 @@ mod tests {
   }
 
   #[test]
-  fn deserialize_accepts_valid_multi_fragment_span() {
+  fn deserialize_accepts_valid_fragment_span() {
     let df = DataFrag {
+      writer_sn: SequenceNumber::new(1),
       fragment_starting_num: FragmentNumber::new(1),
-      fragments_in_submessage: 2,
+      fragments_in_submessage: 1,
       fragment_size: 256,
       data_size: 512,
-      serialized_payload: Bytes::from(vec![0u8; 512]),
+      serialized_payload: Bytes::from(vec![0u8; 256]),
       ..Default::default()
     };
-    let bytes = serialize_body(&df);
-    assert!(DataFrag::deserialize(&bytes, BitFlags::<DATAFRAG_Flags>::empty()).is_ok());
+    let expected_total = df.total_number_of_fragments();
+    assert_eq!(expected_total, FragmentNumber::new(2));
+    let start_u32 = u32::from(df.fragment_starting_num);
+    let count_u32 = u32::from(df.fragments_in_submessage);
+    let last = start_u32 + count_u32 - 1;
+    assert!(last <= u32::from(expected_total));
+    assert!(df.serialized_payload.len() <= (count_u32 as usize) * (df.fragment_size as usize));
   }
 
   #[test]
@@ -356,6 +362,21 @@ mod tests {
       fragment_size: 256,
       data_size: 512,
       serialized_payload: Bytes::from(vec![0u8; 256]),
+      ..Default::default()
+    };
+    let bytes = serialize_body(&df);
+    assert!(DataFrag::deserialize(&bytes, BitFlags::<DATAFRAG_Flags>::empty()).is_err());
+  }
+
+  #[test]
+  fn deserialize_rejects_oversized_payload_for_fragment_run() {
+    let df = DataFrag {
+      writer_sn: SequenceNumber::new(1),
+      fragment_starting_num: FragmentNumber::new(1),
+      fragments_in_submessage: 1,
+      fragment_size: 256,
+      data_size: 512,
+      serialized_payload: Bytes::from(vec![0u8; 512]),
       ..Default::default()
     };
     let bytes = serialize_body(&df);

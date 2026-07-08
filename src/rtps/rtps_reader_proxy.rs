@@ -523,14 +523,16 @@ impl RtpsReaderProxy {
   // Fragment handling
 
   pub fn mark_all_frags_requested(&mut self, seq_num: SequenceNumber, frag_count: u32) {
-    // Insert all ones set with frag_count bits
+    let frag_count_usize = match usize::try_from(frag_count) {
+      Ok(n) => n,
+      Err(_) => {
+        error!("mark_all_frags_requested: frag_count {frag_count} does not fit in usize");
+        return;
+      }
+    };
     self
       .frags_requested
-      // TODO: explain why unwrap below succeeds
-      .insert(
-        seq_num,
-        BitVec::from_elem(frag_count.try_into().unwrap(), true),
-      );
+      .insert(seq_num, BitVec::from_elem(frag_count_usize, true));
   }
 
   pub fn mark_frags_requested(&mut self, seq_num: SequenceNumber, frag_nums: &FragmentNumberSet) {
@@ -686,6 +688,12 @@ mod bounded_unsent_tests {
       MAX_UNSENT_CHANGES_PER_READER,
       rp.unsent_changes_count()
     );
+  }
+
+  #[test]
+  fn mark_all_frags_requested_huge_frag_count_does_not_panic() {
+    let mut rp = test_proxy();
+    rp.mark_all_frags_requested(SequenceNumber::new(1), u32::MAX);
   }
 }
 

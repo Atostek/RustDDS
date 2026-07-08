@@ -156,6 +156,10 @@ pub(crate) const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
 /// octetsToNextHeader).
 const SUBMESSAGE_HEADER_SIZE: usize = 4;
 
+fn try_submessage_content_length(len: usize) -> Result<u16, ()> {
+  u16::try_from(len).map_err(|_| ())
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct MessageBuilder {
   submessages: Vec<Submessage>,
@@ -295,7 +299,13 @@ impl MessageBuilder {
 
     // If we are sending related sample identity, then insert that.
     if let Some(si) = cache_change.write_options.related_sample_identity() {
-      let related_sample_identity_serialized = si.write_to_vec_with_ctx(endianness).unwrap();
+      let related_sample_identity_serialized = match si.write_to_vec_with_ctx(endianness) {
+        Ok(v) => v,
+        Err(e) => {
+          error!("data_msg: failed to serialize related sample identity: {e:?}");
+          return self;
+        }
+      };
       // Insert two parameters, because we are not sure which one is the correct
       // parameter id. Or what the receiver thinks is correct. This behaviour
       // was observed from eProsima FastDDS on 2024-11-18.
@@ -385,7 +395,16 @@ impl MessageBuilder {
       header: SubmessageHeader {
         kind: SubmessageKind::DATA,
         flags: flags.bits(),
-        content_length: data_message.len_serialized() as u16, // TODO: Handle overflow?
+        content_length: match try_submessage_content_length(data_message.len_serialized()) {
+          Ok(cl) => cl,
+          Err(()) => {
+            error!(
+              "data_msg: DATA submessage too large for RTPS content_length: {} bytes",
+              data_message.len_serialized()
+            );
+            return self;
+          }
+        },
       },
       body: SubmessageBody::Writer(WriterSubmessage::Data(data_message, flags)),
       original_bytes: None,
@@ -435,7 +454,13 @@ impl MessageBuilder {
 
     // If we are sending related sample identity, then insert that.
     if let Some(si) = cache_change.write_options.related_sample_identity() {
-      let related_sample_identity_serialized = si.write_to_vec_with_ctx(endianness).unwrap();
+      let related_sample_identity_serialized = match si.write_to_vec_with_ctx(endianness) {
+        Ok(v) => v,
+        Err(e) => {
+          error!("data_frag_msg: failed to serialize related sample identity: {e:?}");
+          return self;
+        }
+      };
       // Insert two parameters, because we are not sure which one is the correct
       // parameter id. Or what the receiver thinks is correct. This behaviour
       // was observed from eProsima FastDDS on 2024-11-18.
@@ -456,9 +481,16 @@ impl MessageBuilder {
     // `fragments_in_submessage * fragment_size` payload bytes (the final run is
     // shorter when it reaches the end of the sample).
     let from_byte: usize = (usize::from(fragment_starting_num) - 1) * usize::from(fragment_size);
+    let sample_size_usize = match usize::try_from(sample_size) {
+      Ok(n) => n,
+      Err(_) => {
+        error!("data_frag_msg: sample_size {sample_size} does not fit in usize");
+        return self;
+      }
+    };
     let up_to_before_byte: usize = min(
       from_byte + usize::from(fragments_in_submessage) * usize::from(fragment_size),
-      sample_size.try_into().unwrap(),
+      sample_size_usize,
     );
 
     let serialized_payload = Vec::from(
@@ -534,7 +566,16 @@ impl MessageBuilder {
       header: SubmessageHeader {
         kind: SubmessageKind::DATA_FRAG,
         flags: flags.bits(),
-        content_length: data_message.len_serialized() as u16, // TODO: Handle overflow
+        content_length: match try_submessage_content_length(data_message.len_serialized()) {
+          Ok(cl) => cl,
+          Err(()) => {
+            error!(
+              "data_frag_msg: DATA_FRAG submessage too large for RTPS content_length: {} bytes",
+              data_message.len_serialized()
+            );
+            return self;
+          }
+        },
       },
       body: SubmessageBody::Writer(WriterSubmessage::DataFrag(data_message, flags)),
       original_bytes: None,
@@ -929,6 +970,12 @@ mod tests {
       .unwrap();
     let fast_multi = multi.write_to_vec_fast(Endianness::LittleEndian).unwrap();
     assert_eq!(generic_multi, fast_multi);
+  }
+
+  #[test]
+  fn try_submessage_content_length_rejects_overflow() {
+    assert!(try_submessage_content_length(65535).is_ok());
+    assert!(try_submessage_content_length(65536).is_err());
   }
 
   #[test]

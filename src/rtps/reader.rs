@@ -1239,7 +1239,13 @@ impl Reader {
     _destination_guid: GUID,
     dst_locator_list: &[Locator],
   ) {
-    let bytes = message.write_to_vec_fast(Endianness::LittleEndian).unwrap(); //TODO!
+    let bytes = match message.write_to_vec_fast(Endianness::LittleEndian) {
+      Ok(b) => b,
+      Err(e) => {
+        error!("Failed to serialize RTPS message for send: {e:?}");
+        return;
+      }
+    };
     let _dummy = message; // consume it to avoid clippy warning
     self
       .udp_sender
@@ -1255,9 +1261,13 @@ impl Reader {
   ) {
     match self.security_encode(message, destination_guid) {
       Ok(message) => {
-        let bytes = message
-          .write_to_vec_with_ctx(Endianness::LittleEndian)
-          .unwrap(); //TODO!!
+        let bytes = match message.write_to_vec_with_ctx(Endianness::LittleEndian) {
+          Ok(b) => b,
+          Err(e) => {
+            error!("Failed to serialize RTPS message for send: {e:?}");
+            return;
+          }
+        };
         self
           .udp_sender
           .send_to_locator_list(&bytes, dst_locator_list);

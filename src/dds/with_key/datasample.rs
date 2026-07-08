@@ -11,9 +11,9 @@ use crate::{
 /// Replaces the use of `valid_data` flag in SampleInfo of DataSample from the
 /// DDS spec.
 ///
-/// Implements the methods `value`, `map_value`, `map_dispose` `unwrap` and
-/// `as_ref` that correspond to methods of [`Result`](std::result::Result),
-/// which had been previously used for this purpose.
+/// Implements the methods `value`, `map_value`, `map_dispose`, and
+/// `as_ref`. The `unwrap` method is deprecated — use `value()` or match on
+/// `Sample::Value` / `Sample::Dispose` instead.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sample<D, K> {
   Value(D),
@@ -42,6 +42,13 @@ impl<D, K> Sample<D, K> {
     }
   }
 
+  #[deprecated(note = "panics on Sample::Dispose; use value() or match on Sample::Value/Dispose")]
+  /// Returns the data sample, panicking if this is a dispose notification.
+  ///
+  /// # Panics
+  ///
+  /// Panics if called on [`Sample::Dispose`]. Use [`Self::value`] or match on
+  /// [`Sample::Value`](Sample::Value) / [`Sample::Dispose`](Sample::Dispose).
   pub fn unwrap(self) -> D {
     match self {
       Sample::Value(d) => d,

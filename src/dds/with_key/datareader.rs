@@ -710,6 +710,10 @@ where
   ///
   /// When implemented, this should return `true` if all historical data was
   /// received before the timeout and `false` otherwise.
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
   #[deprecated(note = "placeholder only; will panic if called")]
   pub fn wait_for_historical_data(&mut self, _max_wait: Duration) -> bool {
     unreachable!("wait_for_historical_data is a placeholder only and must not be called")
@@ -1286,18 +1290,30 @@ mod tests {
     {
       let result_vec = datareader.read(100, ReadCondition::any()).unwrap();
       assert_eq!(result_vec.len(), 2);
-      let d = result_vec[0].value().clone().unwrap();
+      let d = result_vec[0]
+        .value()
+        .clone()
+        .value()
+        .expect("test sample is not a dispose notification");
       assert_eq!(&test_data, d);
     }
     {
       let result_vec2 = datareader.read(100, ReadCondition::any()).unwrap();
       assert_eq!(result_vec2.len(), 2);
-      let d2 = result_vec2[1].value().clone().unwrap();
+      let d2 = result_vec2[1]
+        .value()
+        .clone()
+        .value()
+        .expect("test sample is not a dispose notification");
       assert_eq!(&test_data2, d2);
     }
     {
       let result_vec3 = datareader.read(100, ReadCondition::any()).unwrap();
-      let d3 = result_vec3[0].value().clone().unwrap();
+      let d3 = result_vec3[0]
+        .value()
+        .clone()
+        .value()
+        .expect("test sample is not a dispose notification");
       assert_eq!(&test_data, d3);
     }
 
@@ -1305,8 +1321,14 @@ mod tests {
     let mut result_vec = datareader.take(100, ReadCondition::any()).unwrap();
     let datasample2 = result_vec.pop().unwrap();
     let datasample1 = result_vec.pop().unwrap();
-    let data2 = datasample2.into_value().unwrap();
-    let data1 = datasample1.into_value().unwrap();
+    let data2 = datasample2
+      .into_value()
+      .value()
+      .expect("test data is not a dispose notification");
+    let data1 = datasample1
+      .into_value()
+      .value()
+      .expect("test data is not a dispose notification");
     assert_eq!(test_data2, data2);
     assert_eq!(test_data, data1);
 
@@ -1498,18 +1520,39 @@ mod tests {
     info!("calling read with key 1 and this");
     let results =
       datareader.read_instance(100, ReadCondition::any(), Some(key1), SelectByKey::This);
-    assert_eq!(&data_key1, results.unwrap()[0].value().clone().unwrap());
+    assert_eq!(
+      &data_key1,
+      results.unwrap()[0]
+        .value()
+        .clone()
+        .value()
+        .expect("test sample is not a dispose notification")
+    );
 
     info!("calling read with None and this");
     // Takes the smallest key, 1 in this case.
     let results = datareader.read_instance(100, ReadCondition::any(), None, SelectByKey::This);
-    assert_eq!(&data_key1, results.unwrap()[0].value().clone().unwrap());
+    assert_eq!(
+      &data_key1,
+      results.unwrap()[0]
+        .value()
+        .clone()
+        .value()
+        .expect("test sample is not a dispose notification")
+    );
 
     info!("calling read with key 1 and next");
     let results =
       datareader.read_instance(100, ReadCondition::any(), Some(key1), SelectByKey::Next);
     assert_eq!(results.as_ref().unwrap().len(), 3);
-    assert_eq!(&data_key2_1, results.unwrap()[0].value().clone().unwrap());
+    assert_eq!(
+      &data_key2_1,
+      results.unwrap()[0]
+        .value()
+        .clone()
+        .value()
+        .expect("test sample is not a dispose notification")
+    );
 
     // Check that calling take_instance returns all 3 samples with the same key
     info!("calling take with key 2 and this");
@@ -1518,11 +1561,20 @@ mod tests {
     assert_eq!(results.as_ref().unwrap().len(), 3);
     let mut vec = results.unwrap();
     let d3 = vec.pop().unwrap();
-    let d3 = d3.into_value().unwrap();
+    let d3 = d3
+      .into_value()
+      .value()
+      .expect("test data is not a dispose notification");
     let d2 = vec.pop().unwrap();
-    let d2 = d2.into_value().unwrap();
+    let d2 = d2
+      .into_value()
+      .value()
+      .expect("test data is not a dispose notification");
     let d1 = vec.pop().unwrap();
-    let d1 = d1.into_value().unwrap();
+    let d1 = d1
+      .into_value()
+      .value()
+      .expect("test data is not a dispose notification");
     assert_eq!(data_key2_3, d3);
     assert_eq!(data_key2_2, d2);
     assert_eq!(data_key2_1, d1);
