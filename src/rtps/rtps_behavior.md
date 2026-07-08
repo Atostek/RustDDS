@@ -123,6 +123,22 @@ and locators. Application data does not flow until matching completes on the
 receiving side (and for reliable communication, until the reliable protocol
 state is initialized).
 
+Note that there is no handshake message exchange to confirm the match both
+ways. It is simply assumed that both sides agree on whether there is a match or
+not. If the matching logic of the two participants is incompatible, the protocol
+may end up in a confused state where one participant thinks there is a match but
+the other does not. The result is typically that no data is transmitted, but
+this is not always the case.
+
+- **Example 1:** the Reader thinks there is a match, but the Writer infers a
+  mismatch. If there are no other Readers, the Writer may not transmit any data.
+- **Example 2:** same case, but there is another, pre-existing correctly matched
+  Reader and data is already flowing. The Writer may send its data over
+  multicast, which causes the mismatched Reader to receive it too. This can
+  result in data being delivered, if the Reader expects best-effort reliability.
+  However, once the first Reader disappears, data flow stops, because the Writer
+  thinks there are no Readers left.
+
 ### 3.2 Endpoint lifecycle
 
 ```mermaid
@@ -153,9 +169,9 @@ applies:
 | Reliable | StatefulWriter + StatefulReader | HEARTBEAT, ACKNACK, repair DATA/DATAFRAG |
 
 **Stateful** endpoints keep **per-remote-proxy state** (sequence numbers
-received, acknowledged, or missing). **Stateless** endpoints do not track
-per-writer history for reliability (they may still deduplicate by sequence
-number).
+acknowledged or reported missing). **Stateless** endpoints do not track
+per-writer history for reliability (Readers must still deduplicate by sequence
+number and drop out-of-sequence samples).
 
 ---
 
@@ -200,7 +216,7 @@ best effort does not guarantee delivery.
 ## 6. Reliable data path: writer–reader pair state
 
 Reliable communication is a **per-writer, per-reader state machine** on top of
-a **writer history cache** (ordered sequence numbers, possibly keyed instances).
+a **writer history cache** (ordered by sequence numbers).
 
 ### 6.1 Sequence number line (shared model)
 
@@ -208,7 +224,6 @@ Each **Writer** assigns monotonically increasing **sequence numbers** (per
 writer GUID) to cache changes. For each matched **Reader**, the **Writer**
 tracks:
 
-- `first_sn` / `last_sn` — extent of the history cache;
 - `all_acked_before` — all SN `< this` are known received (or irrelevant) at
   that reader;
 - which SNs are **missing** at the reader (from ACKNACK).
@@ -216,8 +231,9 @@ tracks:
 Each **Reader** tracks per matched **Writer**:
 
 - highest contiguous received SN (and gaps);
-- `received_heartbeat_count` — deduplicate periodic HEARTBEATs;
-- which SNs are **irrelevant** (from GAP or HEARTBEAT `first_sn`).
+- which SNs are **irrelevant** (announced by GAP or by a HEARTBEAT `first_sn`
+  that moved forward). These SNs will never arrive, so the Reader must advance
+  past them instead of waiting for them.
 
 ### 6.2 Writer side (reliable)
 
@@ -243,10 +259,10 @@ stateDiagram-v2
 - Sent **periodically** even when idle if unacknowledged data exists; also on
   new data and on **manual assertion** (liveliness).
 
-**On ACKNACK:**
+**On Writer receiving ACKNACK:**
 
 - If bitmap lists missing SNs → **repair**: resend DATA or DATAFRAG for those
-  SNs (unicast to requesting reader).
+  SNs (typically unicast to requesting reader).
 - If reader acknowledges all → advance `all_acked_before`; writer may trim
   history per QoS.
 
@@ -331,7 +347,7 @@ sequenceDiagram
 ## 7. Fragmentation (large samples)
 
 When a sample exceeds the **data payload limit** (path MTU minus headers,
-typically ~64 KiB on many stacks), the writer splits it into **DATAFRAG**
+typically ~1.5 KiB on many stacks), the writer splits it into **DATAFRAG**
 submessages sharing one **sequence number** and distinct **fragment numbers**.
 
 **Writer:** sends DATAFRAGs (often batched), then **HEARTBEAT_FRAG** (or
@@ -340,8 +356,9 @@ fragments.
 
 **Reader:** **FragmentAssembler** buffers partial fragments per `(writer, seq)`.
 When all fragments arrive → one complete cache change → same processing as
-DATA. ACKNACK may report partial reception (implementation-dependent); repair
-resends individual fragments.
+DATA. NACKFRAG may report partial reception (implementation-dependent); repair
+resends individual fragments. Fragmented data completion is reported using ACKNACK
+if Reader has Reliable reliability.
 
 ```mermaid
 stateDiagram-v2
@@ -360,11 +377,17 @@ stateDiagram-v2
 
 ## 8. Keyed topics and instance lifecycle
 
-For **with-key** topics, each sample carries a key. Writers may send:
+For **with-key** topics, each sample carries a key. Key is embedded into the
+sample, and there must be a function to derive the key from a sample. The function
+may be just extracting one field of the sample or doing something more complicated.
 
-- **DATA** — alive instance update;
+Each key value identifies an instance. A keyed topic works like a key-value map. Instances are the currently alive key values. 
+
+Writers may send:
+
+- **DATA** — instance update - or creation, if key was new
 - **DATA** with dispose flag — instance disposed;
-- **GAP** — irrelevant instances or SN ranges.
+- **GAP** — irrelevant SN ranges - these updates are no longer available
 
 Readers maintain **per-instance** state (ALIVE, NOT_ALIVE_DISPOSED,
 NOT_ALIVE_NO_WRITERS) and per-instance generation counts. Dispose/unregister
@@ -418,15 +441,6 @@ These are **not** in the structural spec but appear in the field:
 2. **Multicast disabled** — unicast peers or localhost discovery required.
 3. **Shared memory / iceoryx** — bypasses UDP for same-host; wire protocol
    state machines still apply for remote peers.
-4. **Submessage aggregation** — multiple DATA or DATAFRAG in one UDP datagram;
-   receive path must process all submessages in order.
-5. **Vendor-specific discovery topics** — security (DDS Security) adds parallel
-   built-in endpoints; matching follows the same SEDP pattern.
-6. **Timestamp granularity** — receive timestamps used as cache keys may
-   collide under very high ingress rates; implementations must ensure unique
-   keys (monotonic bump or composite key).
-7. **Best-effort "stateful" readers** — some stacks use StatefulReader
-   entities but ignore HEARTBEAT when reliability is best effort.
 
 When implementing, prefer **normative behavior** on the wire and **defensive**
 handling of peer quirks.
