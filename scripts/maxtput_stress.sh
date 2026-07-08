@@ -199,17 +199,30 @@ run_scenario() {  # scenario_kind(tput/stress) name reliable size dur
 }
 
 # ---- max-throughput sweep (short) -----------------------------------------
-run_scenario tput be_64b   0 64    "$DURATION"
-run_scenario tput be_1k    0 1024  "$DURATION"
-run_scenario tput be_8k    0 8192  "$DURATION"
-run_scenario tput be_64k   0 65000 "$DURATION"
-run_scenario tput rel_1k   1 1024  "$DURATION"
-run_scenario tput rel_8k   1 8192  "$DURATION"
+# Four payload buckets spanning the fragmentation boundary, each best-effort
+# and reliable:
+#   small       (64 B)      one tiny datagram; per-sample/framing overhead dominates
+#   below_frag  (8 KB)      fits a single UDP datagram (< loopback MTU)
+#   above_frag  (128 KB)    > 64 KiB UDP max -> always RTPS DATAFRAG + reassembly
+#   large       (2 MB)      many fragments per sample; reassembly-buffer pressure
+run_scenario tput be_small       0 64      "$DURATION"
+run_scenario tput be_below_frag  0 8192    "$DURATION"
+run_scenario tput be_above_frag  0 131072  "$DURATION"
+run_scenario tput be_2mb         0 2000000 "$DURATION"
+run_scenario tput rel_small      1 64      "$DURATION"
+run_scenario tput rel_below_frag 1 8192    "$DURATION"
+run_scenario tput rel_above_frag 1 131072  "$DURATION"
+run_scenario tput rel_2mb        1 2000000 "$DURATION"
 
 # ---- sustained traffic-pressure / collapse watch (long) --------------------
-run_scenario stress be_64b_stress 0 64    "$STRESS_DURATION"
-run_scenario stress rel_1k_stress 1 1024  "$STRESS_DURATION"
-run_scenario stress be_64k_stress 0 65000 "$STRESS_DURATION"
+# The collapse-prone combinations: reliable under backpressure, and fragmented /
+# large best-effort where a slow receiver must shed load without leaking
+# reassembly buffers. Watch collapse_ratio (<1 = decaying), rss_max (unbounded
+# growth), min_sps mid-run (stall/deadlock), and survived (crash).
+run_scenario stress rel_below_frag_stress 1 8192    "$STRESS_DURATION"
+run_scenario stress rel_above_frag_stress 1 131072  "$STRESS_DURATION"
+run_scenario stress be_above_frag_stress  0 131072  "$STRESS_DURATION"
+run_scenario stress be_2mb_stress         0 2000000 "$STRESS_DURATION"
 
 echo
 echo "===== MAX-THROUGHPUT/STRESS SUMMARY ($SUMMARY) ====="
