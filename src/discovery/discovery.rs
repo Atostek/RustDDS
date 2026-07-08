@@ -2353,7 +2353,7 @@ mod tests {
       .poll(&mut events, Some(StdDuration::from_secs(1)))
       .unwrap();
 
-    for _ in udp_listener.messages() {
+    for _ in udp_listener.messages_bounded(usize::MAX) {
       info!("Message received");
     }
   }

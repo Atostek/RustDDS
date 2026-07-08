@@ -106,6 +106,7 @@ pub(crate) struct WriterSendBuffer {
 }
 
 impl WriterSendBuffer {
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     writer_guid: GUID,
     topic_name: String,

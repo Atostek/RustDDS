@@ -308,18 +308,14 @@ impl UDPListener {
     panic!("test helper didn't recv message after ten attempts.");
   }
 
-  /// Get all messages waiting in the socket, each paired with its
-  /// [`PacketOrigin`] (source address + receiving interface, when available).
-  pub fn messages(&mut self) -> Vec<(Bytes, PacketOrigin)> {
-    self.messages_bounded(usize::MAX)
-  }
-
-  /// Like [`messages`](Self::messages) but returns after at most `max_messages`
-  /// datagrams, leaving any remainder in the socket. Used by the event loop to
-  /// cap how much bulk traffic one socket can process per poll iteration, so a
-  /// flood on one socket cannot starve the (single-threaded) loop from
-  /// servicing discovery/control sockets. Relies on the listener being
-  /// registered level-triggered, so undrained data re-fires on the next poll.
+  /// Drain up to `max_messages` datagrams waiting in the socket, each paired
+  /// with its [`PacketOrigin`] (source address + receiving interface, when
+  /// available). Pass `usize::MAX` to read everything currently queued. Used
+  /// by the event loop to cap how much bulk traffic one socket can process
+  /// per poll iteration, so a flood on one socket cannot starve the
+  /// (single-threaded) loop from servicing discovery/control sockets. Relies
+  /// on the listener being registered level-triggered, so undrained data
+  /// re-fires on the next poll.
   pub fn messages_bounded(&mut self, max_messages: usize) -> Vec<(Bytes, PacketOrigin)> {
     let mut messages = Vec::with_capacity(4);
 

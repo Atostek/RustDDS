@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt, iter};
+use std::{
+  collections::{btree_map::Entry, BTreeMap},
+  fmt, iter,
+};
 
 use bit_vec::BitVec;
 use enumflags2::BitFlags;
@@ -216,12 +219,15 @@ impl FragmentAssembler {
     let frag_size = self.fragment_size;
 
     let sn = datafrag.writer_sn;
-    if !self.assembly_buffers.contains_key(&sn) {
-      let Some(buf) = AssemblyBuffer::new(datafrag) else {
-        error!("new_datafrag: failed to create AssemblyBuffer for {sn:?}");
-        return None;
-      };
-      self.assembly_buffers.insert(sn, buf);
+    match self.assembly_buffers.entry(sn) {
+      Entry::Vacant(v) => {
+        let Some(buf) = AssemblyBuffer::new(datafrag) else {
+          error!("new_datafrag: failed to create AssemblyBuffer for {sn:?}");
+          return None;
+        };
+        v.insert(buf);
+      }
+      Entry::Occupied(_) => {}
     }
 
     let Some(assembly_buffer) = self.assembly_buffers.get_mut(&sn) else {
