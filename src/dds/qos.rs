@@ -233,6 +233,89 @@ pub struct QosPolicies {
   pub(crate) property: Option<policy::Property>,
 }
 
+/// Default QoS policy values from DDS Specification v1.4 Section 2.2.3
+/// (tables "DDS QosPolicies").
+///
+/// RTPS discovery (SEDP) permits a participant to omit a QoS parameter when it
+/// equals the endpoint's default value; a receiver must then assume that
+/// default (e.g. Fast DDS 3.x omits such parameters). The defaults differ
+/// between DataWriters and DataReaders — most notably Reliability: writers
+/// default to Reliable, readers to BestEffort.
+pub mod spec_qos_defaults {
+  use super::{policy, QosPolicies};
+  use crate::structure::duration::Duration;
+
+  /// Effective QoS of a DataWriter that does not specify a policy.
+  ///
+  /// History and resource-limits stay `None`: they are not part of SEDP
+  /// discovery data (RTPS spec 2.5, Figure 8.30). Time-based filter is a
+  /// DataReader policy and stays `None` here.
+  pub fn data_writer() -> QosPolicies {
+    QosPolicies {
+      durability: Some(policy::Durability::Volatile),
+      presentation: Some(policy::Presentation {
+        access_scope: policy::PresentationAccessScope::Instance,
+        coherent_access: false,
+        ordered_access: false,
+      }),
+      deadline: Some(policy::Deadline(Duration::INFINITE)),
+      latency_budget: Some(policy::LatencyBudget {
+        duration: Duration::ZERO,
+      }),
+      ownership: Some(policy::Ownership::Shared),
+      liveliness: Some(policy::Liveliness::Automatic {
+        lease_duration: Duration::INFINITE,
+      }),
+      time_based_filter: None,
+      reliability: Some(policy::Reliability::Reliable {
+        max_blocking_time: Duration::from_millis(100),
+      }),
+      destination_order: Some(policy::DestinationOrder::ByReceptionTimestamp),
+      history: None,
+      resource_limits: None,
+      lifespan: Some(policy::Lifespan {
+        duration: Duration::INFINITE,
+      }),
+      #[cfg(feature = "security")]
+      property: None,
+    }
+  }
+
+  /// Effective QoS of a DataReader that does not specify a policy.
+  ///
+  /// History and resource-limits stay `None`: they are not part of SEDP
+  /// discovery data (RTPS spec 2.5, Figure 8.30). Lifespan is a DataWriter
+  /// policy and stays `None` here.
+  pub fn data_reader() -> QosPolicies {
+    QosPolicies {
+      durability: Some(policy::Durability::Volatile),
+      presentation: Some(policy::Presentation {
+        access_scope: policy::PresentationAccessScope::Instance,
+        coherent_access: false,
+        ordered_access: false,
+      }),
+      deadline: Some(policy::Deadline(Duration::INFINITE)),
+      latency_budget: Some(policy::LatencyBudget {
+        duration: Duration::ZERO,
+      }),
+      ownership: Some(policy::Ownership::Shared),
+      liveliness: Some(policy::Liveliness::Automatic {
+        lease_duration: Duration::INFINITE,
+      }),
+      time_based_filter: Some(policy::TimeBasedFilter {
+        minimum_separation: Duration::ZERO,
+      }),
+      reliability: Some(policy::Reliability::BestEffort),
+      destination_order: Some(policy::DestinationOrder::ByReceptionTimestamp),
+      history: None,
+      resource_limits: None,
+      lifespan: None,
+      #[cfg(feature = "security")]
+      property: None,
+    }
+  }
+}
+
 impl QosPolicies {
   // TODO: rename this to "none", as this is already member of QosPolicies, so
   // context in implied

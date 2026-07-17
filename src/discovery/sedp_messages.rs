@@ -17,7 +17,7 @@ use crate::{
         Deadline, DestinationOrder, Durability, History, LatencyBudget, Lifespan, Liveliness,
         Ownership, Presentation, Reliability, ResourceLimits, TimeBasedFilter,
       },
-      HasQoSPolicy, QosPolicies,
+      spec_qos_defaults, HasQoSPolicy, QosPolicies,
     },
     topic::{Topic, TopicDescription},
     with_key::datawriter::DataWriter,
@@ -260,7 +260,10 @@ impl SubscriptionBuiltinTopicData {
     // resource_limits does not exist
   }
 
-  pub fn qos(&self) -> QosPolicies {
+  /// QoS exactly as present on this struct, `None` for parameters that were
+  /// not set or received. Used for serialization so that announcements carry
+  /// only explicitly-set policies.
+  fn wire_qos(&self) -> QosPolicies {
     QosPolicies {
       durability: self.durability,
       presentation: self.presentation,
@@ -274,6 +277,32 @@ impl SubscriptionBuiltinTopicData {
       history: None, // SubscriptionBuiltinTopicData does not contain History QoS
       resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
       lifespan: self.lifespan,
+      #[cfg(feature = "security")]
+      property: None, // TODO: no property QoS?
+    }
+  }
+
+  /// Effective QoS of the discovered reader.
+  ///
+  /// QoS parameters omitted from the received SEDP data resolve to the DDS
+  /// spec defaults for a DataReader (RTPS: an absent parameter means its
+  /// default value; Fast DDS 3.x omits default-valued parameters). The struct
+  /// fields keep only what was actually received.
+  pub fn qos(&self) -> QosPolicies {
+    let defaults = spec_qos_defaults::data_reader();
+    QosPolicies {
+      durability: self.durability.or(defaults.durability),
+      presentation: self.presentation.or(defaults.presentation),
+      deadline: self.deadline.or(defaults.deadline),
+      latency_budget: self.latency_budget.or(defaults.latency_budget),
+      ownership: self.ownership.or(defaults.ownership),
+      liveliness: self.liveliness.or(defaults.liveliness),
+      time_based_filter: self.time_based_filter.or(defaults.time_based_filter),
+      reliability: self.reliability.or(defaults.reliability),
+      destination_order: self.destination_order.or(defaults.destination_order),
+      history: None, // SubscriptionBuiltinTopicData does not contain History QoS
+      resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
+      lifespan: self.lifespan.or(defaults.lifespan),
 
       #[cfg(feature = "security")]
       property: None, // TODO: no property QoS?
@@ -488,7 +517,7 @@ impl ParameterListable for DiscoveredReaderData {
     } = self;
 
     let mut pl = ParameterList::new();
-    let qos = sbtd.qos();
+    let qos = sbtd.wire_qos();
 
     let ctx = pl_cdr_rep_id_to_speedy(encoding)?;
 
@@ -704,7 +733,10 @@ impl PublicationBuiltinTopicData {
     self.presentation = qos.presentation;
   }
 
-  pub fn qos(&self) -> QosPolicies {
+  /// QoS exactly as present on this struct, `None` for parameters that were
+  /// not set or received. Used for serialization so that announcements carry
+  /// only explicitly-set policies.
+  fn wire_qos(&self) -> QosPolicies {
     QosPolicies {
       durability: self.durability,
       presentation: self.presentation,
@@ -718,6 +750,33 @@ impl PublicationBuiltinTopicData {
       history: None,         // PublicationBuiltinTopicData does not contain History QoS
       resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
       lifespan: self.lifespan,
+      #[cfg(feature = "security")]
+      property: None, // TODO: no property Qos?
+    }
+  }
+
+  /// Effective QoS of the discovered writer.
+  ///
+  /// QoS parameters omitted from the received SEDP data resolve to the DDS
+  /// spec defaults for a DataWriter (RTPS: an absent parameter means its
+  /// default value; Fast DDS 3.x omits default-valued parameters). Note the
+  /// writer default for Reliability is Reliable, unlike DataReaders. The
+  /// struct fields keep only what was actually received.
+  pub fn qos(&self) -> QosPolicies {
+    let defaults = spec_qos_defaults::data_writer();
+    QosPolicies {
+      durability: self.durability.or(defaults.durability),
+      presentation: self.presentation.or(defaults.presentation),
+      deadline: self.deadline.or(defaults.deadline),
+      latency_budget: self.latency_budget.or(defaults.latency_budget),
+      ownership: self.ownership.or(defaults.ownership),
+      liveliness: self.liveliness.or(defaults.liveliness),
+      time_based_filter: self.time_based_filter.or(defaults.time_based_filter),
+      reliability: self.reliability.or(defaults.reliability),
+      destination_order: self.destination_order.or(defaults.destination_order),
+      history: None,         // PublicationBuiltinTopicData does not contain History QoS
+      resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
+      lifespan: self.lifespan.or(defaults.lifespan),
       #[cfg(feature = "security")]
       property: None, // TODO: no property Qos?
     }
@@ -941,7 +1000,7 @@ impl ParameterListable for DiscoveredWriterData {
     } = self;
 
     let mut pl = ParameterList::new();
-    let qos = pbtd.qos();
+    let qos = pbtd.wire_qos();
 
     let ctx = pl_cdr_rep_id_to_speedy(encoding)?;
 
@@ -1415,6 +1474,121 @@ mod tests {
 
     let msg = Message::read_from_buffer(&raw_data).unwrap();
     info!("{msg:?}");
+  }
+
+  #[test]
+  fn qos_spec_defaults_for_omitted_writer_params() {
+    use crate::structure::duration::Duration;
+
+    let pub_data = PublicationBuiltinTopicData::new(
+      GUID::GUID_UNKNOWN,
+      None,
+      "Square".to_string(),
+      "ShapeType".to_string(),
+      None,
+    );
+    // Struct stays wire-faithful: nothing received, nothing stored.
+    assert_eq!(pub_data.reliability, None);
+    assert_eq!(pub_data.durability, None);
+
+    // Effective QoS resolves to the DataWriter spec defaults.
+    let qos = pub_data.qos();
+    assert_eq!(
+      qos.reliability(),
+      Some(Reliability::Reliable {
+        max_blocking_time: Duration::from_millis(100),
+      })
+    );
+    assert_eq!(qos.durability(), Some(Durability::Volatile));
+    assert_eq!(qos.deadline(), Some(Deadline(Duration::INFINITE)));
+    assert_eq!(
+      qos.liveliness(),
+      Some(Liveliness::Automatic {
+        lease_duration: Duration::INFINITE,
+      })
+    );
+    assert_eq!(
+      qos.lifespan(),
+      Some(Lifespan {
+        duration: Duration::INFINITE,
+      })
+    );
+  }
+
+  #[test]
+  fn qos_spec_defaults_for_omitted_reader_params() {
+    let sub_data = SubscriptionBuiltinTopicData::new(
+      GUID::GUID_UNKNOWN,
+      None,
+      "Square".to_string(),
+      "ShapeType".to_string(),
+      &QosPolicies::qos_none(),
+      None,
+    );
+    assert_eq!(sub_data.reliability, None);
+
+    // DataReader reliability default is BestEffort — asymmetric to DataWriters.
+    let qos = sub_data.qos();
+    assert_eq!(qos.reliability(), Some(Reliability::BestEffort));
+    assert_eq!(qos.durability(), Some(Durability::Volatile));
+    assert_eq!(qos.lifespan(), None);
+  }
+
+  #[test]
+  fn qos_explicit_wire_values_preserved() {
+    let mut pub_data = PublicationBuiltinTopicData::new(
+      GUID::GUID_UNKNOWN,
+      None,
+      "Square".to_string(),
+      "ShapeType".to_string(),
+      None,
+    );
+    pub_data.reliability = Some(Reliability::BestEffort);
+    pub_data.durability = Some(Durability::TransientLocal);
+
+    let qos = pub_data.qos();
+    assert_eq!(qos.reliability(), Some(Reliability::BestEffort));
+    assert_eq!(qos.durability(), Some(Durability::TransientLocal));
+  }
+
+  #[test]
+  fn omitted_qos_params_roundtrip_as_none_but_qos_fills_defaults() {
+    // Simulates Fast DDS 3.x behavior: QoS parameters equal to the endpoint
+    // defaults are omitted from the serialized SEDP data entirely.
+    let mut writer_proxy = writer_proxy_data().unwrap();
+    let pub_data = PublicationBuiltinTopicData::new(
+      writer_proxy.remote_writer_guid,
+      None,
+      "Square".to_string(),
+      "ShapeType".to_string(),
+      None,
+    );
+    writer_proxy.remote_writer_guid = pub_data.key;
+
+    let dwd = DiscoveredWriterData {
+      last_updated: Instant::now(),
+      writer_proxy,
+      publication_topic_data: pub_data,
+      user_data: Vec::new(),
+    };
+
+    let sdata = dwd
+      .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
+      .unwrap();
+    let dwd2: DiscoveredWriterData =
+      PlCdrDeserializerAdapter::from_bytes(&sdata, RepresentationIdentifier::PL_CDR_LE).unwrap();
+
+    // Wire fidelity: omitted parameters parse back as None on the struct.
+    assert_eq!(dwd2.publication_topic_data.reliability, None);
+    assert_eq!(dwd2.publication_topic_data.durability, None);
+
+    // Effective QoS applies the DataWriter spec defaults.
+    let qos = dwd2.publication_topic_data.qos();
+    assert!(matches!(
+      qos.reliability(),
+      Some(Reliability::Reliable { .. })
+    ));
+    assert_eq!(qos.durability(), Some(Durability::Volatile));
   }
 
   #[test]
