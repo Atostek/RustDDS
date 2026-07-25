@@ -253,17 +253,25 @@ impl TopicCache {
       None
     } else {
       // This is a new (to us) SequenceNumber, this is the default processing path.
-      self.insert_sn(*instant, &cache_change);
-      self
-        .changes
-        .insert(*instant, cache_change)
-        .inspect(|old_cc| {
-          // If this happens, cache changes were created at exactly same instant.
-          // This is bad, since we are using instants as keys and assume that they
-          // are unique.
-          error!("DDSHistoryCache already contained element with key {instant:?} !!!");
-          self.remove_sn(old_cc);
-        })
+      //
+      // Reception instants are not guaranteed unique: several samples decoded
+      // within the same clock tick (e.g. a discovery burst arriving in one
+      // datagram) would collide on the map key, and evicting the incumbent
+      // would permanently lose a change the reliability protocol has already
+      // acknowledged. Probe forward to the next vacant tick instead; the
+      // sub-nanosecond skew preserves ordering.
+      let mut key = *instant;
+      while self.changes.contains_key(&key) {
+        key = Timestamp::from_ticks(key.to_ticks() + 1);
+      }
+      if key != *instant {
+        debug!(
+          "add_change: bumped colliding instant {:?} to {:?} topic={:?}",
+          instant, key, self.topic_name
+        );
+      }
+      self.insert_sn(key, &cache_change);
+      self.changes.insert(key, cache_change)
     }
   }
 
@@ -577,6 +585,43 @@ mod tests {
         )
         .count(),
       3
+    );
+  }
+
+  #[test]
+  fn same_instant_changes_are_all_retained() {
+    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let qos = QosPolicies::qos_none();
+    let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+      String::from("BurstTopic"),
+      TypeDesc::new("BurstType".to_string()),
+      &qos,
+    );
+
+    // Samples decoded within the same clock tick share a reception instant,
+    // as happens when a discovery burst arrives in one datagram. None of
+    // them may be lost to key collisions.
+    let instant = crate::Timestamp::now();
+    for sn in 1..=8 {
+      let change = CacheChange::new(
+        GUID::GUID_UNKNOWN,
+        SequenceNumber::new(sn),
+        WriteOptions::default(),
+        DDSData::new(SerializedPayload::default()),
+      );
+      topic_cache_handle.lock().unwrap().add_change(&instant, change);
+    }
+
+    assert_eq!(
+      topic_cache_handle
+        .lock()
+        .unwrap()
+        .get_changes_in_range_best_effort(
+          instant - crate::Duration::from_secs(1),
+          crate::Timestamp::now() + crate::Duration::from_secs(1)
+        )
+        .count(),
+      8
     );
   }
 }
