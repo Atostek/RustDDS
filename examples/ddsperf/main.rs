@@ -29,6 +29,11 @@ use futures::{/* FutureExt, */ StreamExt, TryFutureExt};
 struct KeyedSeq {
   pub seq: u32,
   pub keyval: u32,
+  // Plain `Vec<u8>` uses serde's SeqAccess (one visit per octet). For a 1 KB
+  // baggage that is ~30% of subscriber CPU. `serde_bytes` selects CDR's
+  // deserialize_byte_buf / serialize_bytes bulk path; wire format is identical
+  // (CDR sequence of octet = length + bytes).
+  #[serde(with = "serde_bytes")]
   pub baggage: Vec<u8>,
 }
 

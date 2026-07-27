@@ -135,10 +135,19 @@ impl ReaderProxy {
 
 impl From<RtpsReaderProxy> for ReaderProxy {
   fn from(rtps_reader_proxy: RtpsReaderProxy) -> Self {
+    // Discovery `ReaderProxy` has a single unicast list. The live RTPS proxy
+    // splits loopback into `loopback_unicast_locators` so the send path can
+    // gate it; when converting back for SEDP / DiscoveryDB enrichment we must
+    // re-merge that bucket. Otherwise a loopback-only participant (e.g.
+    // `with_only_networks([127.0.0.1])`) ends up with an empty unicast list
+    // after the round-trip and user-data never flows (match-but-no-data).
+    let expects_inline_qos = rtps_reader_proxy.expects_inline_qos();
+    let mut unicast_locator_list = rtps_reader_proxy.unicast_locator_list;
+    unicast_locator_list.extend(rtps_reader_proxy.loopback_unicast_locators);
     Self {
       remote_reader_guid: rtps_reader_proxy.remote_reader_guid,
-      expects_inline_qos: rtps_reader_proxy.expects_inline_qos(),
-      unicast_locator_list: rtps_reader_proxy.unicast_locator_list,
+      expects_inline_qos,
+      unicast_locator_list,
       multicast_locator_list: rtps_reader_proxy.multicast_locator_list,
     }
   }

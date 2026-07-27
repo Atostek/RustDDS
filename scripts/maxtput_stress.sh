@@ -38,29 +38,45 @@ mkdir -p "$LOGDIR"
 if [ "$FLAVOR" = rustdds ]; then
   BIN_DIR="${BIN_DIR:-target/release/examples}"
   DDSPERF="$BIN_DIR/ddsperf"
+  # Same loopback address as Cyclone (127.0.0.1). Override with
+  # RUSTDDS_IFACE=<nic-ip> or RUSTDDS_IFACE= to use all interfaces.
+  if [ -z "${RUSTDDS_IFACE+x}" ]; then
+    RUSTDDS_IFACE=127.0.0.1
+  fi
+  if [ -n "${RUSTDDS_IFACE}" ]; then
+    export RUSTDDS_IFACE
+    echo "  rustdds:  RUSTDDS_IFACE=$RUSTDDS_IFACE"
+  fi
 elif [ "$FLAVOR" = cyclone ]; then
   CYC_DIR="${CYC_DIR:-../cyclonedds}"
   DDSPERF="${DDSPERF:-$CYC_DIR/build/bin/ddsperf}"
-  # Force loopback UDP, no multicast, no shared memory (apples-to-apples w/ RustDDS).
-  CFG="$OUTDIR/cyclone_loopback.xml"
+  # Loopback by default (lo on Linux, lo0 on macOS).
+  IFACE="${IFACE:-lo}"
+  if ! ip link show "$IFACE" >/dev/null 2>&1 && ! ifconfig "$IFACE" >/dev/null 2>&1; then
+    IFACE=lo0
+  fi
+  PEER_IP="${PEER_IP:-127.0.0.1}"
+  CFG="$OUTDIR/cyclone_${IFACE}.xml"
   printf '%s\n' \
     '<?xml version="1.0" encoding="UTF-8" ?>' \
     '<CycloneDDS xmlns="https://cdds.io/config">' \
     '  <Domain Id="any">' \
     '    <General>' \
     '      <Interfaces>' \
-    '        <NetworkInterface name="lo0" priority="default" multicast="false"/>' \
+    "        <NetworkInterface name=\"${IFACE}\" priority=\"default\" multicast=\"false\"/>" \
     '      </Interfaces>' \
     '      <AllowMulticast>false</AllowMulticast>' \
     '      <EnableMulticastLoopback>false</EnableMulticastLoopback>' \
     '    </General>' \
     '    <Discovery>' \
-    '      <Peers><Peer address="127.0.0.1"/></Peers>' \
+    "      <Peers><Peer address=\"${PEER_IP}\"/></Peers>" \
     '      <ParticipantIndex>auto</ParticipantIndex>' \
     '    </Discovery>' \
     '  </Domain>' \
     '</CycloneDDS>' > "$CFG"
   export CYCLONEDDS_URI="file://$CFG"
+  export LD_LIBRARY_PATH="$CYC_DIR/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  echo "  cyclone:   iface=$IFACE peer=$PEER_IP"
 else
   echo "unknown FLAVOR=$FLAVOR" >&2; exit 1
 fi
