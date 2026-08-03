@@ -562,7 +562,8 @@ impl Writer {
     let fragment_size = FRAGMENT_SIZE as u32;
     let data_size = payload_size as u32; // TODO: overflow check
                                          // Formula from RTPS spec v2.5 Section "8.3.8.3.5 Logical Interpretation"
-    let num_frags = (data_size / fragment_size) + u32::from(data_size % fragment_size != 0); // rounding up
+    let num_frags =
+      (data_size / fragment_size) + u32::from(!data_size.is_multiple_of(fragment_size)); // rounding up
     debug!("Fragmenting {data_size} to {num_frags} x {fragment_size}");
     // TODO: Check fragment_size overflow
     (num_frags, fragment_size as u16)

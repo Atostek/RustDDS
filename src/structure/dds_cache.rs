@@ -255,7 +255,7 @@ impl TopicCache {
     } else {
       1
     };
-    let gc_triggered = modulus <= 1 || semi_random_number % modulus == 0;
+    let gc_triggered = modulus <= 1 || semi_random_number.is_multiple_of(modulus);
     if gc_triggered {
       debug!("Garbage collecting topic {}", self.topic_name);
       self.remove_changes_before(Timestamp::ZERO);

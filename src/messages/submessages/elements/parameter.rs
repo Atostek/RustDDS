@@ -98,7 +98,11 @@ impl<C: Context> Writable<C> for Parameter {
   #[inline]
   fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
     let length = self.value.len();
-    let pad = if length % 4 != 0 { 4 - (length % 4) } else { 0 };
+    let pad = if !length.is_multiple_of(4) {
+      4 - (length % 4)
+    } else {
+      0
+    };
 
     writer.write_value(&self.parameter_id)?;
     writer.write_u16((length + pad) as u16)?;
