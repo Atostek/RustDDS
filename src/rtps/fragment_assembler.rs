@@ -190,6 +190,9 @@ const MAX_ASSEMBLY_BUFFERS: usize = 128;
 pub(crate) struct FragmentAssembler {
   fragment_size: u16, // number of bytes per fragment. Each writer must select one constant value.
   assembly_buffers: BTreeMap<SequenceNumber, AssemblyBuffer>,
+  // Whether the owning reader is Reliable. This decides which buffer to drop
+  // when `MAX_ASSEMBLY_BUFFERS` is exceeded (see `new_datafrag`).
+  reliable: bool,
 }
 
 impl fmt::Debug for FragmentAssembler {
@@ -201,11 +204,12 @@ impl fmt::Debug for FragmentAssembler {
 }
 
 impl FragmentAssembler {
-  pub fn new(fragment_size: u16) -> Self {
-    debug!("new FragmentAssembler. frag_size = {fragment_size}");
+  pub fn new(fragment_size: u16, reliable: bool) -> Self {
+    debug!("new FragmentAssembler. frag_size = {fragment_size} reliable = {reliable}");
     Self {
       fragment_size,
       assembly_buffers: BTreeMap::new(),
+      reliable,
     }
   }
 
@@ -266,11 +270,28 @@ impl FragmentAssembler {
     } else {
       debug!("new_dataFrag: FRAGMENT NOT COMPLETED YET");
       // Bound memory: never keep more than MAX_ASSEMBLY_BUFFERS incomplete
-      // reassemblies. Evict the oldest (lowest SN) first; those are the least
-      // likely to still complete (their remaining fragments are long gone under
-      // best effort, and will be re-requested under reliable).
+      // reassemblies.
+      //
+      // Which one to evict depends on reliability:
+      //  * Reliable: the reader delivers strictly in order, so it must complete
+      //    the LOWEST sequence number first; that buffer is exactly the one
+      //    blocking progress. Dropping it would livelock, because a writer that
+      //    bursts many large samples ahead (e.g. Connext) would make the reader
+      //    perpetually evict the very sample it is waiting for. So evict the
+      //    HIGHEST (newest) sequence number instead; the writer keeps unacked
+      //    samples in its history and re-sends them once we catch up.
+      //  * Best effort: there is no retransmission, so a low incomplete buffer is
+      //    lost anyway. Evict the OLDEST (lowest SN) to free room for newer
+      //    samples that may still complete.
       while self.assembly_buffers.len() > MAX_ASSEMBLY_BUFFERS {
-        self.assembly_buffers.pop_first();
+        let evicted = if self.reliable {
+          self.assembly_buffers.pop_last()
+        } else {
+          self.assembly_buffers.pop_first()
+        };
+        if evicted.is_none() {
+          break;
+        }
       }
       None
     }
@@ -400,7 +421,7 @@ mod tests {
     let frag_size = 256u16;
     let data_size = 512u32;
     let bad = datafrag(2, 2, frag_size, data_size, vec![0u8; 256]);
-    let mut fa = FragmentAssembler::new(frag_size);
+    let mut fa = FragmentAssembler::new(frag_size, true);
     assert!(fa
       .new_datafrag(&bad, BitFlags::<DATAFRAG_Flags>::empty())
       .is_none());

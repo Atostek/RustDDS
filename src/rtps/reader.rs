@@ -640,10 +640,11 @@ impl Reader {
     writer_guid: GUID,
     frag_size: u16,
   ) -> &mut FragmentAssembler {
+    let reliable = self.reliability != policy::Reliability::BestEffort;
     self
       .fragment_assemblers
       .entry(writer_guid)
-      .or_insert_with(|| FragmentAssembler::new(frag_size))
+      .or_insert_with(|| FragmentAssembler::new(frag_size, reliable))
   }
 
   fn garbage_collect_fragments(&mut self) {
