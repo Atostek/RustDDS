@@ -690,6 +690,14 @@ impl DiscoveryDB {
     self.local_topic_writers.values()
   }
 
+  pub fn get_all_external_topic_readers(&self) -> impl Iterator<Item = &DiscoveredReaderData> {
+    self.external_topic_readers.values()
+  }
+
+  pub fn get_all_external_topic_writers(&self) -> impl Iterator<Item = &DiscoveredWriterData> {
+    self.external_topic_writers.values()
+  }
+
   // Note:
   // If multiple participants announce the same topic, this will
   // return duplicates, one per announcing participant.
@@ -971,6 +979,73 @@ mod tests {
     discovery_db.update_subscription(&dreader3);
 
     // TODO: there might be a need for different scenarios
+  }
+
+  #[test]
+  fn discdb_external_endpoint_snapshots() {
+    let (discovery_db_event_sender, _discovery_db_event_receiver) =
+      mio_channel::sync_channel::<()>(4);
+    let (status_sender, _status_receiver) = sync_status_channel(16).unwrap();
+
+    let mut discovery_db = DiscoveryDB::new(
+      GUID::new_participant_guid(),
+      discovery_db_event_sender,
+      status_sender,
+    );
+
+    // Nothing discovered yet.
+    assert_eq!(discovery_db.get_all_external_topic_readers().count(), 0);
+    assert_eq!(discovery_db.get_all_external_topic_writers().count(), 0);
+
+    // Discover one external Reader via SEDP subscription data.
+    let reader = reader_proxy_data().unwrap();
+    let reader_sub = subscription_builtin_topic_data().unwrap();
+    let dreader = DiscoveredReaderData {
+      reader_proxy: reader,
+      subscription_topic_data: reader_sub,
+      content_filter: None,
+      user_data: Vec::new(),
+    };
+    discovery_db.update_subscription(&dreader);
+
+    // Discover one external Writer via SEDP publication data.
+    let domain_participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let topic = domain_participant
+      .create_topic(
+        "Foobar".to_string(),
+        "RandomData".to_string(),
+        &QosPolicies::qos_none(),
+        TopicKind::WithKey,
+      )
+      .unwrap();
+    let publisher = domain_participant
+      .create_publisher(&QosPolicies::qos_none())
+      .unwrap();
+    let dw = publisher
+      .create_datawriter::<RandomData, CDRSerializerAdapter<RandomData, LittleEndian>>(&topic, None)
+      .unwrap();
+    let writer_data = DiscoveredWriterData::new(&dw, &topic, &domain_participant, None);
+    discovery_db.update_publication(&writer_data);
+
+    // Both accessors return the discovered endpoints as a snapshot.
+    let readers = discovery_db
+      .get_all_external_topic_readers()
+      .cloned()
+      .collect::<Vec<_>>();
+    let writers = discovery_db
+      .get_all_external_topic_writers()
+      .cloned()
+      .collect::<Vec<_>>();
+    assert_eq!(readers.len(), 1);
+    assert_eq!(writers.len(), 1);
+    assert_eq!(
+      readers[0].reader_proxy.remote_reader_guid,
+      dreader.reader_proxy.remote_reader_guid
+    );
+    assert_eq!(
+      writers[0].writer_proxy.remote_writer_guid,
+      writer_data.writer_proxy.remote_writer_guid
+    );
   }
 
   #[test]

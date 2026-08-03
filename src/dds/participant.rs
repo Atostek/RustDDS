@@ -35,7 +35,7 @@ use crate::{
   discovery::{
     discovery::{Discovery, DiscoveryCommand},
     discovery_db::DiscoveryDB,
-    sedp_messages::DiscoveredTopicData,
+    sedp_messages::{DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData},
   },
   network::{constant::*, udp_listener::UDPListener},
   rtps::{
@@ -534,6 +534,50 @@ impl DomainParticipant {
     self.dpi.lock().unwrap().discovered_topics()
   }
 
+  /// Gets a snapshot of all Readers discovered over the DDS network.
+  ///
+  /// The `DomainParticipantStatusListener` reports Reader discovery as a live
+  /// stream of events, so a listener that attaches late or drains slowly can
+  /// miss some of them. This returns the full current set of discovered
+  /// Readers from the internal discovery database instead.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// # use rustdds::DomainParticipant;
+  ///
+  /// let domain_participant = DomainParticipant::new(0).unwrap();
+  /// let discovered_readers = domain_participant.discovered_readers();
+  /// for dreader in discovered_readers.iter() {
+  ///   // do something
+  /// }
+  /// ```
+  pub fn discovered_readers(&self) -> Vec<DiscoveredReaderData> {
+    self.dpi.lock().unwrap().discovered_readers()
+  }
+
+  /// Gets a snapshot of all Writers discovered over the DDS network.
+  ///
+  /// The `DomainParticipantStatusListener` reports Writer discovery as a live
+  /// stream of events, so a listener that attaches late or drains slowly can
+  /// miss some of them. This returns the full current set of discovered
+  /// Writers from the internal discovery database instead.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// # use rustdds::DomainParticipant;
+  ///
+  /// let domain_participant = DomainParticipant::new(0).unwrap();
+  /// let discovered_writers = domain_participant.discovered_writers();
+  /// for dwriter in discovered_writers.iter() {
+  ///   // do something
+  /// }
+  /// ```
+  pub fn discovered_writers(&self) -> Vec<DiscoveredWriterData> {
+    self.dpi.lock().unwrap().discovered_writers()
+  }
+
   /// Manually asserts liveliness, affecting all writers with
   /// LIVELINESS QoS of MANUAL_BY_PARTICIPANT created by
   /// this particular participant.
@@ -950,6 +994,14 @@ impl DomainParticipantDisc {
 
   pub fn discovered_topics(&self) -> Vec<DiscoveredTopicData> {
     self.dpi.discovered_topics()
+  }
+
+  pub fn discovered_readers(&self) -> Vec<DiscoveredReaderData> {
+    self.dpi.discovered_readers()
+  }
+
+  pub fn discovered_writers(&self) -> Vec<DiscoveredWriterData> {
+    self.dpi.discovered_writers()
   }
 
   pub(crate) fn dds_cache(&self) -> Arc<RwLock<DDSCache>> {
@@ -1553,6 +1605,23 @@ impl DomainParticipantInner {
 
     db.all_user_topics().cloned().collect()
   }
+
+  pub fn discovered_readers(&self) -> Vec<DiscoveredReaderData> {
+    let db = self.discovery_db.read().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}")
+    });
+
+    db.get_all_external_topic_readers().cloned().collect()
+  }
+
+  pub fn discovered_writers(&self) -> Vec<DiscoveredWriterData> {
+    let db = self.discovery_db.read().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}")
+    });
+
+    db.get_all_external_topic_writers().cloned().collect()
+  }
+
   pub(crate) fn status_channel_receiver(
     &self,
   ) -> &StatusChannelReceiver<DomainParticipantStatusEvent> {
