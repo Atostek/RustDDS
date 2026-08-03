@@ -53,10 +53,13 @@ impl SignedDocument {
 
     match parsed_mail.subparts.as_slice() {
       [doc_content, signature] => {
-        let mut content = Vec::<u8>::from(doc_content.raw_bytes);
+        let content = Vec::<u8>::from(doc_content.raw_bytes);
 
-        // Remove an extra newline at end. mailparse seems to add this.
-        content.pop();
+        // Since mailparse 0.16, the CRLF/LF that precedes the MIME boundary
+        // delimiter is treated as part of the boundary (per RFC 2046) and is no
+        // longer included in `raw_bytes`, so we must not strip a trailing
+        // newline ourselves here. (mailparse <=0.15 appended it, requiring a
+        // manual `.pop()`.)
 
         // OpenSSL has converted to MS-DOS line endings when MIME encoding, and
         // the contents has has been computed from that.
