@@ -100,7 +100,7 @@ impl SignedDocument {
     // The SignedData type is defined in RFC 5652 Section 5.1.
     // OpenSSL calls this "pkcs7-signedData (1.2.840.113549.1.7.2)"
     if signature_encap.econtent_type
-      != const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2")
+      != der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2")
     {
       return Err(pkcs7_config_error("Expected to find SignedData object".to_owned()).into());
     }
@@ -129,7 +129,7 @@ impl SignedDocument {
         // "If the [signedAttrs] field is present, it MUST contain [...]
         // A message-digest attribute [...]""
         match sas.iter().find(|attr| attr.oid ==
-                  const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4")) 
+                  der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4")) 
                 // id-messageDigest OBJECT IDENTIFIER ::= { iso(1) member-body(2)
                 // us(840) rsadsi(113549) pkcs(1) pkcs9(9) 4 }
                 {
