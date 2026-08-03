@@ -273,16 +273,16 @@ impl FragmentAssembler {
       // reassemblies.
       //
       // Which one to evict depends on reliability:
-      //  * Reliable: the reader delivers strictly in order, so it must complete
-      //    the LOWEST sequence number first; that buffer is exactly the one
-      //    blocking progress. Dropping it would livelock, because a writer that
-      //    bursts many large samples ahead (e.g. Connext) would make the reader
-      //    perpetually evict the very sample it is waiting for. So evict the
-      //    HIGHEST (newest) sequence number instead; the writer keeps unacked
-      //    samples in its history and re-sends them once we catch up.
+      //  * Reliable: the reader delivers strictly in order, so it must complete the
+      //    LOWEST sequence number first; that buffer is exactly the one blocking
+      //    progress. Dropping it would livelock, because a writer that bursts many
+      //    large samples ahead (e.g. Connext) would make the reader perpetually evict
+      //    the very sample it is waiting for. So evict the HIGHEST (newest) sequence
+      //    number instead; the writer keeps unacked samples in its history and
+      //    re-sends them once we catch up.
       //  * Best effort: there is no retransmission, so a low incomplete buffer is
-      //    lost anyway. Evict the OLDEST (lowest SN) to free room for newer
-      //    samples that may still complete.
+      //    lost anyway. Evict the OLDEST (lowest SN) to free room for newer samples
+      //    that may still complete.
       while self.assembly_buffers.len() > MAX_ASSEMBLY_BUFFERS {
         let evicted = if self.reliable {
           self.assembly_buffers.pop_last()
