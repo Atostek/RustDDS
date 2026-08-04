@@ -63,7 +63,7 @@ mio-extras = "2.0.6"
 mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"], optional = true } 
 socketpair = { version = "0.19", optional = true }
 
-bit-vec = "0.8.0"
+bit-vec = "0.10.1"
 speedy = "0.8.0"
 log = "0.4.11"
 num-traits = "0.2"
