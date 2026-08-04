@@ -46,7 +46,7 @@ security = [
   "dep:serde-xml-rs", "dep:glob", "dep:mailparse", 
   "dep:x509-certificate", "dep:x509-cert", 
   "dep:tempfile", "dep:newline-converter", 
-  "dep:ring", "dep:cms", "dep:der", 
+  "dep:ring", "dep:der", 
   "dep:bcder",
   "dep:openssl", "dep:cryptoki"
   ]
@@ -96,12 +96,11 @@ serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated
 glob = { version = "0.3" , optional = true } # for reading spec-mandated XML config files
 mailparse = { version = "0.16" , optional = true } # for reading S/MIME-encoded (XML) config files
 x509-certificate = { version = "0.25" , optional = true } # for configuration certificates
-x509-cert = { version = "0.2" , optional = true }
+x509-cert = { version = "0.3" , optional = true }
 tempfile = { version = "3" , optional = true } # for calling external openssl command. Remove when no longer used.
 newline-converter = { version = "0.3" , optional = true } # helper for handling S/MIME
 ring = { version = "0.17" , optional = true } # Cryptographic primitives
-cms = { version = "0.2" , optional = true } # for ASN.1 parsing
-der = { version = "0.7" , features = ["oid"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
+der = { version = "0.8" , features = ["oid", "derive", "alloc"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.12", optional = true }

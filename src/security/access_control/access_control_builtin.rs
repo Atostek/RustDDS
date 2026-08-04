@@ -23,6 +23,7 @@ use super::{AccessControl, PermissionsHandle};
 mod domain_governance_document;
 mod domain_participant_permissions_document;
 //mod permissions_ca_certificate; --> crate::security::certificate
+mod pkcs7_signed_data;
 pub mod s_mime_config_parser;
 
 mod local_entity_access_control;

@@ -19,12 +19,10 @@
 // 9.4.1.3)
 
 use bytes::Bytes;
-use cms::{
-  attr::MessageDigest,
-  signed_data::{EncapsulatedContentInfo, SignedData},
-};
 use der::{Decode, Encode};
 use ring::{digest, signature};
+
+use super::pkcs7_signed_data::{EncapsulatedContentInfo, MessageDigest, SignedData};
 
 use crate::{
   create_security_error_and_log,
@@ -114,7 +112,7 @@ impl SignedDocument {
         .map_err(to_config_error_pkcs7("Cannot decode SignedData")),
     }?;
 
-    let signer_info = signed_data.signer_infos.0.get(0).ok_or(pkcs7_config_error(
+    let signer_info = signed_data.signer_infos.get(0).ok_or(pkcs7_config_error(
       "SignerInfo list in SignedData is empty!".to_owned(),
     ))?;
 

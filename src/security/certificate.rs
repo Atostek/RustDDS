@@ -51,7 +51,7 @@ impl Certificate {
     let other_cert = x509_cert::certificate::Certificate::from_der(cert.constructed_data())
       .map_err(to_config_error_parse("Cannot read X.509 Certificate(2)"))?;
 
-    let subject_name = other_cert.tbs_certificate.subject.into();
+    let subject_name = other_cert.tbs_certificate().subject().clone().into();
 
     Ok(Certificate { cert, subject_name })
   }
@@ -180,7 +180,7 @@ impl DistinguishedName {
 // This conversion should be non-fallible?
 impl From<x509_cert::name::Name> for DistinguishedName {
   fn from(name: x509_cert::name::Name) -> DistinguishedName {
-    DistinguishedName(name)
+    DistinguishedName(name.into())
   }
 }
 
