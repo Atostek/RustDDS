@@ -61,7 +61,8 @@ pub enum QosPolicyId {
   // TransportPriority, // 20
   Lifespan,
   // DurabilityService, // 22
-  Property, // No Id in the security spec (But this is from older DDS/RTPs spec.)
+  Representation, // 23 (DDS-XTypes v1.3 DATA_REPRESENTATION)
+  Property,       // No Id in the security spec (But this is from older DDS/RTPs spec.)
 }
 
 /// Utility for building [QosPolicies]
@@ -205,6 +206,10 @@ impl QosPolicyBuilder {
       history: self.history,
       resource_limits: self.resource_limits,
       lifespan: self.lifespan,
+      // DATA_REPRESENTATION is not part of the (const) builder: it holds a `Vec`
+      // (drop glue) which is incompatible with `const fn`, and the built-in QoS
+      // policies never need it. Set it via `QosPolicies::with_data_representation`.
+      data_representation: None,
       #[cfg(feature = "security")]
       property: None,
     }
@@ -229,6 +234,7 @@ pub struct QosPolicies {
   pub(crate) history: Option<policy::History>,
   pub(crate) resource_limits: Option<policy::ResourceLimits>,
   pub(crate) lifespan: Option<policy::Lifespan>,
+  pub(crate) data_representation: Option<policy::DataRepresentation>,
   #[cfg(feature = "security")]
   pub(crate) property: Option<policy::Property>,
 }
@@ -308,6 +314,25 @@ impl QosPolicies {
     self.lifespan
   }
 
+  pub fn data_representation(&self) -> Option<policy::DataRepresentation> {
+    self.data_representation.clone()
+  }
+
+  /// Set the DATA_REPRESENTATION QoS policy (DDS-XTypes v1.3 Section 7.6.3.1).
+  ///
+  /// For a DataWriter the first list element is the representation it uses; for
+  /// a DataReader the list is the set of representations it accepts. This is
+  /// not part of [`QosPolicyBuilder`] because it holds a `Vec` (incompatible
+  /// with the `const` builder used for built-in QoS).
+  #[must_use]
+  pub fn with_data_representation(
+    mut self,
+    data_representation: policy::DataRepresentation,
+  ) -> Self {
+    self.data_representation = Some(data_representation);
+    self
+  }
+
   #[cfg(feature = "security")]
   pub fn property(&self) -> Option<policy::Property> {
     self.property.clone()
@@ -333,6 +358,10 @@ impl QosPolicies {
       history: other.history.or(self.history),
       resource_limits: other.resource_limits.or(self.resource_limits),
       lifespan: other.lifespan.or(self.lifespan),
+      data_representation: other
+        .data_representation
+        .clone()
+        .or(self.data_representation.clone()),
       #[cfg(feature = "security")]
       property: other.property.clone().or(self.property.clone()),
     }
@@ -359,10 +388,19 @@ impl QosPolicies {
   }
 
   fn compliance_failure_wrt_impl(&self, other: &Self) -> Option<QosPolicyId> {
-    // TODO: Check for cases where policy is requested, but not offered (None)
+    // A QoS policy that is absent from an endpoint's discovery data must be
+    // treated as that policy's DDS default value (DDS spec v1.4 §2.2.3): the
+    // remote endpoint is in fact using the default, it just omitted the
+    // (default-valued) policy from the wire. Comparing only when *both* sides
+    // are `Some` would miss incompatibilities where one side omitted a
+    // default-valued policy (e.g. a writer that does not announce the default
+    // VOLATILE durability), causing incompatible endpoints to match.
 
     // check Durability: Offered must be better than or equal to Requested.
-    if let (Some(off), Some(req)) = (self.durability, other.durability) {
+    // Default: VOLATILE (the lowest).
+    {
+      let off = self.durability.unwrap_or(policy::Durability::Volatile);
+      let req = other.durability.unwrap_or(policy::Durability::Volatile);
       if off < req {
         return Some(QosPolicyId::Durability);
       }
@@ -372,7 +410,15 @@ impl QosPolicies {
     // * If coherent_access is requested, it must be offered also. AND
     // * Same for ordered_access. AND
     // * Offered access scope is broader than requested.
-    if let (Some(off), Some(req)) = (self.presentation, other.presentation) {
+    // Default: INSTANCE scope, no coherent access, no ordered access.
+    {
+      let default = policy::Presentation {
+        access_scope: policy::PresentationAccessScope::Instance,
+        coherent_access: false,
+        ordered_access: false,
+      };
+      let off = self.presentation.unwrap_or(default);
+      let req = other.presentation.unwrap_or(default);
       if (req.coherent_access && !off.coherent_access)
         || (req.ordered_access && !off.ordered_access)
         || (req.access_scope > off.access_scope)
@@ -381,25 +427,51 @@ impl QosPolicies {
       }
     }
 
-    // check Deadline: offered period <= requested period
-    if let (Some(off), Some(req)) = (self.deadline, other.deadline) {
+    // check Deadline: offered period <= requested period. Default: INFINITE.
+    {
+      let off = self
+        .deadline
+        .unwrap_or(policy::Deadline(Duration::INFINITE));
+      let req = other
+        .deadline
+        .unwrap_or(policy::Deadline(Duration::INFINITE));
       if off.0 > req.0 {
         return Some(QosPolicyId::Deadline);
       }
     }
 
-    // check Latency Budget:
-    // offered duration <= requested duration
-    if let (Some(off), Some(req)) = (self.latency_budget, other.latency_budget) {
+    // check Latency Budget: offered duration <= requested duration.
+    // Default: zero.
+    {
+      let off = self.latency_budget.unwrap_or(policy::LatencyBudget {
+        duration: Duration::ZERO,
+      });
+      let req = other.latency_budget.unwrap_or(policy::LatencyBudget {
+        duration: Duration::ZERO,
+      });
       if off.duration > req.duration {
         return Some(QosPolicyId::LatencyBudget);
       }
     }
 
-    // check Ownership:
-    // offered kind == requested kind
-    if let (Some(off), Some(req)) = (self.ownership, other.ownership) {
-      if off != req {
+    // check Ownership: offered kind == requested kind. Default: SHARED.
+    // Only the KIND (SHARED vs EXCLUSIVE) affects compatibility. OWNERSHIP_STRENGTH
+    // is a writer-only policy (DDS spec v1.4 §2.2.3.10) that selects which writer's
+    // sample is delivered for EXCLUSIVE ownership; it must NOT be compared for
+    // matching, otherwise two EXCLUSIVE endpoints with differing strengths would
+    // be wrongly reported INCOMPATIBLE_QOS.
+    {
+      let off = self.ownership.unwrap_or(policy::Ownership::Shared);
+      let req = other.ownership.unwrap_or(policy::Ownership::Shared);
+      let same_kind = matches!(
+        (off, req),
+        (policy::Ownership::Shared, policy::Ownership::Shared)
+          | (
+            policy::Ownership::Exclusive { .. },
+            policy::Ownership::Exclusive { .. }
+          )
+      );
+      if !same_kind {
         return Some(QosPolicyId::Ownership);
       }
     }
@@ -408,9 +480,15 @@ impl QosPolicies {
     // offered kind >= requested kind
     // Definition: AUTOMATIC < MANUAL_BY_PARTICIPANT < MANUAL_BY_TOPIC
     // AND offered lease_duration <= requested lease_duration
+    // Default: AUTOMATIC with INFINITE lease duration.
     //
     // See Ord implementation on Liveliness.
-    if let (Some(off), Some(req)) = (self.liveliness, other.liveliness) {
+    {
+      let default = policy::Liveliness::Automatic {
+        lease_duration: Duration::INFINITE,
+      };
+      let off = self.liveliness.unwrap_or(default);
+      let req = other.liveliness.unwrap_or(default);
       if off < req {
         return Some(QosPolicyId::Liveliness);
       }
@@ -419,7 +497,13 @@ impl QosPolicies {
     // check Reliability
     // offered kind >= requested kind
     // kind ranking: BEST_EFFORT < RELIABLE
-    if let (Some(off), Some(req)) = (self.reliability, other.reliability) {
+    // Default differs by entity: a DataWriter (offered) defaults to RELIABLE,
+    // a DataReader (requested) defaults to BEST_EFFORT.
+    {
+      let off = self.reliability.unwrap_or(policy::Reliability::Reliable {
+        max_blocking_time: Duration::ZERO,
+      });
+      let req = other.reliability.unwrap_or(policy::Reliability::BestEffort);
       if off < req {
         return Some(QosPolicyId::Reliability);
       }
@@ -428,9 +512,31 @@ impl QosPolicies {
     // check Destination Order
     // offered kind >= requested kind
     // kind ranking: BY_RECEPTION_TIMESTAMP < BY_SOURCE_TIMESTAMP
-    if let (Some(off), Some(req)) = (self.destination_order, other.destination_order) {
+    // Default: BY_RECEPTION_TIMESTAMP (the lowest).
+    {
+      let off = self
+        .destination_order
+        .unwrap_or(policy::DestinationOrder::ByReceptionTimestamp);
+      let req = other
+        .destination_order
+        .unwrap_or(policy::DestinationOrder::ByReceptionTimestamp);
       if off < req {
         return Some(QosPolicyId::DestinationOrder);
+      }
+    }
+
+    // check Data Representation (DDS-XTypes v1.3 Section 7.6.3.1.1):
+    // the writer (offered = self) uses a single representation (first element of
+    // its list, or XCDR1 if absent/empty); it is compatible with the reader
+    // (requested = other) only if that representation is contained in the
+    // reader's accepted list (or [XCDR1] if the reader's is absent/empty).
+    {
+      let offered =
+        policy::DataRepresentation::offered_representation(self.data_representation.as_ref());
+      let requested =
+        policy::DataRepresentation::accepted_representations(other.data_representation.as_ref());
+      if !requested.contains(&offered) {
+        return Some(QosPolicyId::Representation);
       }
     }
 
@@ -459,6 +565,7 @@ impl QosPolicies {
       history,
       resource_limits,
       lifespan,
+      data_representation,
       #[cfg(feature = "security")]
         property: _, // TODO: properties to parameter list?
     } = self;
@@ -540,6 +647,11 @@ impl QosPolicies {
     }
     emit_option!(PID_RESOURCE_LIMITS, resource_limits, policy::ResourceLimits);
     emit_option!(PID_LIFESPAN, lifespan, policy::Lifespan);
+    emit_option!(
+      PID_DATA_REPRESENTATION,
+      data_representation,
+      policy::DataRepresentation
+    );
 
     Ok(pl)
   }
@@ -604,6 +716,8 @@ impl QosPolicies {
 
     let resource_limits: Option<policy::ResourceLimits> = get_option!(PID_RESOURCE_LIMITS);
     let lifespan: Option<policy::Lifespan> = get_option!(PID_LIFESPAN);
+    let data_representation: Option<policy::DataRepresentation> =
+      get_option!(PID_DATA_REPRESENTATION);
 
     #[cfg(feature = "security")]
     let property: Option<policy::Property> = None; // TODO: Should also properties be read?
@@ -623,6 +737,7 @@ impl QosPolicies {
       history,
       resource_limits,
       lifespan,
+      data_representation,
       #[cfg(feature = "security")]
       property,
     })
@@ -786,10 +901,76 @@ pub mod policy {
   }
 
   /// DDS 2.2.3.9 OWNERSHIP
+  ///
+  /// # Support status / known limitation
+  ///
+  /// RustDDS uses OWNERSHIP only for **matching**: a `Shared` endpoint and an
+  /// `Exclusive` endpoint are incompatible (`INCOMPATIBLE_QOS`), while the
+  /// `strength` value does *not* affect matching (it is a writer-only policy,
+  /// DDS spec v1.4 §2.2.3.10).
+  ///
+  /// RustDDS does **not** implement EXCLUSIVE-ownership *delivery filtering*.
+  /// When several EXCLUSIVE writers publish to the **same instance**, a correct
+  /// implementation would deliver only the samples of the highest-strength
+  /// live writer (with owner hand-off on liveliness loss / unregister). RustDDS
+  /// instead delivers samples from all matched writers. Consequently a reader
+  /// sees data from every EXCLUSIVE writer regardless of `strength`.
+  ///
+  /// This surfaces in the dds-rtps interoperability suite as the single failing
+  /// ownership case `Test_Ownership_3` (two same-instance EXCLUSIVE writers,
+  /// expected `RECEIVING_FROM_ONE`, RustDDS yields `RECEIVING_FROM_BOTH`). All
+  /// other ownership cases pass. Implementing per-instance owner tracking would
+  /// remove this limitation.
   #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
   pub enum Ownership {
     Shared,
     Exclusive { strength: i32 }, // This also implements OwnershipStrength
+  }
+
+  /// Identifier of a data representation, per DDS-XTypes v1.3 Section 7.6.3.1.
+  pub type DataRepresentationId = i16;
+
+  /// Extensible CDR encoding version 1 (the DDS default).
+  pub const XCDR_DATA_REPRESENTATION: DataRepresentationId = 0;
+  /// XML data representation (not supported by RustDDS).
+  pub const XML_DATA_REPRESENTATION: DataRepresentationId = 1;
+  /// Extensible CDR encoding version 2 (not supported by RustDDS).
+  pub const XCDR2_DATA_REPRESENTATION: DataRepresentationId = 2;
+
+  /// DDS-XTypes v1.3 Section 7.6.3.1 DATA_REPRESENTATION QoS policy.
+  ///
+  /// A DataWriter offers a single data representation (the first element of the
+  /// list, or XCDR1 if the list is empty). A DataReader requests one or more
+  /// accepted representations. The policies are compatible when the writer's
+  /// offered representation is contained in the reader's requested list.
+  ///
+  /// On the wire this is `PID_DATA_REPRESENTATION` (0x0073), a CDR
+  /// `sequence<int16>`.
+  #[derive(Clone, Debug, PartialEq, Eq, Hash, Readable, Writable, Serialize, Deserialize)]
+  pub struct DataRepresentation {
+    pub value: Vec<DataRepresentationId>,
+  }
+
+  impl DataRepresentation {
+    /// The single representation a DataWriter with this (optional) policy uses:
+    /// the first list element, or XCDR1 when absent/empty (DDS-XTypes
+    /// 7.6.3.1.1).
+    pub fn offered_representation(maybe: Option<&DataRepresentation>) -> DataRepresentationId {
+      maybe
+        .and_then(|dr| dr.value.first().copied())
+        .unwrap_or(XCDR_DATA_REPRESENTATION)
+    }
+
+    /// The representations a DataReader with this (optional) policy accepts:
+    /// the list, or `[XCDR1]` when absent/empty (DDS-XTypes 7.6.3.1.1).
+    pub fn accepted_representations(
+      maybe: Option<&DataRepresentation>,
+    ) -> Vec<DataRepresentationId> {
+      match maybe {
+        Some(dr) if !dr.value.is_empty() => dr.value.clone(),
+        _ => vec![XCDR_DATA_REPRESENTATION],
+      }
+    }
   }
 
   /// DDS 2.2.3.11 LIVELINESS

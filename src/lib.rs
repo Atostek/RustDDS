@@ -74,8 +74,10 @@
 //!
 //! ## `mio-0.8`
 //!
-//! RustDDS DataReaders implement [`mio_08::event::Source`] for registering with
-//! mio-0.8. See example `shapes_demo_mio_08`
+//! When the optional `mio_08` feature is enabled, RustDDS DataReaders implement
+//! `mio_08::event::Source` for registering with mio-0.8. See example
+//! `shapes_demo_mio_08`. This feature is not enabled by default; without it,
+//! use the mio-0.6 (`Evented`) or `async` polling mechanisms below.
 //!
 //!
 //! ## `async`

@@ -23,12 +23,18 @@ use clap::Parser;
 use futures::{pin_mut, select, FutureExt, StreamExt};
 use log::{debug, error};
 use rustdds::{
-  policy::{Deadline, Durability, History, Lifespan, Ownership, Reliability, TimeBasedFilter},
+  dds::{
+    result::WriteError,
+    statusevents::{DataReaderStatus, DataWriterStatus},
+  },
+  policy::{
+    DataRepresentation, Deadline, Durability, History, Lifespan, Ownership, Reliability,
+    TimeBasedFilter, XCDR2_DATA_REPRESENTATION, XCDR_DATA_REPRESENTATION,
+  },
   with_key::Sample,
   DomainParticipantBuilder, Duration, Keyed, QosPolicyBuilder, StatusEvented, TopicDescription,
   TopicKind,
 };
-use rustdds::dds::statusevents::{DataReaderStatus, DataWriterStatus};
 use serde::{Deserialize, Serialize};
 use smol::Timer;
 
@@ -124,6 +130,10 @@ struct Args {
   /// durability (v: VOLATILE, l: TRANSIENT_LOCAL, t: TRANSIENT, p: PERSISTENT)
   #[arg(short = 'D')]
   durability: Option<String>,
+
+  /// disable same-host loopback routing and localhost SPDP peer discovery
+  #[arg(long = "no-same-host-loopback", default_value_t = false)]
+  no_same_host_loopback: bool,
 
   /// data representation (1: XCDR, 2: XCDR2). RustDDS only supports XCDR1.
   #[arg(short = 'x')]
@@ -252,13 +262,38 @@ fn main() {
   if args.coherent || args.ordered || args.access_scope.is_some() {
     unsupported("PRESENTATION coherent/ordered access");
   }
+  // RustDDS 0.12 accepts the TIME_BASED_FILTER QoS but its reader does not
+  // enforce `minimum_separation` (every sample is delivered), so report it as
+  // unsupported rather than silently delivering unfiltered data.
+  if args.time_filter_ms.is_some() {
+    unsupported("TIME_BASED_FILTER QoS");
+  }
 
   let topic_name = args.topic.clone();
   let color = args.color.clone().unwrap_or_else(|| "BLUE".to_owned());
 
-  let domain_participant = DomainParticipantBuilder::new(args.domain_id)
-    .build()
-    .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"));
+  let domain_participant = {
+    let mut builder = DomainParticipantBuilder::new(args.domain_id);
+    // RUSTDDS_IFACE: comma-separated local IPv4 addresses to restrict discovery
+    // and locators to a chosen physical interface (e.g. "192.168.1.161"). See
+    // note in the ddsperf example about the macOS same-host loopback caveat.
+    if let Ok(spec) = std::env::var("RUSTDDS_IFACE") {
+      let addrs: Vec<std::net::IpAddr> = spec
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+      if !addrs.is_empty() {
+        println!("shape_main: restricting to interfaces {addrs:?}");
+        builder = builder.with_only_networks(addrs);
+      }
+    }
+    if args.no_same_host_loopback {
+      builder = builder.same_host_loopback(false);
+    }
+    builder
+      .build()
+      .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"))
+  };
 
   let qos = build_qos(&args);
 
@@ -350,7 +385,11 @@ fn main() {
         color: instance_color(&color, i),
         x: rand::random_range(0..DA_WIDTH),
         y: rand::random_range(0..DA_HEIGHT),
-        shapesize: if args.shapesize == 0 { 1 } else { args.shapesize },
+        shapesize: if args.shapesize == 0 {
+          1
+        } else {
+          args.shapesize
+        },
         additional_payload_size: payload.clone(),
       })
       .collect();
@@ -362,9 +401,12 @@ fn main() {
     // knows the requested deadline. If a deadline elapses without a write, we
     // emit `on_offered_deadline_missed()` (once per missed period), matching
     // what the test harness expects from the publisher.
-    let deadline = args.deadline_ms.map(|ms| StdDuration::from_millis(ms.max(0) as u64));
-    let mut deadline_check =
-      StreamExt::fuse(Timer::interval(deadline.unwrap_or(StdDuration::from_secs(3600))));
+    let deadline = args
+      .deadline_ms
+      .map(|ms| StdDuration::from_millis(ms.max(0) as u64));
+    let mut deadline_check = StreamExt::fuse(Timer::interval(
+      deadline.unwrap_or(StdDuration::from_secs(3600)),
+    ));
     let mut last_write = std::time::Instant::now();
     let mut deadline_reported = false;
 
@@ -373,14 +415,30 @@ fn main() {
         _ = stop => run = false,
         _ = ticks.select_next_some() => {
           for (shape, vel) in shapes.iter_mut().zip(velocities.iter_mut()) {
-            step_shape(shape, vel, &args);
-            datawriter
-              .async_write(shape.clone(), None)
-              .await
-              .unwrap_or_else(|e| error!("DataWriter write failed: {e:?}"));
+            // Send the current sample first, then advance position/size for the
+            // next one. This makes the very first sample the initial value
+            // (e.g. shapesize == 1 with `-z 0`), which the TRANSIENT_LOCAL
+            // durability test relies on.
+            //
+            // Under reliable back-pressure the write can return WouldBlock when
+            // the send window is full (a slow/lagging reader). Retry with a small
+            // delay so we never drop a sample; this gives the lossless behavior
+            // the reliability/history tests expect.
+            let mut pending = Some(shape.clone());
+            while let Some(s) = pending.take() {
+              match datawriter.async_write(s, None).await {
+                Ok(()) => {}
+                Err(WriteError::WouldBlock { data }) => {
+                  pending = Some(data);
+                  Timer::after(StdDuration::from_millis(2)).await;
+                }
+                Err(e) => error!("DataWriter write failed: {e:?}"),
+              }
+            }
             if args.print_writer_samples {
               print_sample(&topic_name, shape);
             }
+            step_shape(shape, vel, &args);
           }
           last_write = std::time::Instant::now();
           deadline_reported = false;
@@ -468,7 +526,17 @@ fn build_qos(args: &Args) -> rustdds::QosPolicies {
     });
   }
 
-  b.build()
+  let data_representation = match args.data_representation.as_deref() {
+    Some("2") => DataRepresentation {
+      value: vec![XCDR2_DATA_REPRESENTATION],
+    },
+    Some("1") | None => DataRepresentation {
+      value: vec![XCDR_DATA_REPRESENTATION],
+    },
+    Some(other) => panic!("unsupported data representation {other} (use 1 or 2)"),
+  };
+
+  b.build().with_data_representation(data_representation)
 }
 
 /// Determine the write period: an explicit `--write-period` wins; otherwise
@@ -545,10 +613,21 @@ fn step_shape(shape: &mut ShapeType, vel: &mut (i32, i32), args: &Args) {
 /// Print a sample in the exact format the harness parses:
 /// `<topic> <color> <x> <y> [<shapesize>]`.
 fn print_sample(topic_name: &str, sample: &ShapeType) {
-  println!(
-    "{:<10.10} {:<10.10} {:03} {:03} [{}]",
-    topic_name, sample.color, sample.x, sample.y, sample.shapesize
-  );
+  // For the large-data tests the harness additionally expects a trailing
+  // `{<last byte of additional_payload_size>}` token, which it uses to verify
+  // the payload arrived intact. Emit it only when a payload is present so the
+  // normal (small-data) output line is unchanged.
+  if let Some(&last) = sample.additional_payload_size.last() {
+    println!(
+      "{:<10.10} {:<10.10} {:03} {:03} [{}] {{{}}}",
+      topic_name, sample.color, sample.x, sample.y, sample.shapesize, last
+    );
+  } else {
+    println!(
+      "{:<10.10} {:<10.10} {:03} {:03} [{}]",
+      topic_name, sample.color, sample.x, sample.y, sample.shapesize
+    );
+  }
 }
 
 fn report_reader_status(status: &DataReaderStatus) {

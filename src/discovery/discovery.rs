@@ -284,6 +284,13 @@ pub(crate) struct Discovery {
   #[cfg(feature = "security")]
   dcps_participant_volatile_message_secure:
     no_key::DiscoveryTopicCDR<ParticipantVolatileMessageSecure>, // CDR?
+
+  // Remote participants to which we have already sent an unsolicited "quick" SPDP
+  // response while they were still being authenticated. Used to avoid sending a
+  // quick response more than once per remote during the (pre-authentication)
+  // discovery phase. See `spdp_receive`.
+  #[cfg(feature = "security")]
+  spdp_quick_response_sent: std::collections::HashSet<GuidPrefix>,
 }
 
 impl Discovery {
@@ -361,16 +368,17 @@ impl Discovery {
           discovery_publisher_qos.clone()
         };
 
-        let topic = domain_participant
-          .create_topic(
+        let topic = try_construct!(
+          domain_participant.create_topic(
             $topic_name.to_string(),
             $topic_type_name.to_string(),
             topic_qos_ref,
             $has_key::TOPIC_KIND,
-          )
-          .expect("Unable to create topic. ");
+          ),
+          "Unable to create discovery topic."
+        );
         paste! {
-          let reader =
+          let reader = try_construct!(
             discovery_subscriber
             . [< create_datareader_with_entity_id_ $has_key >]
               ::<$message_type, [<$repr DeserializerAdapter>] <$message_type>>(
@@ -378,20 +386,25 @@ impl Discovery {
               $reader_entity_id,
               $endpoint_qos_opt,
               $stateless_RTPS,
-            ).expect("Unable to create DataReader. ");
+            ),
+            "Unable to create discovery DataReader."
+          );
 
-          let writer =
+          let writer = try_construct!(
               discovery_publisher.[< create_datawriter_with_entity_id_ $has_key >]
                 ::<$message_type, [<$repr SerializerAdapter>] <$message_type>>(
                 $writer_entity_id,
                 &topic,
                 Some(publisher_qos),
                 $stateless_RTPS,
-              ).expect("Unable to create DataWriter .");
+              ),
+            "Unable to create discovery DataWriter."
+          );
         }
-        poll
-          .register(&reader, $reader_token, Ready::readable(), PollOpt::edge())
-          .expect("Failed to register a discovery reader to poll.");
+        try_construct!(
+          poll.register(&reader, $reader_token, Ready::readable(), PollOpt::edge()),
+          "Failed to register a discovery reader to poll."
+        );
 
         // Per-topic timers are gone; all periodic discovery tasks now share one
         // timer registered under DISCOVERY_TIMER_TOKEN. The former timer token
@@ -686,6 +699,8 @@ impl Discovery {
       dcps_participant_stateless_message,
       #[cfg(feature = "security")]
       dcps_participant_volatile_message_secure,
+      #[cfg(feature = "security")]
+      spdp_quick_response_sent: std::collections::HashSet::new(),
     })
   }
 
@@ -706,10 +721,10 @@ impl Discovery {
     }
     drop(db);
 
-    self
-      .discovery_started_sender
-      .send(Ok(()))
-      .expect("Discovery start notification send failure!");
+    if self.discovery_started_sender.send(Ok(())).is_err() {
+      error!("Discovery start notification send failed: main thread receiver dropped");
+      return;
+    }
     // If this triggers, then discovery_started channel has been
     // closed, which likely means the receiver (app thread) has paniced also.
     // They will wait for up to 10 sec for us to send this handshake.
@@ -989,6 +1004,30 @@ impl Discovery {
                 self.process_participant_dispose(participant_guid.0.prefix);
               }
             }
+          } else {
+            // Speed up *secure* discovery.
+            //
+            // While the remote is still being authenticated, `participant_read`
+            // returns a permission other than `Allow`, which skips
+            // `process_discovered_participant_data` above — and with it the normal
+            // "quick SPDP response" optimization. Without that, the remote would
+            // only learn about us on our next *periodic* SPDP (SPDP_PUBLISH_PERIOD),
+            // delaying the authentication handshake by up to a full period. Send an
+            // unsolicited one-shot quick SPDP response now (at most once per remote).
+            // We only re-announce our own public SPDP data, so this discloses nothing
+            // extra.
+            #[cfg(feature = "security")]
+            if let Sample::Value(participant_data) = &ds.value {
+              let remote_prefix = participant_data.participant_guid.prefix;
+              if remote_prefix != self.domain_participant.guid().prefix
+                && self.spdp_quick_response_sent.insert(remote_prefix)
+              {
+                self.discovery_timer.borrow_mut().set_timeout(
+                  StdDuration::from_millis(10),
+                  DiscoveryTimerEvent::SendParticipantInfo { reschedule: false },
+                );
+              }
+            }
           }
         }
         Ok(None) => {
@@ -1058,6 +1097,8 @@ impl Discovery {
       id: participant_guidp,
       reason: LostReason::Disposed,
     });
+    #[cfg(feature = "security")]
+    self.spdp_quick_response_sent.remove(&participant_guidp);
   }
 
   fn send_endpoint_dispose_message(&self, endpoint_guid: GUID) {
@@ -2044,7 +2085,16 @@ impl Discovery {
   pub const fn create_participant_volatile_message_secure_qos() -> QosPolicies {
     // See Table 18 – Non-default Qos policies for
     // BuiltinParticipantVolatileMessageSecureWriter of the Security spec
-    QosPolicyBuilder::new()
+    //
+    // Base this on builtin_subscriber_qos_builder() (like the other built-in
+    // QoS) so that the fabricated remote writer proxy carries the same
+    // presentation/deadline/ownership/etc. policies as the locally created
+    // volatile reader (whose effective QoS inherits them from the built-in
+    // Subscriber). Using an empty QosPolicyBuilder here left presentation unset
+    // on the proxy while the reader required PresentationAccessScope::Topic,
+    // causing a spurious QoS incompatibility that prevented the volatile
+    // endpoints from matching and blocked all secure key exchange.
+    Self::builtin_subscriber_qos_builder()
       .reliability(Reliability::Reliable {
         max_blocking_time: Duration::from_std(StdDuration::from_millis(100)),
       })
@@ -2303,7 +2353,7 @@ mod tests {
       .poll(&mut events, Some(StdDuration::from_secs(1)))
       .unwrap();
 
-    for _ in udp_listener.messages() {
+    for _ in udp_listener.messages_bounded(usize::MAX) {
       info!("Message received");
     }
   }

@@ -168,6 +168,7 @@ where
   }
 }
 
+#[cfg(feature = "mio_08")]
 impl<D, DA> mio_08::event::Source for SimpleDataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -210,6 +211,7 @@ where
     self.keyed_simpledatareader.as_status_evented()
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.keyed_simpledatareader.as_status_source()
   }

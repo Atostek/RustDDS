@@ -1,6 +1,7 @@
 use std::{
   cmp::max,
   collections::{BTreeMap, BTreeSet},
+  net::SocketAddr,
 };
 
 use bit_vec::BitVec;
@@ -11,7 +12,11 @@ use crate::{
   dds::{participant::DomainParticipant, qos::QosPolicies},
   discovery::sedp_messages::DiscoveredReaderData,
   messages::submessages::submessage::AckSubmessage,
-  rtps::constant::*,
+  network::util::{path_mtu_payload_for_peer, IfAddr},
+  rtps::{
+    constant::*,
+    transmit::{InterfaceObservations, InterfaceSelector, RouteSelector, SendRoute},
+  },
   structure::{
     guid::{EntityId, GUID},
     locator::Locator,
@@ -39,6 +44,13 @@ pub(crate) struct RtpsReaderProxy {
   /// empty
   pub multicast_locator_list: Vec<Locator>,
 
+  /// Loopback unicast locators the reader advertised (e.g. `127.0.0.1`). These
+  /// are kept out of `unicast_locator_list` so the legacy all-locators fallback
+  /// never sends to a *remote* host's loopback, but are retained here so route
+  /// selection can prefer them once the peer is positively confirmed to be on
+  /// the same host. See `src/rtps/loopback_same_host_design.md`.
+  pub loopback_unicast_locators: Vec<Locator>,
+
   /// Specifies whether the remote matched RTPS Reader expects in-line QoS to be
   /// sent along with any data.
   expects_in_line_qos: bool,
@@ -61,6 +73,20 @@ pub(crate) struct RtpsReaderProxy {
   pub repair_mode: bool,
   qos: QosPolicies,
   frags_requested: BTreeMap<SequenceNumber, BitVec>,
+
+  // Interface-aware transmit: the resolved send destination for this reader,
+  // recomputed when locators or observations change. Defaults to the fallback
+  // (legacy all-locators) route until resolved.
+  send_route: SendRoute,
+
+  // Per-peer path-MTU budget: the number of bytes available for RTPS
+  // submessages in one datagram sent to this reader, derived from the local
+  // egress interface's MTU (same-subnet peer) or the conservative default
+  // (`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`) for peers behind a router / unresolved.
+  // Recomputed alongside `send_route`. Used to bound submessage packing and
+  // multi-fragment DATAFRAG datagrams. An overestimate only causes IP
+  // fragmentation, never data loss.
+  max_datagram_payload: usize,
 }
 
 impl RtpsReaderProxy {
@@ -70,6 +96,7 @@ impl RtpsReaderProxy {
       remote_group_entity_id: EntityId::UNKNOWN,
       unicast_locator_list: Vec::default(),
       multicast_locator_list: Vec::default(),
+      loopback_unicast_locators: Vec::default(),
       expects_in_line_qos,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
@@ -78,6 +105,8 @@ impl RtpsReaderProxy {
       repair_mode: false,
       qos,
       frags_requested: BTreeMap::new(),
+      send_route: SendRoute::default(),
+      max_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
     }
   }
 
@@ -107,9 +136,19 @@ impl RtpsReaderProxy {
         "Multicast:\n Old={:?}\n  New={:?}",
         self.multicast_locator_list, update.multicast_locator_list
       );
-      let mut unicasts = update.unicast_locator_list.clone();
-      unicasts.retain(Self::not_loopback);
+      // The incoming proxy may carry loopback either inline (built-in path via
+      // `get_builtin_reader_proxy`) or already split into its bucket (discovered
+      // path). Recombine both before splitting so the invariant holds regardless
+      // of how `update` was constructed.
+      let combined: Vec<Locator> = update
+        .unicast_locator_list
+        .iter()
+        .chain(update.loopback_unicast_locators.iter())
+        .copied()
+        .collect();
+      let (unicasts, loopbacks) = Self::split_loopback(&combined);
       self.unicast_locator_list = unicasts;
+      self.loopback_unicast_locators = loopbacks;
       self
         .multicast_locator_list
         .clone_from(&update.multicast_locator_list);
@@ -179,6 +218,10 @@ impl RtpsReaderProxy {
       remote_group_entity_id: EntityId::UNKNOWN, // TODO
       unicast_locator_list,
       multicast_locator_list,
+      // `from_reader` builds the proxy we *advertise* for a local reader (via
+      // SEDP), so loopback stays in `unicast_locator_list` here; the bucket is
+      // only meaningful for proxies used as live send destinations.
+      loopback_unicast_locators: Vec::new(),
       expects_in_line_qos: false,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
@@ -187,6 +230,8 @@ impl RtpsReaderProxy {
       repair_mode: false,
       qos: reader.qos_policy.clone(),
       frags_requested: BTreeMap::new(),
+      send_route: SendRoute::default(),
+      max_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
     }
   }
 
@@ -198,15 +243,34 @@ impl RtpsReaderProxy {
     }
   }
 
-  // OpenDDS seems to advertise also loopback address as its Locator over SPDP,
-  // which is problematic, if we are not on the same host.
-  fn not_loopback(l: &Locator) -> bool {
-    let is_loopback = l.is_loopback();
-    if is_loopback {
-      info!("Ignoring loopback address {l:?}");
-    }
+  // OpenDDS (and RustDDS itself) advertise the loopback address as a Locator,
+  // which is problematic if we are *not* on the same host. Rather than discard
+  // it outright, partition the advertised unicast locators into non-loopback
+  // (returned first, used by the normal/fallback send path) and loopback
+  // (returned second, used only once the peer is confirmed same-host). See
+  // `src/rtps/loopback_same_host_design.md`.
+  fn split_loopback(locators: &[Locator]) -> (Vec<Locator>, Vec<Locator>) {
+    locators.iter().copied().partition(|l| !l.is_loopback())
+  }
 
-    !is_loopback
+  /// Enforce the loopback-bucket invariant: any loopback address in
+  /// `unicast_locator_list` is moved into `loopback_unicast_locators`.
+  /// Idempotent. Applied to freshly-inserted proxies (e.g. the built-in
+  /// `get_builtin_reader_proxy` path, which fills `unicast_locator_list`
+  /// inline) so loopback is never used by the non-same-host send path. See
+  /// `src/rtps/loopback_same_host_design.md`.
+  pub fn normalize_loopback(&mut self) {
+    if self.unicast_locator_list.iter().any(Locator::is_loopback) {
+      let combined: Vec<Locator> = self
+        .unicast_locator_list
+        .iter()
+        .chain(self.loopback_unicast_locators.iter())
+        .copied()
+        .collect();
+      let (unicasts, loopbacks) = Self::split_loopback(&combined);
+      self.unicast_locator_list = unicasts;
+      self.loopback_unicast_locators = loopbacks;
+    }
   }
 
   pub fn from_discovered_reader_data(
@@ -214,11 +278,12 @@ impl RtpsReaderProxy {
     default_unicast_locators: &[Locator],
     default_multicast_locators: &[Locator],
   ) -> Self {
-    let mut unicast_locator_list = Self::discovered_or_default(
+    let advertised_unicast = Self::discovered_or_default(
       &discovered_reader_data.reader_proxy.unicast_locator_list,
       default_unicast_locators,
     );
-    unicast_locator_list.retain(Self::not_loopback);
+    let (unicast_locator_list, loopback_unicast_locators) =
+      Self::split_loopback(&advertised_unicast);
 
     let multicast_locator_list = Self::discovered_or_default(
       &discovered_reader_data.reader_proxy.multicast_locator_list,
@@ -230,6 +295,7 @@ impl RtpsReaderProxy {
       remote_group_entity_id: EntityId::UNKNOWN, // TODO
       unicast_locator_list,
       multicast_locator_list,
+      loopback_unicast_locators,
       expects_in_line_qos: discovered_reader_data.reader_proxy.expects_inline_qos,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
@@ -238,7 +304,93 @@ impl RtpsReaderProxy {
       repair_mode: false,
       qos: discovered_reader_data.subscription_topic_data.qos(),
       frags_requested: BTreeMap::new(),
+      send_route: SendRoute::default(),
+      max_datagram_payload: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
     }
+  }
+
+  /// The currently resolved [`SendRoute`] for this reader.
+  pub fn send_route(&self) -> SendRoute {
+    self.send_route
+  }
+
+  /// Recompute this reader's [`SendRoute`] from its advertised locators and the
+  /// per-participant [`InterfaceObservations`], using `selector`.
+  pub fn resolve_send_route(
+    &mut self,
+    observations: &InterfaceObservations,
+    local_multicast_ifaces: &[InterfaceSelector],
+    selector: &dyn RouteSelector,
+  ) {
+    let observed = observations.get(self.remote_reader_guid.prefix);
+    self.send_route = selector.select(
+      &self.unicast_locator_list,
+      &self.multicast_locator_list,
+      &self.loopback_unicast_locators,
+      observed,
+      local_multicast_ifaces,
+    );
+  }
+
+  /// The per-peer datagram-payload budget (bytes for RTPS submessages in one
+  /// datagram) resolved for this reader. Defaults to
+  /// [`FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE`] until [`resolve_path_mtu`] runs.
+  ///
+  /// [`resolve_path_mtu`]: Self::resolve_path_mtu
+  pub fn max_datagram_payload(&self) -> usize {
+    self.max_datagram_payload
+  }
+
+  /// Recompute this reader's
+  /// [`max_datagram_payload`](Self::max_datagram_payload) from its advertised
+  /// unicast locators and the local interface table.
+  ///
+  /// We take the minimum budget over all of the reader's unicast locators
+  /// (including the loopback bucket) so that whichever path the [`SendRoute`]
+  /// ends up using, the datagram fits. A loopback locator resolves to the
+  /// (typically large) loopback-interface MTU, so it never lowers the minimum;
+  /// its only effect is to give a same-host-only peer (which advertises *only*
+  /// loopback) the large loopback budget instead of the conservative default.
+  /// When the reader advertises no unicast locators at all, we keep the
+  /// default.
+  ///
+  /// # Design note: current vs. ideal (future work)
+  ///
+  /// What could be improved: today a peer only gets a larger-than-fallback
+  /// budget if *every* advertised unicast address clears the bar (IPv4,
+  /// same-subnet as a local interface, OS-reported MTU > 1500), or if it
+  /// advertises loopback only. Ideally it should suffice that the *single
+  /// locator we actually send to* has a large MTU (e.g. one jumbo-frame
+  /// same-subnet address should win even when the peer also advertises an
+  /// ordinary 1500-MTU address).
+  ///
+  /// Why we take the conservative `min` now: the budget is a single per-reader
+  /// scalar, fixed here and consumed at message-build time, and the resulting
+  /// datagram can legitimately be sent to *all* of the peer's locators (the
+  /// `SendRoute { fallback: true }` path in `Writer::send_message_to_readers`,
+  /// and the multicast-to-all path via `min_datagram_payload`). So it must fit
+  /// the smallest MTU among them; an overestimate would cause IP fragmentation
+  /// on the copies aimed at the smaller-MTU locators.
+  ///
+  /// Three things missing before "some locator suffices" would be correct:
+  /// 1. MTU resolved *per chosen route/locator* rather than as this per-reader
+  ///    `min` scalar decoupled from route selection.
+  /// 2. A route selector that *deterministically prefers* the large-MTU locator
+  ///    (today `DefaultRouteSelector::select_unicast` narrows by observed
+  ///    source IP, not by subnet/MTU, and otherwise falls back to all
+  ///    locators).
+  /// 3. A guarantee that a datagram built with the larger budget is sent to
+  ///    *only* that one locator (today the fallback and multicast-to-all paths
+  ///    reuse one datagram across many locators).
+  pub fn resolve_path_mtu(&mut self, local_interfaces: &[IfAddr]) {
+    let budget = self
+      .unicast_locator_list
+      .iter()
+      .chain(self.loopback_unicast_locators.iter())
+      .filter(|l| l.is_udp())
+      .map(|l| path_mtu_payload_for_peer(local_interfaces, SocketAddr::from(*l).ip()))
+      .min();
+    self.max_datagram_payload = budget.unwrap_or(FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE);
   }
 
   pub fn handle_ack_nack(
@@ -344,6 +496,24 @@ impl RtpsReaderProxy {
       );
     }
     self.unsent_changes.insert(sequence_number);
+
+    // Memory-safety backstop: never let this set grow without bound. In normal
+    // operation it is pruned as samples are pushed (see Writer::process_pending)
+    // or acknowledged (handle_ack_nack), but a best-effort flood sends no
+    // ACKNACKs, so cap the set and drop the oldest (least-useful-to-resend)
+    // entries if it ever exceeds the cap.
+    while self.unsent_changes.len() > MAX_UNSENT_CHANGES_PER_READER {
+      if let Some(&oldest) = self.unsent_changes.iter().next() {
+        self.unsent_changes.remove(&oldest);
+      } else {
+        break;
+      }
+    }
+  }
+
+  #[cfg(test)]
+  pub fn unsent_changes_count(&self) -> usize {
+    self.unsent_changes.len()
   }
 
   pub fn acked_up_to_before(&self) -> SequenceNumber {
@@ -353,14 +523,16 @@ impl RtpsReaderProxy {
   // Fragment handling
 
   pub fn mark_all_frags_requested(&mut self, seq_num: SequenceNumber, frag_count: u32) {
-    // Insert all ones set with frag_count bits
+    let frag_count_usize = match usize::try_from(frag_count) {
+      Ok(n) => n,
+      Err(_) => {
+        error!("mark_all_frags_requested: frag_count {frag_count} does not fit in usize");
+        return;
+      }
+    };
     self
       .frags_requested
-      // TODO: explain why unwrap below succeeds
-      .insert(
-        seq_num,
-        BitVec::from_elem(frag_count.try_into().unwrap(), true),
-      );
+      .insert(seq_num, BitVec::from_elem(frag_count_usize, true));
   }
 
   pub fn mark_frags_requested(&mut self, seq_num: SequenceNumber, frag_nums: &FragmentNumberSet) {
@@ -369,22 +541,17 @@ impl RtpsReaderProxy {
       .entry(seq_num)
       .or_insert_with(|| BitVec::with_capacity(64)); // default capacity out of hat
 
-    if let Some(max_fn_requested) = req_set.iter().next_back() {
-      // allocate more space if needed
-      let max_fn_requested = usize::from(max_fn_requested);
-      if max_fn_requested > req_set.len() {
-        let growth_need = max_fn_requested - req_set.len();
-        req_set.grow(growth_need, false);
+    for f in frag_nums.iter() {
+      // -1 because FragmentNumbers start at 1
+      let idx = usize::from(f) - 1;
+      // The bit vector must be long enough to address `idx`. Grow it (filling
+      // with `false`) whenever a requested fragment number exceeds the current
+      // length, otherwise `set()` would be out of bounds. Note that a freshly
+      // inserted `BitVec` has length 0 regardless of its capacity.
+      if idx >= req_set.len() {
+        req_set.grow(idx + 1 - req_set.len(), false);
       }
-      for f in frag_nums.iter() {
-        // -1 because FragmentNumbers start at 1
-        req_set.set(usize::from(f) - 1, true);
-      }
-    } else {
-      warn!(
-        "mark_frags_requested: Empty set in NackFrag??? reader={:?} SN={:?}",
-        self.remote_reader_guid, seq_num
-      );
+      req_set.set(idx, true);
     }
   }
 
@@ -478,6 +645,59 @@ impl Iterator for FragBitVecIterator {
 // }
 
 #[cfg(test)]
+mod bounded_unsent_tests {
+  use super::*;
+  use crate::structure::guid::GuidPrefix;
+
+  fn test_proxy() -> RtpsReaderProxy {
+    let guid = GUID::new(GuidPrefix::UNKNOWN, EntityId::UNKNOWN);
+    RtpsReaderProxy::new(guid, QosPolicies::default(), false)
+  }
+
+  // Regression: the push path (Writer::process_pending) now prunes each sample
+  // from unsent_changes via mark_change_sent, so a best-effort flood (no
+  // ACKNACKs) does not leave one entry per sample behind. Model that here.
+  #[test]
+  fn unsent_changes_do_not_grow_when_pruned_on_push() {
+    let mut rp = test_proxy();
+    for i in 1..=50_000 {
+      let sn = SequenceNumber::new(i);
+      rp.notify_new_cache_change(sn);
+      rp.mark_change_sent(sn); // Writer::process_pending does this on
+                               // Complete/drop.
+    }
+    assert_eq!(
+      rp.unsent_changes_count(),
+      0,
+      "unsent_changes should be empty after every sample is marked sent"
+    );
+  }
+
+  // Regression / safety net: even if pruning never happened (pathological peer),
+  // the hard cap must keep unsent_changes bounded.
+  #[test]
+  fn unsent_changes_bounded_by_hard_cap() {
+    let mut rp = test_proxy();
+    let n = (MAX_UNSENT_CHANGES_PER_READER as i64) * 4;
+    for i in 1..=n {
+      rp.notify_new_cache_change(SequenceNumber::new(i));
+    }
+    assert!(
+      rp.unsent_changes_count() <= MAX_UNSENT_CHANGES_PER_READER,
+      "unsent_changes exceeded cap {}: {} entries",
+      MAX_UNSENT_CHANGES_PER_READER,
+      rp.unsent_changes_count()
+    );
+  }
+
+  #[test]
+  fn mark_all_frags_requested_huge_frag_count_does_not_panic() {
+    let mut rp = test_proxy();
+    rp.mark_all_frags_requested(SequenceNumber::new(1), u32::MAX);
+  }
+}
+
+#[cfg(test)]
 mod acknack_tests {
   use super::*;
   use crate::{
@@ -519,5 +739,135 @@ mod acknack_tests {
     rp.handle_ack_nack(&AckSubmessage::AckNack(ack), SequenceNumber::from(100));
 
     assert_eq!(rp.all_acked_before, SequenceNumber::from(50));
+  }
+}
+
+#[cfg(test)]
+mod route_tests {
+  use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+
+  use super::*;
+  use crate::{
+    rtps::transmit::{DefaultRouteSelector, InterfaceObservations, InterfaceSelector},
+    structure::guid::GuidPrefix,
+  };
+
+  fn udp(ip: [u8; 4], port: u16) -> Locator {
+    Locator::UdpV4(SocketAddrV4::new(
+      Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+      port,
+    ))
+  }
+
+  fn iface(ip: [u8; 4]) -> InterfaceSelector {
+    InterfaceSelector::Ip(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])))
+  }
+
+  fn proxy_with_prefix(prefix: GuidPrefix) -> RtpsReaderProxy {
+    let guid = GUID::new(prefix, EntityId::UNKNOWN);
+    RtpsReaderProxy::new(guid, QosPolicies::default(), false)
+  }
+
+  #[test]
+  fn resolve_falls_back_without_observation() {
+    let mut rp = proxy_with_prefix(GuidPrefix::UNKNOWN);
+    rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7410)];
+    let observations = InterfaceObservations::new();
+    rp.resolve_send_route(
+      &observations,
+      &[iface([10, 0, 0, 1])],
+      &DefaultRouteSelector::default(),
+    );
+    assert!(rp.send_route().fallback);
+  }
+
+  #[test]
+  fn resolve_narrows_with_observation() {
+    let prefix = GuidPrefix::new(&[9; 12]);
+    let mut rp = proxy_with_prefix(prefix);
+    rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7410)];
+    rp.multicast_locator_list = vec![udp([239, 255, 0, 1], 7401)];
+
+    let mut observations = InterfaceObservations::new();
+    observations.record(
+      prefix,
+      Some(iface([10, 0, 0, 1])),
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 7410),
+    );
+
+    rp.resolve_send_route(
+      &observations,
+      &[iface([10, 0, 0, 1])],
+      &DefaultRouteSelector::default(),
+    );
+
+    let route = rp.send_route();
+    assert!(!route.fallback);
+    assert_eq!(route.unicast, Some(udp([10, 0, 0, 5], 7410)));
+    assert_eq!(
+      route.multicast,
+      Some((udp([239, 255, 0, 1], 7401), iface([10, 0, 0, 1])))
+    );
+  }
+
+  #[test]
+  fn update_partitions_loopback_into_bucket() {
+    let prefix = GuidPrefix::new(&[7; 12]);
+    let mut rp = proxy_with_prefix(prefix);
+
+    // An incoming update carrying a loopback and a LAN locator inline (as the
+    // built-in reader-proxy path does).
+    let mut update = proxy_with_prefix(prefix);
+    update.unicast_locator_list = vec![udp([127, 0, 0, 1], 7413), udp([10, 0, 0, 5], 7413)];
+
+    rp.update(&update, "topic");
+
+    // Loopback is kept out of the normal list but retained in the bucket.
+    assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7413)]);
+    assert_eq!(
+      rp.loopback_unicast_locators,
+      vec![udp([127, 0, 0, 1], 7413)]
+    );
+  }
+
+  #[test]
+  fn normalize_loopback_moves_inline_loopback_to_bucket() {
+    // Mimics a freshly built built-in reader proxy with loopback inline.
+    let mut rp = proxy_with_prefix(GuidPrefix::new(&[5; 12]));
+    rp.unicast_locator_list = vec![udp([127, 0, 0, 1], 7410), udp([10, 0, 0, 5], 7410)];
+    rp.normalize_loopback();
+    assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7410)]);
+    assert_eq!(
+      rp.loopback_unicast_locators,
+      vec![udp([127, 0, 0, 1], 7410)]
+    );
+    // Idempotent.
+    rp.normalize_loopback();
+    assert_eq!(rp.unicast_locator_list, vec![udp([10, 0, 0, 5], 7410)]);
+    assert_eq!(
+      rp.loopback_unicast_locators,
+      vec![udp([127, 0, 0, 1], 7410)]
+    );
+  }
+
+  #[test]
+  fn same_host_route_selects_bucket_loopback() {
+    let prefix = GuidPrefix::new(&[8; 12]);
+    let mut rp = proxy_with_prefix(prefix);
+    rp.unicast_locator_list = vec![udp([10, 0, 0, 5], 7413)];
+    rp.loopback_unicast_locators = vec![udp([127, 0, 0, 1], 7413)];
+
+    let mut observations = InterfaceObservations::new();
+    observations.record(
+      prefix,
+      None,
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7410),
+    );
+
+    rp.resolve_send_route(&observations, &[], &DefaultRouteSelector::default());
+
+    let route = rp.send_route();
+    assert!(!route.fallback);
+    assert_eq!(route.unicast, Some(udp([127, 0, 0, 1], 7413)));
   }
 }

@@ -1364,7 +1364,7 @@ impl SecurityPluginsHandle {
         }
         Err(poisoned) => {
           create_security_error_and_log!("Security plugins are poisoned! {poisoned:?}");
-          panic!("Security plugins are poisoned!");
+          panic!("RustDDS internal bug: SecurityPlugins mutex poisoned after a prior panic");
         }
       }
     } // loop

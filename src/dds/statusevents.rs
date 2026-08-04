@@ -17,6 +17,7 @@ use log::{debug, error, info, trace, warn};
 use futures::stream::{FusedStream, Stream};
 use mio_06::Evented;
 use mio_extras::channel as mio_channel;
+#[cfg(feature = "mio_08")]
 use mio_08::{event, Interest, Registry, Token};
 use chrono::Utc;
 
@@ -43,6 +44,7 @@ where
   // such is requested. The stream object typically contains a reference to
   // self, so it is to ensure correct lifetimes.
   fn as_status_evented(&mut self) -> &dyn Evented; // This is for polling with mio-0.6.x
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source; // This is for polling with mio-0.8.x
   fn as_async_status_stream(&'a self) -> S;
   fn try_recv_status(&self) -> Option<E>;
@@ -136,6 +138,7 @@ impl<'a, E> StatusEvented<'a, E, StatusReceiverStream<'a, E>> for StatusChannelR
     self
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self
   }
@@ -188,6 +191,7 @@ impl<E> Evented for StatusChannelReceiver<E> {
   }
 }
 
+#[cfg(feature = "mio_08")]
 impl<T> event::Source for StatusChannelReceiver<T> {
   fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
     self.signal_receiver.register(registry, token, interests)

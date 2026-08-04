@@ -1,16 +1,18 @@
 //! Performance test program inspired by `ddsperf` in CycloneDDS
 
 use std::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
 use log::error;
 use rustdds::{
+  dds::result::WriteError,
   policy::History,
   policy::Reliability,
   with_key::Sample,
   //DataWriterStatus,
   DataReaderStatus,
+  DomainParticipant,
   DomainParticipantBuilder,
   Keyed,
   QosPolicyBuilder,
@@ -82,9 +84,7 @@ fn main() {
   #[cfg(debug_assertions)]
   println!("-------\nNOTE: Running debug build for performace test. It will be slow.\n-------");
 
-  let domain_participant = DomainParticipantBuilder::new(0)
-    .build()
-    .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"));
+  let domain_participant = build_participant(0);
 
   let qos = QosPolicyBuilder::new()
     .history(History::KeepLast { depth: 16 })
@@ -219,8 +219,13 @@ fn main() {
         baggage,
       };
 
+      // rate == 0 means "flat out": publish as fast as possible with no
+      // per-sample pacing timer (mirrors CycloneDDS `ddsperf pub` with no rate).
+      // This is what the max-throughput / traffic-pressure scenarios use.
+      let flat_out = rate == 0;
       smol::block_on(async {
         let mut seq = 0;
+        let mut last_report = std::time::Instant::now();
         loop {
           let mut new_message = keyed_seq_msg.clone();
           new_message.seq = seq;
@@ -229,9 +234,21 @@ fn main() {
             .async_write(new_message, None)
             .unwrap_or_else(|e| error!("DataWriter async_write failed: {e:?}"))
             .await;
-          // wait for 1 sec for transfer to complete before exiting.
-          let interval = 1_000_000_000 / rate;
-          Timer::after(Duration::from_nanos(interval.into())).await;
+          if flat_out {
+            // No pacing. Report CPU/RSS roughly once per second (wall clock).
+            if last_report.elapsed() >= Duration::from_secs(1) {
+              print_and_reset_cpu_usage();
+              last_report = std::time::Instant::now();
+            }
+          } else {
+            // Periodic (~1 s) CPU/RSS report so the publisher side is also
+            // observable for leaks (send-buffer growth, etc.).
+            if seq % rate == 0 {
+              print_and_reset_cpu_usage();
+            }
+            let interval = 1_000_000_000 / rate;
+            Timer::after(Duration::from_nanos(interval.into())).await;
+          }
         } // loop
       });
     } // Pub
@@ -270,6 +287,7 @@ fn main() {
         let mut rtt_max = rustdds::Duration::from_secs(0);
         let mut last_pong_seq = 0;
         let mut lost_seq_count = 0_u32;
+        let mut ping_dropped = 0_u32;
 
         println!("Waiting for messages.");
         loop {
@@ -283,14 +301,16 @@ fn main() {
                 } else {
                   Duration::from_secs(0)
                 };
-              println!("{} samples {} lost {} bytes  RTT avg {}, max {}",
-                  format_count(sample_count as u64), format_count(lost_seq_count as u64), format_count(byte_count),
+              println!("{} samples {} lost {} dropped {} bytes  RTT avg {}, max {}",
+                  format_count(sample_count as u64), format_count(lost_seq_count as u64),
+                  format_count(ping_dropped as u64), format_count(byte_count),
                   format_duration(rtt_avg) , format_duration(rtt_max.to_std()));
               sample_count = 0;
               byte_count = 0;
               rtt_total = rustdds::Duration::from_secs(0);
               rtt_max = rustdds::Duration::from_secs(0);
               lost_seq_count = 0;
+              ping_dropped = 0;
               print_and_reset_cpu_usage();
             }
 
@@ -306,8 +326,14 @@ fn main() {
               };
               ping_seq += 1;
               let ts = Timestamp::now();
-              data_writer.async_write(keyed_seq_msg, Some(ts))
-                .await.unwrap();
+              match data_writer.async_write(keyed_seq_msg, Some(ts)).await {
+                Ok(()) => {}
+                // Reliable send window is full and did not drain within
+                // max_blocking_time. Drop this ping and keep going instead of
+                // crashing; count it so over-driving is visible in the stats.
+                Err(WriteError::WouldBlock { .. }) => ping_dropped += 1,
+                Err(e) => error!("ping write failed: {e:?}"),
+              }
             }
 
             // handle pong
@@ -407,9 +433,12 @@ fn main() {
                     byte_count += (8 + 4 + keyed_seq_msg.baggage.len()) as u64;
                     match s.sample_info().source_timestamp() {
                       Some(ts) => {
-                        data_writer.async_write(keyed_seq_msg.clone(), Some(ts))
-                          .await
-                          .unwrap();
+                        match data_writer.async_write(keyed_seq_msg.clone(), Some(ts)).await {
+                          Ok(()) => {}
+                          // Under backpressure, drop the echo rather than crash.
+                          Err(WriteError::WouldBlock { .. }) => {}
+                          Err(e) => error!("pong write failed: {e:?}"),
+                        }
                       }
                       None => println!("Ping without source timestamp!"),
                     }
@@ -441,6 +470,29 @@ fn main() {
     } // Pong
   } // match main_mode
 } // fn
+
+// Build the DomainParticipant, optionally restricting it to specific local
+// network interfaces. Set RUSTDDS_IFACE to a comma-separated list of local IPv4
+// addresses (e.g. "192.168.1.161") to force discovery/locators onto a chosen
+// physical interface instead of every interface. NB: on a single host, traffic
+// addressed to a local IP is still short-circuited through the kernel loopback
+// path, so this pins the advertised locator but does not change same-host MTU.
+fn build_participant(domain_id: u16) -> DomainParticipant {
+  let mut builder = DomainParticipantBuilder::new(domain_id);
+  if let Ok(spec) = std::env::var("RUSTDDS_IFACE") {
+    let addrs: Vec<std::net::IpAddr> = spec
+      .split(',')
+      .filter_map(|s| s.trim().parse().ok())
+      .collect();
+    if !addrs.is_empty() {
+      println!("ddsperf: restricting to interfaces {addrs:?}");
+      builder = builder.with_only_networks(addrs);
+    }
+  }
+  builder
+    .build()
+    .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"))
+}
 
 fn format_duration(d: Duration) -> String {
   let nanos = d.as_nanos();
@@ -505,7 +557,65 @@ fn cpu_usage_printer_closure() -> impl FnMut() {
   }
 }
 
-#[cfg(not(target_os = "linux"))]
+// macOS has no procfs. Use libproc's proc_pidinfo(PROC_PIDTASKINFO) to read the
+// current resident set size (pti_resident_size, in bytes) and the accumulated
+// user/system CPU time (pti_total_user/system, in nanoseconds).
+//
+// This is functionally equivalent to the Linux version above (user %, sys %,
+// current RSS), but it is NOT a portable replacement for it: it relies on
+// libc::proc_pidinfo / PROC_PIDTASKINFO / proc_taskinfo, which the `libc` crate
+// only exposes on Apple targets.
+#[cfg(target_os = "macos")]
+fn cpu_usage_printer_closure() -> impl FnMut() {
+  fn task_info() -> Option<libc::proc_taskinfo> {
+    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let n = unsafe {
+      libc::proc_pidinfo(
+        libc::getpid(),
+        libc::PROC_PIDTASKINFO,
+        0,
+        (&mut ti as *mut libc::proc_taskinfo).cast::<libc::c_void>(),
+        size,
+      )
+    };
+    (n == size).then_some(ti)
+  }
+
+  let mut prev = task_info();
+  let mut last_instant = Instant::now();
+
+  move || {
+    let now = task_info();
+    let now_instant = Instant::now();
+    let call_interval = now_instant.duration_since(last_instant).as_secs_f32();
+    last_instant = now_instant;
+
+    match (prev, now) {
+      (Some(p), Some(c)) if call_interval > 0.0 => {
+        // pti_total_* are in nanoseconds.
+        let user_secs = (c.pti_total_user.saturating_sub(p.pti_total_user)) as f32 / 1e9;
+        let sys_secs = (c.pti_total_system.saturating_sub(p.pti_total_system)) as f32 / 1e9;
+        println!(
+          "user {:2.0}% sys {:2.0}% RSS {}B",
+          100.0 * user_secs / call_interval,
+          100.0 * sys_secs / call_interval,
+          format_count(c.pti_resident_size)
+        );
+      }
+      (_, Some(c)) => {
+        println!(
+          "user  ?% sys  ?% RSS {}B",
+          format_count(c.pti_resident_size)
+        );
+      }
+      _ => println!("(cpu/rss unavailable)"),
+    }
+    prev = now;
+  }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cpu_usage_printer_closure() -> impl FnMut() {
   || {
     // no-op

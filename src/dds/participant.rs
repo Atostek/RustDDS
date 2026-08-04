@@ -14,6 +14,7 @@ use std::{
 
 use mio_extras::channel as mio_channel;
 use mio_06::{self, Evented};
+#[cfg(feature = "mio_08")]
 use mio_08::{Interest, Registry};
 use futures::stream::{FusedStream, Stream};
 #[allow(unused_imports)]
@@ -34,7 +35,7 @@ use crate::{
   discovery::{
     discovery::{Discovery, DiscoveryCommand},
     discovery_db::DiscoveryDB,
-    sedp_messages::DiscoveredTopicData,
+    sedp_messages::{DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData},
   },
   network::{constant::*, udp_listener::UDPListener},
   rtps::{
@@ -71,7 +72,10 @@ pub struct DomainParticipantBuilder {
   only_networks: Option<Vec<IpAddr>>, /* optional IP address filter for discovery advertisements
                                        * and multicast setup */
 
+  same_host_loopback: bool, // prefer loopback for same-host peers + localhost SPDP discovery peers
+
   socket_receive_buffer_size: usize,
+  socket_send_buffer_size: usize,
 
   #[cfg(feature = "security")]
   security_plugins: Option<SecurityPlugins>,
@@ -84,7 +88,9 @@ impl DomainParticipantBuilder {
     DomainParticipantBuilder {
       domain_id,
       only_networks: None,
+      same_host_loopback: true,
       socket_receive_buffer_size: Self::DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE,
+      socket_send_buffer_size: Self::DEFAULT_SOCKET_SEND_BUFFER_SIZE,
       #[cfg(feature = "security")]
       security_plugins: None,
       #[cfg(feature = "security")]
@@ -105,10 +111,52 @@ impl DomainParticipantBuilder {
     self
   }
 
-  pub const DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+  /// Enable/disable same-host communication over loopback (default: enabled).
+  ///
+  /// When enabled, the participant (a) additionally announces SPDP to the
+  /// "localhost peers" (`127.0.0.1:<well-known SPDP ports>`), letting two
+  /// participants on the same host discover each other even with no external
+  /// network or loopback multicast, and (b) prefers a peer's advertised
+  /// loopback locator once that peer is positively confirmed to be on the same
+  /// host. Disable to force all traffic onto regular (LAN) interfaces. See
+  /// `src/rtps/loopback_same_host_design.md`.
+  pub fn same_host_loopback(mut self, enabled: bool) -> Self {
+    self.same_host_loopback = enabled;
+    self
+  }
 
+  pub const DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+  pub const DEFAULT_SOCKET_SEND_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+  /// Requested `SO_RCVBUF` (kernel receive buffer) for every UDP listener
+  /// socket, in bytes. A large receive buffer absorbs traffic bursts before the
+  /// single-threaded event loop can drain them, reducing packet loss under
+  /// load. The default is 8 MiB.
+  ///
+  /// The kernel silently clamps the request to a per-socket ceiling; if the
+  /// effective value ends up materially below what was requested, a warning is
+  /// logged. To go above the ceiling, raise the OS limit first:
+  /// - macOS: `sudo sysctl -w kern.ipc.maxsockbuf=<bytes>` (default is 8 MiB,
+  ///   so the 8 MiB default here is already at the cap unless you raise it).
+  /// - Linux: `sudo sysctl -w net.core.rmem_max=<bytes>` (note Linux reports
+  ///   back roughly twice the requested size due to internal bookkeeping).
   pub fn socket_receive_buffer_size(mut self, size: usize) -> Self {
     self.socket_receive_buffer_size = size;
+    self
+  }
+
+  /// Requested `SO_SNDBUF` (kernel send buffer) for every UDP sender socket, in
+  /// bytes. A large send buffer smooths bursty output so the writer hits
+  /// `WouldBlock` (and grows the control queue) less often. The default is
+  /// 8 MiB.
+  ///
+  /// The kernel silently clamps the request to a per-socket ceiling; if the
+  /// effective value ends up materially below what was requested, a warning is
+  /// logged. To go above the ceiling, raise the OS limit first:
+  /// - macOS: `sudo sysctl -w kern.ipc.maxsockbuf=<bytes>` (default is 8 MiB).
+  /// - Linux: `sudo sysctl -w net.core.wmem_max=<bytes>`.
+  pub fn socket_send_buffer_size(mut self, size: usize) -> Self {
+    self.socket_send_buffer_size = size;
     self
   }
 
@@ -273,7 +321,9 @@ impl DomainParticipantBuilder {
       status_receiver,
       security_plugins_handle.clone(),
       self.socket_receive_buffer_size,
+      self.socket_send_buffer_size,
       self.only_networks,
+      self.same_host_loopback,
     )?;
 
     // outer DP wrapper
@@ -334,6 +384,12 @@ impl DomainParticipantBuilder {
 /// Domains are identified by a domain identifier, which is, in Rust terms, a
 /// `u16`. Domain identifier values are application-specific, but `0` is usually
 /// the default.
+///
+/// # Panics
+///
+/// Most methods panic if an internal mutex or lock is poisoned (a prior panic
+/// occurred in another thread while holding the lock). This indicates a RustDDS
+/// internal defect, not user misuse.
 #[derive(Clone)]
 // This is a smart pointer for DomainParticipant for easier manipulation.
 pub struct DomainParticipant {
@@ -478,6 +534,50 @@ impl DomainParticipant {
     self.dpi.lock().unwrap().discovered_topics()
   }
 
+  /// Gets a snapshot of all Readers discovered over the DDS network.
+  ///
+  /// The `DomainParticipantStatusListener` reports Reader discovery as a live
+  /// stream of events, so a listener that attaches late or drains slowly can
+  /// miss some of them. This returns the full current set of discovered
+  /// Readers from the internal discovery database instead.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// # use rustdds::DomainParticipant;
+  ///
+  /// let domain_participant = DomainParticipant::new(0).unwrap();
+  /// let discovered_readers = domain_participant.discovered_readers();
+  /// for dreader in discovered_readers.iter() {
+  ///   // do something
+  /// }
+  /// ```
+  pub fn discovered_readers(&self) -> Vec<DiscoveredReaderData> {
+    self.dpi.lock().unwrap().discovered_readers()
+  }
+
+  /// Gets a snapshot of all Writers discovered over the DDS network.
+  ///
+  /// The `DomainParticipantStatusListener` reports Writer discovery as a live
+  /// stream of events, so a listener that attaches late or drains slowly can
+  /// miss some of them. This returns the full current set of discovered
+  /// Writers from the internal discovery database instead.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// # use rustdds::DomainParticipant;
+  ///
+  /// let domain_participant = DomainParticipant::new(0).unwrap();
+  /// let discovered_writers = domain_participant.discovered_writers();
+  /// for dwriter in discovered_writers.iter() {
+  ///   // do something
+  /// }
+  /// ```
+  pub fn discovered_writers(&self) -> Vec<DiscoveredWriterData> {
+    self.dpi.lock().unwrap().discovered_writers()
+  }
+
   /// Manually asserts liveliness, affecting all writers with
   /// LIVELINESS QoS of MANUAL_BY_PARTICIPANT created by
   /// this particular participant.
@@ -546,6 +646,7 @@ impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatus
     self
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self
   }
@@ -566,6 +667,7 @@ impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatus
   }
 }
 
+#[cfg(feature = "mio_08")]
 impl mio_08::event::Source for DomainParticipantStatusListener {
   fn register(
     &mut self,
@@ -803,7 +905,9 @@ impl DomainParticipantDisc {
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     socket_receive_buffer_size: usize,
+    socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
+    same_host_loopback: bool,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -816,7 +920,9 @@ impl DomainParticipantDisc {
       status_receiver,
       security_plugins_handle,
       socket_receive_buffer_size,
+      socket_send_buffer_size,
       only_networks,
+      same_host_loopback,
     )?;
 
     Ok(Self {
@@ -890,6 +996,14 @@ impl DomainParticipantDisc {
     self.dpi.discovered_topics()
   }
 
+  pub fn discovered_readers(&self) -> Vec<DiscoveredReaderData> {
+    self.dpi.discovered_readers()
+  }
+
+  pub fn discovered_writers(&self) -> Vec<DiscoveredWriterData> {
+    self.dpi.discovered_writers()
+  }
+
   pub(crate) fn dds_cache(&self) -> Arc<RwLock<DDSCache>> {
     self.dpi.dds_cache()
   }
@@ -960,7 +1074,9 @@ impl Drop for DomainParticipantDisc {
 
     debug!("Waiting for Discovery join.");
     if let Ok(handle) = self.discovery_join_handle.try_recv() {
-      handle.join().unwrap();
+      handle
+        .join()
+        .unwrap_or_else(|e| warn!("Failed to join discovery thread: {e:?}"));
       debug!("Joined Discovery.");
     }
   }
@@ -1038,7 +1154,9 @@ impl DomainParticipantInner {
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     socket_receive_buffer_size: usize,
+    socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
+    same_host_loopback: bool,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
@@ -1172,6 +1290,8 @@ impl DomainParticipantInner {
 
     let (stop_poll_sender, stop_poll_receiver) = mio_channel::channel();
 
+    let (ev_ready_tx, ev_ready_rx) = std::sync::mpsc::sync_channel::<CreateResult<()>>(1);
+
     // Launch the background thread for DomainParticipant
     let disc_db_clone = discovery_db.clone();
     let security_plugins_clone = security_plugins_handle.clone();
@@ -1179,7 +1299,7 @@ impl DomainParticipantInner {
     let ev_loop_handle = thread::Builder::new()
       .name(format!("RustDDS Participant {participant_id} event loop"))
       .spawn(move || {
-        let dp_event_loop = DPEventLoop::new(
+        match DPEventLoop::new(
           domain_info_clone,
           dds_cache_clone,
           listeners,
@@ -1208,9 +1328,26 @@ impl DomainParticipantInner {
           status_sender,
           security_plugins_clone,
           only_networks_for_ev_loop,
-        );
-        dp_event_loop.event_loop();
+          socket_send_buffer_size,
+          same_host_loopback,
+        ) {
+          Ok(dp_event_loop) => {
+            let _ = ev_ready_tx.send(Ok(()));
+            dp_event_loop.event_loop();
+          }
+          Err(e) => {
+            let _ = ev_ready_tx.send(Err(e));
+          }
+        }
       })?;
+
+    match ev_ready_rx.recv() {
+      Ok(Ok(())) => {}
+      Ok(Err(e)) => return Err(e),
+      Err(e) => {
+        return create_error_poisoned!("dp_event_loop ready handshake failed: {e:?}");
+      }
+    }
 
     #[cfg(feature = "security")]
     let have_security = true;
@@ -1462,13 +1599,29 @@ impl DomainParticipantInner {
   }
 
   pub fn discovered_topics(&self) -> Vec<DiscoveredTopicData> {
-    let db = self
-      .discovery_db
-      .read()
-      .unwrap_or_else(|e| panic!("DiscoveryDB is poisoned. {e:?}"));
+    let db = self.discovery_db.read().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}")
+    });
 
     db.all_user_topics().cloned().collect()
   }
+
+  pub fn discovered_readers(&self) -> Vec<DiscoveredReaderData> {
+    let db = self.discovery_db.read().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}")
+    });
+
+    db.get_all_external_topic_readers().cloned().collect()
+  }
+
+  pub fn discovered_writers(&self) -> Vec<DiscoveredWriterData> {
+    let db = self.discovery_db.read().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: DiscoveryDB is poisoned after a prior panic: {e:?}")
+    });
+
+    db.get_all_external_topic_writers().cloned().collect()
+  }
+
   pub(crate) fn status_channel_receiver(
     &self,
   ) -> &StatusChannelReceiver<DomainParticipantStatusEvent> {

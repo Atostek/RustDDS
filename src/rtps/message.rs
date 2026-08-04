@@ -14,6 +14,7 @@ use crate::{
     protocol_version::ProtocolVersion,
     submessages::{
       elements::{parameter::Parameter, parameter_list::ParameterList},
+      submessage_flag::endianness_flag,
       submessages::*,
     },
     validity_trait::Validity,
@@ -45,6 +46,46 @@ pub struct Message {
 impl Message {
   pub fn add_submessage(&mut self, submessage: Submessage) {
     self.submessages.push(submessage);
+  }
+
+  /// Serialize this outbound message into a single datagram buffer, copying the
+  /// payload exactly once.
+  ///
+  /// The generic `Writable`/`Submessage::write_to` path serializes each
+  /// submessage body into a throwaway `Vec` and then splices those bytes into
+  /// the output, and speedy's `write_to_vec_with_ctx` additionally runs a full
+  /// sizing pass first (`bytes_needed`) that repeats that temp-alloc + payload
+  /// copy. This method instead appends directly into one `Vec` (a `&mut
+  /// Vec<u8>` is an `io::Write`, so each write appends): no per-submessage
+  /// temporary allocation, and no separate sizing pass.
+  ///
+  /// The byte output is identical to `write_to_vec_with_ctx(endianness)`: the
+  /// RTPS header and each submessage header are written in `endianness`, and
+  /// each body in its own endianness (from the submessage header flags),
+  /// exactly mirroring the generic `Submessage::write_to`.
+  pub(crate) fn write_to_vec_fast(&self, endianness: Endianness) -> Result<Vec<u8>, speedy::Error> {
+    // Capacity hint only: `content_length` already includes the 4-byte payload
+    // padding (see `Data::len_serialized`). If it were ever off the `Vec` simply
+    // grows, so correctness does not depend on it being exact.
+    let total = RTPS_MESSAGE_HEADER_SIZE
+      + self
+        .submessages
+        .iter()
+        .map(|s| SUBMESSAGE_HEADER_SIZE + s.header.content_length as usize)
+        .sum::<usize>();
+
+    let mut buf = Vec::with_capacity(total);
+    self.header.write_to_stream_with_ctx(endianness, &mut buf)?;
+    for sm in &self.submessages {
+      // Mirror the generic Submessage::write_to exactly: the submessage header
+      // is written in the message endianness, the body in its own endianness.
+      sm.header.write_to_stream_with_ctx(endianness, &mut buf)?;
+      let body_endianness = endianness_flag(sm.header.flags);
+      sm.body
+        .write_to_stream_with_ctx(body_endianness, &mut buf)?;
+    }
+    debug_assert_eq!(buf.len(), total);
+    Ok(buf)
   }
 
   #[cfg(test)]
@@ -108,6 +149,17 @@ impl<C: Context> Writable<C> for Message {
   }
 }
 
+/// Serialized size of the fixed RTPS [`Header`] that `add_header_and_build`
+/// prepends (protocol id + version + vendor id + guid prefix).
+pub(crate) const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
+/// Serialized size of a [`SubmessageHeader`] (kind + flags +
+/// octetsToNextHeader).
+const SUBMESSAGE_HEADER_SIZE: usize = 4;
+
+fn try_submessage_content_length(len: usize) -> Result<u16, ()> {
+  u16::try_from(len).map_err(|_| ())
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct MessageBuilder {
   submessages: Vec<Submessage>,
@@ -116,6 +168,32 @@ pub(crate) struct MessageBuilder {
 impl MessageBuilder {
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Serialized size of the submessages accumulated so far, i.e. the datagram
+  /// size *without* the 20-byte RTPS message header. Each submessage's
+  /// `content_length` is already 4-byte aligned (payloads are padded on write),
+  /// so this is exact for the DATA/INFO_TS/HEARTBEAT submessages used by the
+  /// writer's coalescing path.
+  pub fn submessage_bytes_len(&self) -> usize {
+    self
+      .submessages
+      .iter()
+      .map(|s| SUBMESSAGE_HEADER_SIZE + s.header.content_length as usize)
+      .sum()
+  }
+
+  /// Serialized size of the whole RTPS message (20-byte header + submessages)
+  /// that `add_header_and_build` would produce. Used by the writer's DATA
+  /// coalescing loop to keep an aggregated datagram under an MTU-safe budget.
+  pub fn len_serialized(&self) -> usize {
+    RTPS_MESSAGE_HEADER_SIZE + self.submessage_bytes_len()
+  }
+
+  /// Move all submessages from `other` onto the end of this builder. Used to
+  /// coalesce several samples' `INFO_TS`+`DATA` submessages into one datagram.
+  pub fn append(&mut self, mut other: MessageBuilder) {
+    self.submessages.append(&mut other.submessages);
   }
 
   pub fn dst_submessage(mut self, endianness: Endianness, guid_prefix: GuidPrefix) -> Self {
@@ -221,7 +299,13 @@ impl MessageBuilder {
 
     // If we are sending related sample identity, then insert that.
     if let Some(si) = cache_change.write_options.related_sample_identity() {
-      let related_sample_identity_serialized = si.write_to_vec_with_ctx(endianness).unwrap();
+      let related_sample_identity_serialized = match si.write_to_vec_with_ctx(endianness) {
+        Ok(v) => v,
+        Err(e) => {
+          error!("data_msg: failed to serialize related sample identity: {e:?}");
+          return self;
+        }
+      };
       // Insert two parameters, because we are not sure which one is the correct
       // parameter id. Or what the receiver thinks is correct. This behaviour
       // was observed from eProsima FastDDS on 2024-11-18.
@@ -311,7 +395,16 @@ impl MessageBuilder {
       header: SubmessageHeader {
         kind: SubmessageKind::DATA,
         flags: flags.bits(),
-        content_length: data_message.len_serialized() as u16, // TODO: Handle overflow?
+        content_length: match try_submessage_content_length(data_message.len_serialized()) {
+          Ok(cl) => cl,
+          Err(()) => {
+            error!(
+              "data_msg: DATA submessage too large for RTPS content_length: {} bytes",
+              data_message.len_serialized()
+            );
+            return self;
+          }
+        },
       },
       body: SubmessageBody::Writer(WriterSubmessage::Data(data_message, flags)),
       original_bytes: None,
@@ -322,12 +415,15 @@ impl MessageBuilder {
   // This whole MessageBuilder structure should be refactored into something more
   // coherent. Now it just looks messy.
   #[allow(clippy::too_many_arguments)]
+  #[allow(clippy::too_many_arguments)]
   pub fn data_frag_msg(
     mut self,
     cache_change: &CacheChange,
     reader_entity_id: EntityId,
     writer_guid: GUID,
-    fragment_number: FragmentNumber, // We support only submessages with one fragment
+    fragment_starting_num: FragmentNumber, /* 1-based number of the first fragment in this
+                                            * submessage */
+    fragments_in_submessage: u16, // how many contiguous fragments this submessage carries
     fragment_size: u16,
     sample_size: u32, // all fragments together
     endianness: Endianness,
@@ -358,7 +454,13 @@ impl MessageBuilder {
 
     // If we are sending related sample identity, then insert that.
     if let Some(si) = cache_change.write_options.related_sample_identity() {
-      let related_sample_identity_serialized = si.write_to_vec_with_ctx(endianness).unwrap();
+      let related_sample_identity_serialized = match si.write_to_vec_with_ctx(endianness) {
+        Ok(v) => v,
+        Err(e) => {
+          error!("data_frag_msg: failed to serialize related sample identity: {e:?}");
+          return self;
+        }
+      };
       // Insert two parameters, because we are not sure which one is the correct
       // parameter id. Or what the receiver thinks is correct. This behaviour
       // was observed from eProsima FastDDS on 2024-11-18.
@@ -374,11 +476,21 @@ impl MessageBuilder {
 
     let have_inline_qos = !param_list.is_empty(); // we need this later also
 
-    // fragments are numbered starting from 1, not 0.
-    let from_byte: usize = (usize::from(fragment_number) - 1) * usize::from(fragment_size);
+    // fragments are numbered starting from 1, not 0. This submessage carries the
+    // contiguous run [start, start + K) of fragments, i.e. up to
+    // `fragments_in_submessage * fragment_size` payload bytes (the final run is
+    // shorter when it reaches the end of the sample).
+    let from_byte: usize = (usize::from(fragment_starting_num) - 1) * usize::from(fragment_size);
+    let sample_size_usize = match usize::try_from(sample_size) {
+      Ok(n) => n,
+      Err(_) => {
+        error!("data_frag_msg: sample_size {sample_size} does not fit in usize");
+        return self;
+      }
+    };
     let up_to_before_byte: usize = min(
-      usize::from(fragment_number) * usize::from(fragment_size),
-      sample_size.try_into().unwrap(),
+      from_byte + usize::from(fragments_in_submessage) * usize::from(fragment_size),
+      sample_size_usize,
     );
 
     let serialized_payload = Vec::from(
@@ -422,8 +534,8 @@ impl MessageBuilder {
       reader_id: reader_entity_id,
       writer_id: writer_entity_id,
       writer_sn: cache_change.sequence_number,
-      fragment_starting_num: fragment_number,
-      fragments_in_submessage: 1,
+      fragment_starting_num,
+      fragments_in_submessage,
       data_size: sample_size, // total, assembled data (SerializedPayload) size
       fragment_size,
       inline_qos: if have_inline_qos {
@@ -454,7 +566,16 @@ impl MessageBuilder {
       header: SubmessageHeader {
         kind: SubmessageKind::DATA_FRAG,
         flags: flags.bits(),
-        content_length: data_message.len_serialized() as u16, // TODO: Handle overflow
+        content_length: match try_submessage_content_length(data_message.len_serialized()) {
+          Ok(cl) => cl,
+          Err(()) => {
+            error!(
+              "data_frag_msg: DATA_FRAG submessage too large for RTPS content_length: {} bytes",
+              data_message.len_serialized()
+            );
+            return self;
+          }
+        },
       },
       body: SubmessageBody::Writer(WriterSubmessage::DataFrag(data_message, flags)),
       original_bytes: None,
@@ -790,6 +911,71 @@ mod tests {
         .unwrap(),
     );
     assert_eq!(bits1, serialized);
+  }
+
+  #[test]
+  fn write_to_vec_fast_matches_generic() {
+    // Capture containing INFO_DST, INFO_TS, DATA(w) (with payload) and HEARTBEAT.
+    let bits = Bytes::from_static(&[
+      0x52, 0x54, 0x50, 0x53, 0x02, 0x03, 0x01, 0x0f, 0x01, 0x0f, 0x99, 0x06, 0x78, 0x34, 0x00,
+      0x00, 0x01, 0x00, 0x00, 0x00, 0x0e, 0x01, 0x0c, 0x00, 0x01, 0x03, 0x00, 0x0c, 0x29, 0x2d,
+      0x31, 0xa2, 0x28, 0x20, 0x02, 0x08, 0x09, 0x01, 0x08, 0x00, 0x12, 0x15, 0xf3, 0x5e, 0x00,
+      0xc8, 0xa9, 0xfa, 0x15, 0x05, 0x0c, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x03, 0xc7,
+      0x00, 0x00, 0x03, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+      0x00, 0x2f, 0x00, 0x18, 0x00, 0x01, 0x00, 0x00, 0x00, 0xf5, 0x1c, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x50, 0x8e, 0x68, 0x50,
+      0x00, 0x10, 0x00, 0x01, 0x0f, 0x99, 0x06, 0x78, 0x34, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x01, 0xc1, 0x05, 0x00, 0x0c, 0x00, 0x07, 0x00, 0x00, 0x00, 0x53, 0x71, 0x75,
+      0x61, 0x72, 0x65, 0x00, 0x00, 0x07, 0x00, 0x10, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x53, 0x68,
+      0x61, 0x70, 0x65, 0x54, 0x79, 0x70, 0x65, 0x00, 0x00, 0x00, 0x70, 0x00, 0x10, 0x00, 0x01,
+      0x0f, 0x99, 0x06, 0x78, 0x34, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+      0x5a, 0x00, 0x10, 0x00, 0x01, 0x0f, 0x99, 0x06, 0x78, 0x34, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x01, 0x02, 0x60, 0x00, 0x04, 0x00, 0x5f, 0x01, 0x00, 0x00, 0x15, 0x00,
+      0x04, 0x00, 0x02, 0x03, 0x00, 0x00, 0x16, 0x00, 0x04, 0x00, 0x01, 0x0f, 0x00, 0x00, 0x1d,
+      0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x00, 0x08, 0x00, 0xff, 0xff, 0xff, 0x7f,
+      0xff, 0xff, 0xff, 0xff, 0x27, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x1b, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff,
+      0xff, 0xff, 0x1a, 0x00, 0x0c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9a,
+      0x99, 0x99, 0x19, 0x2b, 0x00, 0x08, 0x00, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff,
+      0x1f, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x1c, 0x00, 0x00, 0x00, 0x03, 0xc7, 0x00, 0x00,
+      0x03, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+      0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    ]);
+
+    let msg = Message::read_from_buffer(&bits).unwrap();
+
+    // The fast serializer must match the generic path byte-for-byte, and both
+    // must reproduce the original capture.
+    let generic = msg.write_to_vec_with_ctx(Endianness::LittleEndian).unwrap();
+    let fast = msg.write_to_vec_fast(Endianness::LittleEndian).unwrap();
+    assert_eq!(generic, fast);
+    assert_eq!(&generic[..], &bits[..]);
+
+    // Aggregation shape: several DATA submessages coalesced into one datagram
+    // (plus the trailing HEARTBEAT). Duplicate the captured DATA submessage so
+    // the message carries multiple payloads, then re-check equivalence.
+    let data_sm = msg
+      .submessages
+      .iter()
+      .find(|s| matches!(s.body, SubmessageBody::Writer(WriterSubmessage::Data(..))))
+      .expect("capture contains a DATA submessage")
+      .clone();
+    let mut multi = msg;
+    multi.submessages.push(data_sm.clone());
+    multi.submessages.push(data_sm);
+
+    let generic_multi = multi
+      .write_to_vec_with_ctx(Endianness::LittleEndian)
+      .unwrap();
+    let fast_multi = multi.write_to_vec_fast(Endianness::LittleEndian).unwrap();
+    assert_eq!(generic_multi, fast_multi);
+  }
+
+  #[test]
+  fn try_submessage_content_length_rejects_overflow() {
+    assert!(try_submessage_content_length(65535).is_ok());
+    assert!(try_submessage_content_length(65536).is_err());
   }
 
   #[test]

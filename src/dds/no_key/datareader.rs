@@ -17,7 +17,7 @@ use crate::{
     with_key::{
       datareader as datareader_with_key,
       datasample::{DataSample as WithKeyDataSample, Sample},
-      BareDataReaderStream as WithKeyBareDataReaderStream, DataReader as WithKeyDataReader,
+      BareDataReaderStream as WithKeyBareDataReaderStream,
       DataReaderEventStream as WithKeyDataReaderEventStream,
       DataReaderStream as WithKeyDataReaderStream,
     },
@@ -27,6 +27,8 @@ use crate::{
   StatusEvented, GUID,
 };
 use super::wrappers::{DAWrapper, NoKeyWrapper};
+#[cfg(feature = "mio_08")]
+use crate::dds::with_key::DataReader as WithKeyDataReader;
 
 /// Simplified type for CDR encoding
 pub type DataReaderCdr<D> = DataReader<D, CDRDeserializerAdapter<D>>;
@@ -476,6 +478,7 @@ where
 
 /// WARNING! UNTESTED
 //  TODO: test
+#[cfg(feature = "mio_08")]
 impl<D, DA> mio_08::event::Source for DataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -532,6 +535,7 @@ where
     self.keyed_datareader.as_status_evented()
   }
 
+  #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.keyed_datareader.as_status_source()
   }

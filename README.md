@@ -38,7 +38,7 @@ The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talki
 * Topic finding ✅
 * Partition QoS
 * Time-based filter QoS
-* Ownership QoS
+* Ownership QoS: SHARED/EXCLUSIVE matching ✅ (EXCLUSIVE per-instance delivery filtering by strength not implemented)
 * Presentation QoS: Coherent/atomic sample sets and ordering
 * Deadline and Latency budget QoS
 * Sample fragmentation (large object exchange) ✅
@@ -48,15 +48,11 @@ The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talki
 * Alternative API using Rust `async` tasks ✅
 * Shared-memory transport for local connections
 
+If you would like to have more features in RustDDS, then please contact sales at Atostek Oy, or submit a pull request.
+
 ## Interoperability
 
-Using "Shapes" demo programs available. Data exchange worked in both directions:
-
-* RTI Connext
-* eProsima FastRTPS
-* OpenDDS
-* CycloneDDS
-* Twin Oaks Computing
+See [test reports](interop/results). 
 
 # Usage
 
@@ -142,6 +138,17 @@ The DDS specification specifies manual memory management in the sense that many 
 `create_` method call and destroyed with a matching `delete_` method call. We have opted to rely on Rust memory management wherever possible, including handling of payload data.
 
 # Release history
+
+## Version 0.13.0
+* Several interoperability fixes and improvements
+* Rewrite timer usage to limit number of background threads used to four per DomainParticipant
+* Add test program for dds-rtps interoperability tests
+* Smarter transmit route selection in case of multi-homed hosts
+* Non-blocking transmit and publisher backpressure implemented
+
+### Version 0.13.1
+* Interoperability improvements
+* Add missing NACK_FRAG handling
 
 ## Version 0.12.0
 * Upgrade to `cdr-encoding`  v 0.11, which has an breaking API change from the previous version. This adds support for borrowing (zero-copy) deserialization.

@@ -63,6 +63,8 @@ impl ParameterId {
   pub const PID_ENTITY_NAME: Self = Self { value: 0x0062 };
   pub const PID_KEY_HASH: Self = Self { value: 0x0070 };
   pub const PID_STATUS_INFO: Self = Self { value: 0x0071 };
+  // DDS-XTypes v1.3, Section 7.6.3.1: DataRepresentationQosPolicy.
+  pub const PID_DATA_REPRESENTATION: Self = Self { value: 0x0073 };
 
   // From Specification "Remote Procedure Calls over DDS v1.0"
   // Section 7.6.2.1.1 Extended PublicationBuiltin TopicData and

@@ -1,36 +1,90 @@
 use std::{
+  cell::RefCell,
+  collections::HashMap,
   io,
   net::{IpAddr, SocketAddr, UdpSocket},
 };
 #[cfg(test)]
 use std::net::Ipv4Addr;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-#[cfg(windows)]
-use local_ip_address::list_afinet_netifas;
 
-use crate::{network::util::get_local_multicast_ip_addrs_filtered, structure::locator::Locator};
+use crate::{
+  network::util::get_local_multicast_ip_addrs_filtered,
+  rtps::{
+    outbound::{ControlQueue, Datagram, SendOutcome, SocketId, CONTROL_QUEUE_WARN_LEN},
+    transmit::InterfaceSelector,
+  },
+  structure::locator::Locator,
+};
 
 // We need one multicast sender socket per interface
 
 #[derive(Debug)]
 pub struct UDPSender {
-  unicast_socket: mio_08::net::UdpSocket,
-  multicast_sockets: Vec<mio_08::net::UdpSocket>,
+  unicast_socket: UdpSocket,
+  // One multicast sender socket per local interface, keyed by the interface it
+  // was bound to (its `InterfaceSelector`). This lets us target a single
+  // interface instead of sending on all of them.
+  multicast_sockets: Vec<(InterfaceSelector, UdpSocket)>,
+
+  // nonblocking-transmit: per-socket never-dropped control queue. A control
+  // datagram is enqueued only when its socket is currently congested
+  // (WouldBlock) or already has queued control ahead of it; otherwise it is
+  // sent immediately. Drained on write readiness by `flush_control`.
+  // (see src/rtps/nonblocking_transmit_design.md)
+  control_queues: RefCell<HashMap<SocketId, ControlQueue>>,
 }
 
 impl UDPSender {
   #[cfg(test)]
   pub fn new(sender_port: u16) -> io::Result<Self> {
-    Self::new_with_networks(sender_port, None)
+    Self::new_with_networks(sender_port, None, 0)
   }
 
-  pub fn new_with_networks(sender_port: u16, only_networks: Option<&[IpAddr]>) -> io::Result<Self> {
+  // Request (and verify) SO_SNDBUF on a sender socket. `size == 0` leaves the
+  // OS default in place. Like the receive path, the kernel silently clamps the
+  // request to a per-socket ceiling (macOS: `kern.ipc.maxsockbuf`, 8 MiB by
+  // default; Linux: `net.core.wmem_max`), so we read the effective value back
+  // and warn when it is materially smaller than requested -- a too-small send
+  // buffer causes WouldBlock churn / control-queue growth under bursty output.
+  fn set_and_verify_send_buffer(socket: &Socket, size: usize) {
+    if size == 0 {
+      return;
+    }
+    if let Err(e) = socket.set_send_buffer_size(size) {
+      warn!("Failed to set SO_SNDBUF to {size}: {e}. Using OS default.");
+      return;
+    }
+    match socket.send_buffer_size() {
+      Ok(effective) if effective < size => warn!(
+        "SO_SNDBUF clamped: requested {size} bytes but got {effective} bytes. The kernel limits \
+         per-socket send buffers; raise it if the sender backlogs under load (macOS: `sudo sysctl \
+         -w kern.ipc.maxsockbuf=<bytes>`, Linux: `sudo sysctl -w net.core.wmem_max=<bytes>`)."
+      ),
+      Ok(effective) => debug!("SO_SNDBUF requested {size} bytes, effective {effective} bytes."),
+      Err(e) => debug!("Could not read back SO_SNDBUF: {e}"),
+    }
+  }
+
+  pub fn new_with_networks(
+    sender_port: u16,
+    only_networks: Option<&[IpAddr]>,
+    send_buffer_size: usize,
+  ) -> io::Result<Self> {
     let unicast_socket = {
       let saddr: SocketAddr = SocketAddr::new("0.0.0.0".parse().unwrap(), sender_port);
-      mio_08::net::UdpSocket::bind(saddr)?
+      let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+      Self::set_and_verify_send_buffer(&raw_socket, send_buffer_size);
+      raw_socket.bind(&SockAddr::from(saddr))?;
+      let socket = UdpSocket::from(raw_socket);
+      // nonblocking-transmit: the socket must never stall the event loop.
+      socket.set_nonblocking(true)?;
+      socket
     };
 
     // We set multicasting loop on so that we can hear other DomainParticipant
@@ -51,6 +105,7 @@ impl UDPSender {
         IpAddr::V4(a) => {
           let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
           raw_socket.set_multicast_if_v4(&a)?;
+          Self::set_and_verify_send_buffer(&raw_socket, send_buffer_size);
 
           // Handle windows.
           //
@@ -67,12 +122,18 @@ impl UDPSender {
           mc_socket.set_multicast_loop_v4(true).unwrap_or_else(|e| {
             error!("Cannot set IPv4 multicast loop. err: {e}");
           });
+          // nonblocking-transmit: mio requires the socket be non-blocking, and
+          // we must never let a full kernel buffer stall the event loop.
+          mc_socket.set_nonblocking(true).unwrap_or_else(|e| {
+            error!("Cannot set IPv4 multicast socket non-blocking. err: {e}");
+          });
           mc_socket
         }
 
         // ipv6
         IpAddr::V6(addr) => {
           let raw_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+          Self::set_and_verify_send_buffer(&raw_socket, send_buffer_size);
 
           // note: you don't need to use set_multicast_if for ipv6 multicast.
           // it comes for free!
@@ -83,17 +144,22 @@ impl UDPSender {
           mc_socket.set_multicast_loop_v6(true).unwrap_or_else(|e| {
             error!("Cannot set IPv6 multicast loop. err: {e}");
           });
+          // nonblocking-transmit: see IPv4 branch above.
+          mc_socket.set_nonblocking(true).unwrap_or_else(|e| {
+            error!("Cannot set IPv6 multicast socket non-blocking. err: {e}");
+          });
 
           mc_socket
         }
       };
 
-      multicast_sockets.push(mio_08::net::UdpSocket::from_std(mc_socket));
+      multicast_sockets.push((InterfaceSelector::Ip(multicast_if_ipaddr), mc_socket));
     } // end for
 
     let sender = Self {
       unicast_socket,
       multicast_sockets,
+      control_queues: RefCell::new(HashMap::new()),
     };
     info!("UDPSender::new() --> {sender:?}");
     Ok(sender)
@@ -104,62 +170,292 @@ impl UDPSender {
     Self::new(0)
   }
 
+  // --- nonblocking-transmit: socket enumeration & raw non-blocking send ------
+
+  fn socket_ref(&self, id: SocketId) -> Option<&UdpSocket> {
+    match id {
+      SocketId::Unicast => Some(&self.unicast_socket),
+      SocketId::Multicast(i) => self.multicast_sockets.get(i).map(|(_, s)| s),
+    }
+  }
+
+  /// All sender sockets, so `DPEventLoop` can arm write readiness on each.
+  pub(crate) fn socket_ids(&self) -> Vec<SocketId> {
+    let mut v = vec![SocketId::Unicast];
+    v.extend((0..self.multicast_sockets.len()).map(SocketId::Multicast));
+    v
+  }
+
+  /// Raw fd of a sender socket, for registering write readiness in the poll.
+  #[cfg(unix)]
+  pub(crate) fn socket_raw_fd(&self, id: SocketId) -> Option<RawFd> {
+    self.socket_ref(id).map(AsRawFd::as_raw_fd)
+  }
+
+  /// One non-blocking datagram send. Never blocks; classifies the result.
+  fn raw_send(&self, id: SocketId, addr: SocketAddr, buffer: &[u8]) -> SendOutcome {
+    let Some(socket) = self.socket_ref(id) else {
+      error!("raw_send: no socket for {id:?}");
+      return SendOutcome::Dropped;
+    };
+    match socket.send_to(buffer, addr) {
+      Ok(bytes_sent) => {
+        if bytes_sent != buffer.len() {
+          error!(
+            "raw_send: {id:?} tried {} bytes, sent only {bytes_sent}",
+            buffer.len()
+          );
+        }
+        SendOutcome::Sent
+      }
+      Err(e) if e.kind() == io::ErrorKind::WouldBlock => SendOutcome::WouldBlock,
+      Err(e) => {
+        warn!("raw_send: {id:?} to {addr} : {e:?} len={}", buffer.len());
+        SendOutcome::Dropped
+      }
+    }
+  }
+
+  fn control_queue_nonempty(&self, id: SocketId) -> bool {
+    self
+      .control_queues
+      .borrow()
+      .get(&id)
+      .is_some_and(|q| !q.is_empty())
+  }
+
+  // --- nonblocking-transmit: control path (never dropped, high priority) -----
+
+  // Enqueue-or-send one control datagram to a single socket. If the socket
+  // already has queued control we must preserve order and just enqueue;
+  // otherwise we try an immediate send and only enqueue on WouldBlock.
+  fn control_send_one(&self, id: SocketId, addr: SocketAddr, buffer: &[u8]) {
+    let mut queues = self.control_queues.borrow_mut();
+    let queue = queues.entry(id).or_default();
+    if queue.is_empty() {
+      match self.raw_send(id, addr, buffer) {
+        SendOutcome::Sent | SendOutcome::Dropped => {}
+        SendOutcome::WouldBlock => queue.push_back(Datagram {
+          addr,
+          bytes: buffer.to_vec(),
+        }),
+      }
+    } else {
+      queue.push_back(Datagram {
+        addr,
+        bytes: buffer.to_vec(),
+      });
+      if queue.len() == CONTROL_QUEUE_WARN_LEN {
+        warn!(
+          "nonblocking-transmit: control queue for {id:?} reached {} datagrams; link may be \
+           wedged (nothing dropped)",
+          queue.len()
+        );
+      }
+    }
+  }
+
+  /// Try to flush a socket's queued control datagrams (called on write
+  /// readiness). Returns `true` if the queue is now empty.
+  pub(crate) fn flush_control(&self, id: SocketId) -> bool {
+    let mut queues = self.control_queues.borrow_mut();
+    let Some(queue) = queues.get_mut(&id) else {
+      return true;
+    };
+    while let Some(front) = queue.front() {
+      let addr = front.addr;
+      let outcome = self.raw_send(id, addr, &front.bytes);
+      match outcome {
+        SendOutcome::Sent | SendOutcome::Dropped => {
+          queue.pop_front();
+        }
+        SendOutcome::WouldBlock => return false,
+      }
+    }
+    true
+  }
+
+  /// Sockets that currently have queued (undelivered) control datagrams.
+  pub(crate) fn pending_control_sockets(&self) -> Vec<SocketId> {
+    self
+      .control_queues
+      .borrow()
+      .iter()
+      .filter(|(_, q)| !q.is_empty())
+      .map(|(id, _)| *id)
+      .collect()
+  }
+
+  fn locator_socket_addr(&self, locator: &Locator, ctx: &str) -> Option<SocketAddr> {
+    match locator {
+      Locator::UdpV4(sa) => Some(SocketAddr::from(*sa)),
+      Locator::UdpV6(sa) => Some(SocketAddr::from(*sa)),
+      Locator::Invalid | Locator::Reserved => {
+        error!("{ctx}: Cannot send to {locator:?}");
+        None
+      }
+      Locator::Other { kind, .. } => {
+        // Normal: other implementations define their own kinds (from Discovery).
+        trace!("{ctx}: Unknown LocatorKind: {kind:?}");
+        None
+      }
+    }
+  }
+
   pub fn send_to_locator_list(&self, buffer: &[u8], ll: &[Locator]) {
     for loc in ll {
       self.send_to_locator(buffer, loc);
     }
   }
 
-  fn send_to_udp_socket(&self, buffer: &[u8], socket: &mio_08::net::UdpSocket, addr: &SocketAddr) {
-    match socket.send_to(buffer, *addr) {
-      Ok(bytes_sent) => {
-        if bytes_sent == buffer.len() { // ok
-        } else {
-          error!(
-            "send_to_udp_socket - send_to tried {} bytes, sent only {}",
-            buffer.len(),
-            bytes_sent
-          );
-        }
-      }
-      Err(e) => {
-        warn!(
-          "send_to_udp_socket - send_to {} : {:?} len={}",
-          addr,
-          e,
-          buffer.len()
-        );
-      }
-    }
-  }
-
+  /// Control-path send to a locator. A multicast locator fans out to every
+  /// multicast interface (legacy reachability). Datagrams are queued (never
+  /// dropped) if the socket is congested.
   pub fn send_to_locator(&self, buffer: &[u8], locator: &Locator) {
     if buffer.len() > 1500 {
       warn!("send_to_locator: Message size = {}", buffer.len());
     }
-    let send = |socket_address: SocketAddr| {
-      if socket_address.ip().is_multicast() {
-        for socket in &self.multicast_sockets {
-          self.send_to_udp_socket(buffer, socket, &socket_address);
-        }
-      } else {
-        self.send_to_udp_socket(buffer, &self.unicast_socket, &socket_address);
+    let Some(socket_address) = self.locator_socket_addr(locator, "send_to_locator") else {
+      return;
+    };
+    if socket_address.ip().is_multicast() {
+      for id in 0..self.multicast_sockets.len() {
+        self.control_send_one(SocketId::Multicast(id), socket_address, buffer);
       }
+    } else {
+      self.control_send_one(SocketId::Unicast, socket_address, buffer);
+    }
+  }
+
+  /// The set of local interfaces on which this sender can emit multicast.
+  /// Used by route resolution to validate an observed interface is usable.
+  pub fn multicast_interfaces(&self) -> Vec<InterfaceSelector> {
+    self
+      .multicast_sockets
+      .iter()
+      .map(|(iface, _)| *iface)
+      .collect()
+  }
+
+  fn multicast_socket_id_for(&self, interface: &InterfaceSelector) -> Option<SocketId> {
+    self
+      .multicast_sockets
+      .iter()
+      .position(|(iface, _)| iface == interface)
+      .map(SocketId::Multicast)
+  }
+
+  /// Control-path multicast send out of a single, specific local interface.
+  /// Falls back to all interfaces if the requested one is unknown, so a
+  /// stale/misresolved interface never silently drops traffic.
+  pub fn send_to_multicast_locator_via(
+    &self,
+    buffer: &[u8],
+    locator: &Locator,
+    interface: &InterfaceSelector,
+  ) {
+    if buffer.len() > 1500 {
+      warn!(
+        "send_to_multicast_locator_via: Message size = {}",
+        buffer.len()
+      );
+    }
+    let Some(socket_address) = self.locator_socket_addr(locator, "send_to_multicast_locator_via")
+    else {
+      return;
     };
 
-    match locator {
-      Locator::UdpV4(socket_address) => send(SocketAddr::from(*socket_address)),
-      Locator::UdpV6(socket_address) => send(SocketAddr::from(*socket_address)),
-      Locator::Invalid | Locator::Reserved => {
-        error!("send_to_locator: Cannot send to {locator:?}");
-      }
-      Locator::Other { kind, .. } =>
-      // This is normal, as other implementations can define their own kinds.
-      // We get those from Discovery.
-      {
-        trace!("send_to_locator: Unknown LocatorKind: {kind:?}");
+    if !socket_address.ip().is_multicast() {
+      // Not a multicast destination; treat as a plain unicast send.
+      self.control_send_one(SocketId::Unicast, socket_address, buffer);
+      return;
+    }
+
+    match self.multicast_socket_id_for(interface) {
+      Some(id) => self.control_send_one(id, socket_address, buffer),
+      None => {
+        trace!("send_to_multicast_locator_via: interface {interface:?} not found, sending on all");
+        for id in 0..self.multicast_sockets.len() {
+          self.control_send_one(SocketId::Multicast(id), socket_address, buffer);
+        }
       }
     }
+  }
+
+  // --- nonblocking-transmit: bulk path (flow-controlled, backpressured) ------
+
+  // One bulk datagram attempt to a socket. Control has strict priority: if the
+  // socket still has queued control, report WouldBlock so the writer backs off
+  // and resumes only after control has drained.
+  fn bulk_send_one(&self, id: SocketId, addr: SocketAddr, buffer: &[u8]) -> SendOutcome {
+    if self.control_queue_nonempty(id) {
+      return SendOutcome::WouldBlock;
+    }
+    self.raw_send(id, addr, buffer)
+  }
+
+  /// Bulk send to a locator. Returns the sockets that could not accept the
+  /// datagram (WouldBlock), so the caller can stop and arm write readiness.
+  pub(crate) fn try_send_to_locator(&self, buffer: &[u8], locator: &Locator) -> Vec<SocketId> {
+    if buffer.len() > 1500 {
+      warn!("try_send_to_locator: Message size = {}", buffer.len());
+    }
+    let mut blocked = Vec::new();
+    let Some(socket_address) = self.locator_socket_addr(locator, "try_send_to_locator") else {
+      return blocked;
+    };
+    if socket_address.ip().is_multicast() {
+      for id in (0..self.multicast_sockets.len()).map(SocketId::Multicast) {
+        if self.bulk_send_one(id, socket_address, buffer) == SendOutcome::WouldBlock {
+          blocked.push(id);
+        }
+      }
+    } else if self.bulk_send_one(SocketId::Unicast, socket_address, buffer)
+      == SendOutcome::WouldBlock
+    {
+      blocked.push(SocketId::Unicast);
+    }
+    blocked
+  }
+
+  /// Bulk multicast send out of a single interface (fallback: all). Returns the
+  /// sockets that could not accept the datagram (WouldBlock).
+  pub(crate) fn try_send_to_multicast_locator_via(
+    &self,
+    buffer: &[u8],
+    locator: &Locator,
+    interface: &InterfaceSelector,
+  ) -> Vec<SocketId> {
+    if buffer.len() > 1500 {
+      warn!(
+        "try_send_to_multicast_locator_via: Message size = {}",
+        buffer.len()
+      );
+    }
+    let mut blocked = Vec::new();
+    let Some(socket_address) =
+      self.locator_socket_addr(locator, "try_send_to_multicast_locator_via")
+    else {
+      return blocked;
+    };
+    if !socket_address.ip().is_multicast() {
+      if self.bulk_send_one(SocketId::Unicast, socket_address, buffer) == SendOutcome::WouldBlock {
+        blocked.push(SocketId::Unicast);
+      }
+      return blocked;
+    }
+    let ids: Vec<SocketId> = match self.multicast_socket_id_for(interface) {
+      Some(id) => vec![id],
+      None => (0..self.multicast_sockets.len())
+        .map(SocketId::Multicast)
+        .collect(),
+    };
+    for id in ids {
+      if self.bulk_send_one(id, socket_address, buffer) == SendOutcome::WouldBlock {
+        blocked.push(id);
+      }
+    }
+    blocked
   }
 
   #[cfg(test)]
@@ -189,7 +485,7 @@ impl UDPSender {
     if address.is_multicast() {
       let address = SocketAddr::new(IpAddr::V4(address), port);
       let mut size = 0;
-      for s in self.multicast_sockets {
+      for (_iface, s) in self.multicast_sockets {
         size = s.send_to(buffer, address)?;
       }
       Ok(size)

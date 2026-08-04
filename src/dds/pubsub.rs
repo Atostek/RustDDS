@@ -34,8 +34,8 @@ use crate::{
   },
   mio_source,
   rtps::{
-    reader::ReaderIngredients,
-    writer::{WriterCommand, WriterIngredients},
+    constant::DEFAULT_WRITER_MAX_SAMPLES, reader::ReaderIngredients, writer::WriterIngredients,
+    writer_send_buffer::WriterSendBuffer,
   },
   serialization::{CDRDeserializerAdapter, CDRSerializerAdapter},
   structure::{
@@ -86,6 +86,12 @@ use crate::no_security::{security_plugins::SecurityPluginsHandle, EndpointSecuri
 ///
 /// let publisher = domain_participant.create_publisher(&qos);
 /// ```
+///
+/// # Panics
+///
+/// Panics if an internal mutex is poisoned (a prior panic occurred while
+/// holding the lock). This indicates a RustDDS internal defect, not user
+/// misuse.
 #[derive(Clone)]
 pub struct Publisher {
   inner: Arc<Mutex<InnerPublisher>>,
@@ -118,10 +124,9 @@ impl Publisher {
   }
 
   fn inner_lock(&self) -> MutexGuard<'_, InnerPublisher> {
-    self
-      .inner
-      .lock()
-      .unwrap_or_else(|e| panic!("Inner publisher lock fail! {e:?}"))
+    self.inner.lock().unwrap_or_else(|e| {
+      panic!("RustDDS internal bug: InnerPublisher lock poisoned after a prior panic: {e:?}")
+    })
   }
 
   /// Creates DDS [DataWriter](struct.With_Key_DataWriter.html) for Keyed topic
@@ -282,16 +287,24 @@ impl Publisher {
   // Suspend and resume publications are performance optimization methods.
   // The minimal correct implementation is to do nothing. See DDS spec 2.2.2.4.1.8
   // and .9
-  /// **NOT IMPLEMENTED. DO NOT USE**
-  #[deprecated(note = "unimplemented")]
+  /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn suspend_publications(&self) {
-    unimplemented!();
+    unreachable!("suspend_publications is a placeholder only and must not be called")
   }
 
-  /// **NOT IMPLEMENTED. DO NOT USE**
-  #[deprecated(note = "unimplemented")]
+  /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn resume_publications(&self) {
-    unimplemented!();
+    unreachable!("resume_publications is a placeholder only and must not be called")
   }
 
   // coherent change set
@@ -309,10 +322,17 @@ impl Publisher {
 
   // Wait for all matched reliable DataReaders acknowledge data written so far,
   // or timeout.
-  /// **NOT IMPLEMENTED. DO NOT USE**
-  #[deprecated(note = "unimplemented")]
+  /// Placeholder only — not implemented. **Will panic if called.**
+  ///
+  /// Use [`WithKeyDataWriter::wait_for_acknowledgments`](crate::with_key::DataWriter::wait_for_acknowledgments)
+  /// on individual writers instead.
+  ///
+  /// # Panics
+  ///
+  /// Always panics. This method is a placeholder and is not implemented.
+  #[deprecated(note = "placeholder only; will panic if called")]
   pub fn wait_for_acknowledgments(&self, _max_wait: Duration) -> WaitResult<()> {
-    unimplemented!();
+    unreachable!("wait_for_acknowledgments is a placeholder only and must not be called")
   }
 
   // What is the use case for this? (is it useful in Rust style of programming?
@@ -455,9 +475,6 @@ impl InnerPublisher {
     D: Keyed,
     SA: adapters::with_key::SerializerAdapter<D>,
   {
-    // Data samples from DataWriter to HistoryCache
-    let (dwcc_upload, hccc_download) = mio_channel::sync_channel::<WriterCommand>(16);
-    let writer_waker = Arc::new(Mutex::new(None));
     // Status reports back from Writer to DataWriter.
     let (status_sender, status_receiver) = sync_status_channel(4)?;
 
@@ -474,13 +491,63 @@ impl InnerPublisher {
       .modify_by(&optional_qos.unwrap_or_else(QosPolicies::qos_none));
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_WITH_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_WITH_KEY_USER_DEFINED)?;
     let dp = self
       .participant()
       .ok_or("upgrade fail")
       .or_else(|e| create_error_dropped!("Where is my DomainParticipant? {}", e))?;
 
     let guid = GUID::new_with_prefix_and_id(dp.guid().prefix, entity_id);
+
+    // Shared, flow-controlled send buffer between the DataWriter (producer) and
+    // the RTPS Writer (consumer). The reliable send window is derived from the
+    // writer's History / ResourceLimits QoS.
+    let window_limit = {
+      let resource_max = writer_qos
+        .resource_limits()
+        .map(|rl| rl.max_samples)
+        .filter(|&m| m > 0)
+        .map(|m| m as usize);
+      match writer_qos.history() {
+        Some(policy::History::KeepLast { depth }) => {
+          let d = depth as usize;
+          resource_max.map_or(d, |r| d.min(r))
+        }
+        _ => resource_max.unwrap_or(DEFAULT_WRITER_MAX_SAMPLES),
+      }
+    };
+    // nonblocking-transmit: the unsent-backlog limit bounds how many admitted
+    // samples may await transmission when the network socket is congested. We
+    // reuse the same capacity as the reliable window.
+    let backlog_limit = window_limit;
+    // KeepLast-style hard cap on retained samples for best-effort (non-blocking)
+    // writes, which are not throttled at admission. Same capacity as the send
+    // window (History depth / ResourceLimits / default), so the writer never
+    // retains more than the application's configured history requires.
+    let max_retain = window_limit;
+    // Default durability is VOLATILE (DDS v1.4 2.2.3). Only VOLATILE reliable
+    // writers may trim KeepLast before a reader matches; durable writers must
+    // retain samples for late joiners.
+    let volatile = matches!(
+      writer_qos
+        .durability()
+        .unwrap_or(policy::Durability::Volatile),
+      policy::Durability::Volatile
+    );
+    let send_buffer = WriterSendBuffer::new(
+      guid,
+      topic.name(),
+      writer_qos.is_reliable(),
+      guid.entity_id.entity_kind.is_built_in(),
+      volatile,
+      window_limit,
+      backlog_limit,
+      max_retain,
+    );
+    // mio readiness "doorbell": the DataWriter rings `doorbell` after admitting a
+    // sample; the event loop registers `doorbell_registration` under the writer's
+    // entity token and wakes to transmit.
+    let (doorbell_registration, doorbell) = mio_06::Registration::new2();
 
     #[cfg(feature = "security")]
     if let Some(sec_handle) = self.security_plugins_handle.as_ref() {
@@ -537,8 +604,8 @@ impl InnerPublisher {
       topic.clone(),
       writer_qos.clone(),
       guid,
-      dwcc_upload,
-      Arc::clone(&writer_waker),
+      send_buffer.clone(),
+      doorbell.clone(),
       self.discovery_command.clone(),
       status_receiver,
     )?;
@@ -604,8 +671,9 @@ impl InnerPublisher {
     // constructed
     let new_writer = WriterIngredients {
       guid,
-      writer_command_receiver: hccc_download,
-      writer_command_receiver_waker: writer_waker,
+      send_buffer,
+      doorbell_registration,
+      doorbell,
       topic_name: topic.name(),
       like_stateless: writer_like_stateless,
       qos_policies: writer_qos,
@@ -634,7 +702,7 @@ impl InnerPublisher {
     SA: adapters::no_key::SerializerAdapter<D>,
   {
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_NO_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::WRITER_NO_KEY_USER_DEFINED)?;
     let d = self.create_datawriter::<NoKeyWrapper<D>, SAWrapper<SA>>(
       outer,
       Some(entity_id),
@@ -661,10 +729,12 @@ impl InnerPublisher {
     &self,
     entity_id_opt: Option<EntityId>,
     entity_kind: EntityKind,
-  ) -> EntityId {
-    // If the entity_id is given, then just use that. If not, then pull an arbitrary
-    // number out of participant's hat.
-    entity_id_opt.unwrap_or_else(|| self.participant().unwrap().new_entity_id(entity_kind))
+  ) -> CreateResult<EntityId> {
+    let dp = self
+      .participant()
+      .ok_or("upgrade fail")
+      .or_else(|e| create_error_dropped!("Where is my DomainParticipant? {}", e))?;
+    Ok(entity_id_opt.unwrap_or_else(|| dp.new_entity_id(entity_kind)))
   }
 
   pub(crate) fn remove_writer(&self, guid: GUID) {
@@ -713,6 +783,12 @@ impl Debug for InnerPublisher {
 ///
 /// let subscriber = domain_participant.create_subscriber(&qos);
 /// ```
+///
+/// # Panics
+///
+/// Panics if an internal mutex is poisoned (a prior panic occurred while
+/// holding the lock). This indicates a RustDDS internal defect, not user
+/// misuse.
 #[derive(Clone)]
 pub struct Subscriber {
   inner: Arc<InnerSubscriber>,
@@ -1034,7 +1110,7 @@ impl InnerSubscriber {
       .modify_by(&optional_qos.unwrap_or_else(QosPolicies::qos_none));
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_WITH_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_WITH_KEY_USER_DEFINED)?;
 
     let dp = match self.participant() {
       Some(dp) => dp,
@@ -1237,7 +1313,7 @@ impl InnerSubscriber {
     }
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED)?;
 
     let d = self.create_datareader_internal::<NoKeyWrapper<D>, DAWrapper<SA>>(
       outer,
@@ -1265,7 +1341,7 @@ impl InnerSubscriber {
     }
 
     let entity_id =
-      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED);
+      self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_NO_KEY_USER_DEFINED)?;
 
     let d = self.create_simple_datareader_internal::<NoKeyWrapper<D>, DAWrapper<SA>>(
       outer,
@@ -1291,10 +1367,12 @@ impl InnerSubscriber {
     &self,
     entity_id_opt: Option<EntityId>,
     entity_kind: EntityKind,
-  ) -> EntityId {
-    // If the entity_id is given, then just use that. If not, then pull an arbitrary
-    // number out of participant's hat.
-    entity_id_opt.unwrap_or_else(|| self.participant().unwrap().new_entity_id(entity_kind))
+  ) -> CreateResult<EntityId> {
+    let dp = self
+      .participant()
+      .ok_or("upgrade fail")
+      .or_else(|e| create_error_dropped!("Where is my DomainParticipant? {}", e))?;
+    Ok(entity_id_opt.unwrap_or_else(|| dp.new_entity_id(entity_kind)))
   }
 }
 

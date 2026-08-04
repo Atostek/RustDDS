@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -25,6 +25,6 @@ jobs:
         run: cargo llvm-cov --doctests --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info

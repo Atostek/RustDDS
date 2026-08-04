@@ -17,11 +17,14 @@ use log4rs::{
   Config,
 };
 use rustdds::{
-  dds::statusevents, with_key::Sample, DomainParticipantBuilder, Keyed, QosPolicyBuilder,
-  StatusEvented, TopicDescription, TopicKind,
+  dds::statusevents,
+  policy::{
+    DataRepresentation, Deadline, Durability, History, Reliability, XCDR2_DATA_REPRESENTATION,
+    XCDR_DATA_REPRESENTATION,
+  },
+  with_key::Sample,
+  DomainParticipantBuilder, Keyed, QosPolicyBuilder, StatusEvented, TopicDescription, TopicKind,
 };
-use rustdds::policy::{Deadline, Durability, History, Reliability}; /* import all QoS
-                                                                     * policies directly */
 use serde::{Deserialize, Serialize};
 use clap::{Arg, ArgMatches, Command}; // command line argument processing
 use mio_06::{Events, Poll, PollOpt, Ready, Token}; // polling
@@ -72,7 +75,10 @@ fn main() {
   let is_auto_test = std::env::var("auto_test").is_ok();
 
   // Build the DomainParticipant
-  let dp_builder = DomainParticipantBuilder::new(*domain_id);
+  let mut dp_builder = DomainParticipantBuilder::new(*domain_id);
+  if matches.get_flag("no_same_host_loopback") {
+    dp_builder = dp_builder.same_host_loopback(false);
+  }
   #[cfg(feature = "security")]
   let dp_builder = if let Some(sec_dir_path) = matches.get_one::<String>("security") {
     match (
@@ -155,12 +161,23 @@ fn main() {
     "QoS policy Ownership Strength is not yet implemented."
   );
 
-  assert!(
-    !matches.contains_id("representation"),
-    "QoS policy Representation is not yet implemented."
-  );
+  // Match the OMG shape_main default (XCDR1) so cross-vendor interop advertises
+  // PID_DATA_REPRESENTATION in discovery. Honor -x for XCDR2 incompatibility
+  // tests.
+  let data_representation = match matches
+    .get_one::<String>("representation")
+    .map(String::as_str)
+  {
+    Some("2") => DataRepresentation {
+      value: vec![XCDR2_DATA_REPRESENTATION],
+    },
+    Some("1") | None => DataRepresentation {
+      value: vec![XCDR_DATA_REPRESENTATION],
+    },
+    Some(other) => panic!("unsupported data representation {other} (use 1 or 2)"),
+  };
 
-  let qos = qos_b.build();
+  let qos = qos_b.build().with_data_representation(data_representation);
 
   let loop_delay: Duration = match deadline_policy {
     None => Duration::from_millis(200), // This is the default rate
@@ -179,7 +196,6 @@ fn main() {
   if is_auto_test {
     // Make automation tests happy
     println!("Create topic: {}", topic.name());
-    println!("Create reader for topic: {}", topic.name());
   } else {
     println!(
       "Topic name is {}. Type is {}.",
@@ -226,6 +242,10 @@ fn main() {
         PollOpt::edge(),
       )
       .unwrap();
+    if is_auto_test {
+      // Make automation tests happy (publisher role)
+      println!("Create writer for topic: {}", topic.name());
+    }
     Some(writer)
   } else {
     None
@@ -249,6 +269,10 @@ fn main() {
       )
       .unwrap();
     debug!("Created DataReader");
+    if is_auto_test {
+      // Make automation tests happy (subscriber role)
+      println!("Create reader for topic: {}", topic.name());
+    }
     Some(reader)
   } else {
     None
@@ -293,7 +317,7 @@ fn main() {
                 match reader.take_next_sample() {
                   Ok(Some(sample)) => match sample.into_value() {
                     Sample::Value(sample) => println!(
-                      "{:10.10} {:10.10} {:3.3} {:3.3} [{}]",
+                      "{:10.10} {:10.10} {} {} [{}]",
                       topic.name(),
                       sample.color,
                       sample.x,
@@ -553,6 +577,12 @@ fn get_matches() -> ArgMatches {
         .long("pkcs11-pin")
         .value_name("pkcs11-pin")
         .requires("pkcs11-token"),
+    )
+    .arg(
+      Arg::new("no_same_host_loopback")
+        .help("Disable same-host loopback routing and localhost SPDP peers")
+        .long("no-same-host-loopback")
+        .action(clap::ArgAction::SetTrue),
     )
     .arg(
       Arg::new("representation")

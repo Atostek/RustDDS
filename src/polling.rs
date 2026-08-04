@@ -34,9 +34,24 @@ pub(crate) type SharedTimer<E> = Rc<RefCell<Timer<E>>>;
 // also spawns its own background OS thread, which is exactly why we now share
 // one timer per event loop instead of one per endpoint.)
 pub(crate) fn new_shared_timer<E>() -> SharedTimer<E> {
-  // num_slots: number of timer wheel slots (granularity of the wheel).
-  // capacity: maximum number of timeouts that may be in flight at once.
+  // tick_duration: the timer-wheel resolution. `mio_extras` rounds every
+  // scheduled timeout UP to at least one tick, so its 100 ms default silently
+  // inflates all sub-100 ms timeouts. Several reliability timeouts are meant to
+  // be much shorter than that (reliable repair reschedules itself at
+  // `deadline/5`, ~200 µs by default, and DATAFRAG repair continues at 1 ms).
+  // With a 100 ms tick those fire ~100 ms late, so recovering the reliable
+  // startup backlog (samples written during the ~0.5 s discovery window, before
+  // the reader matched) crawls at ~1 batch per tick and takes seconds. A 1 ms
+  // tick keeps those timeouts prompt while still being coarse enough to be
+  // cheap. The timer thread parks until the next real deadline, so a finer tick
+  // does not increase idle wakeups.
+  //
+  // num_slots: number of timer wheel slots. capacity: maximum number of
+  // timeouts that may be in flight at once. Longer timeouts (periodic
+  // heartbeat, cache cleaning, discovery) simply wrap the wheel and remain
+  // correct via absolute-tick comparison.
   let inner = timer::Builder::default()
+    .tick_duration(std::time::Duration::from_millis(1))
     .num_slots(1024)
     .capacity(8192)
     .build();

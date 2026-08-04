@@ -11,7 +11,9 @@ use mio_06::Token;
 use mio_extras::channel as mio_channel;
 use log::{debug, error, info, trace, warn};
 use enumflags2::BitFlags;
-use speedy::{Endianness, Writable};
+use speedy::Endianness;
+#[cfg(feature = "security")]
+use speedy::Writable;
 
 use crate::{
   dds::{
@@ -165,14 +167,14 @@ impl Reader {
     let topic_cache_name = i.topic_cache_handle.lock().unwrap().topic_name();
     if i.topic_name != topic_cache_name {
       panic!(
-        "Topic name = {} and topic cache name = {} not equal when creating a Reader",
+        "RustDDS internal bug: topic name {} and topic cache name {} differ when creating a Reader",
         i.topic_name, topic_cache_name
       );
     }
 
     // If reader should be stateless, only BestEffort QoS is supported
     if i.like_stateless && i.qos_policy.is_reliable() {
-      panic!("Attempted to create a stateless Reader with other than BestEffort reliability");
+      panic!("RustDDS internal bug: attempted to create a stateless Reader with Reliable QoS");
     }
 
     Self {
@@ -638,10 +640,11 @@ impl Reader {
     writer_guid: GUID,
     frag_size: u16,
   ) -> &mut FragmentAssembler {
+    let reliable = self.reliability != policy::Reliability::BestEffort;
     self
       .fragment_assemblers
       .entry(writer_guid)
-      .or_insert_with(|| FragmentAssembler::new(frag_size))
+      .or_insert_with(|| FragmentAssembler::new(frag_size, reliable))
   }
 
   fn garbage_collect_fragments(&mut self) {
@@ -841,7 +844,10 @@ impl Reader {
         let res = worker(self, &mut wp);
         let x = self.matched_writers.insert(writer_guid, wp); // re-insert
         if x.is_some() {
-          panic!("with_mutable_writer_proxy: Worker inserted writer proxy behind my back!")
+          panic!(
+            "RustDDS internal bug: with_mutable_writer_proxy worker re-inserted a writer proxy \
+             for {writer_guid:?}"
+          )
         }
         Some(res)
       }
@@ -1234,9 +1240,13 @@ impl Reader {
     _destination_guid: GUID,
     dst_locator_list: &[Locator],
   ) {
-    let bytes = message
-      .write_to_vec_with_ctx(Endianness::LittleEndian)
-      .unwrap(); //TODO!
+    let bytes = match message.write_to_vec_fast(Endianness::LittleEndian) {
+      Ok(b) => b,
+      Err(e) => {
+        error!("Failed to serialize RTPS message for send: {e:?}");
+        return;
+      }
+    };
     let _dummy = message; // consume it to avoid clippy warning
     self
       .udp_sender
@@ -1252,9 +1262,13 @@ impl Reader {
   ) {
     match self.security_encode(message, destination_guid) {
       Ok(message) => {
-        let bytes = message
-          .write_to_vec_with_ctx(Endianness::LittleEndian)
-          .unwrap(); //TODO!!
+        let bytes = match message.write_to_vec_with_ctx(Endianness::LittleEndian) {
+          Ok(b) => b,
+          Err(e) => {
+            error!("Failed to serialize RTPS message for send: {e:?}");
+            return;
+          }
+        };
         self
           .udp_sender
           .send_to_locator_list(&bytes, dst_locator_list);
@@ -1410,8 +1424,8 @@ impl Reader {
   fn acquire_the_topic_cache_guard(&self) -> MutexGuard<'_, TopicCache> {
     self.topic_cache.lock().unwrap_or_else(|e| {
       panic!(
-        "The topic cache of topic {} is poisoned. Error: {}",
-        self.topic_name, e
+        "RustDDS internal bug: topic cache of topic {} is poisoned after a prior panic: {e}",
+        self.topic_name
       )
     })
   }

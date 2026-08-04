@@ -9,6 +9,7 @@ use crate::{
     discovery::Discovery,
     sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
   },
+  rtps::outbound::SocketId,
   structure::guid::{EntityId, EntityKind, GuidPrefix, GUID},
   QosPolicies,
 };
@@ -20,6 +21,92 @@ pub const CACHE_CLEAN_PERIOD: Duration = Duration::from_secs(4);
 // RTPS spec Section 8.4.7.1.1  "Default Timing-Related Values"
 pub const NACK_RESPONSE_DELAY: Duration = Duration::from_millis(200);
 pub const NACK_SUPPRESSION_DURATION: Duration = Duration::from_millis(0);
+
+// Periodic HEARTBEAT period for reliable Writers. The period is adaptive: while
+// some matched reader is behind (has unacknowledged samples), heartbeats are
+// sent at the FAST period to prompt prompt repair (some peers rely on a
+// standalone HEARTBEAT, not the one piggybacked on DATA). Once all readers have
+// acknowledged everything, the writer backs off to the SLOW period to keep
+// idle-traffic low.
+// Note: these use the RTPS `Duration` type (not `std::time::Duration`) to match
+// the Writer's `heartbeat_period` field.
+pub const HEARTBEAT_PERIOD_SLOW: crate::structure::duration::Duration =
+  crate::structure::duration::Duration::from_secs(1);
+pub const HEARTBEAT_PERIOD_FAST: crate::structure::duration::Duration =
+  crate::structure::duration::Duration::from_millis(100);
+
+// Fallback upper bound on the number of CacheChanges a Writer retains in its
+// history when the Writer QoS does not specify ResourceLimits.max_samples. This
+// is only a memory-safety backstop: for reliable Writers, samples that matched
+// reliable readers have not yet acknowledged are retained up to this bound (so
+// they remain available for repair) rather than being evicted eagerly.
+pub const DEFAULT_WRITER_MAX_SAMPLES: usize = 8192;
+
+// Memory-safety backstop for the per-matched-reader set of sequence numbers a
+// Writer still intends to send (`RtpsReaderProxy::unsent_changes`). In normal
+// operation this set is pruned as samples are pushed or acknowledged, but a
+// best-effort flood (no ACKNACKs) or a pathological peer could otherwise let it
+// grow without bound. When the set exceeds this cap, the oldest entries are
+// dropped (they are the least useful to retransmit).
+pub const MAX_UNSENT_CHANGES_PER_READER: usize = DEFAULT_WRITER_MAX_SAMPLES;
+
+// Memory-safety backstop for the per-matched-writer map of received/irrelevant
+// sequence numbers a Reader tracks (`RtpsWriterProxy::changes`). Entries below
+// `ack_base` are pruned eagerly, but under best-effort loss `ack_base` can
+// stall at a permanently missing sample while received sequence numbers pile up
+// above it. When the map exceeds this cap, `ack_base` is forced forward past
+// the oldest gap (those old samples are given up as lost) so the map stays
+// bounded.
+pub const MAX_TRACKED_CHANGES_PER_WRITER: usize = DEFAULT_WRITER_MAX_SAMPLES;
+
+// Default / fallback UDP-payload budget (RTPS header + submessages) used to
+// size datagrams built by the writer's DATA-coalescing and DATAFRAG packing
+// paths when the per-peer path MTU is unknown (peer behind a router, IPv6, or
+// unresolved). Kept below a typical Ethernet MTU (1500) minus IPv4 (20) +
+// UDP (8) headers = 1472, with a small margin, so datagrams do not trigger IP
+// fragmentation. When the peer's egress-interface MTU is known, the per-reader
+// budget (see `payload_budget_for_mtu`) is used instead; this constant is the
+// conservative default (not an absolute maximum). A single submessage larger
+// than the budget still goes out on its own (equivalent to the non-packed
+// path).
+pub const FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE: usize = 1452;
+
+// Overhead subtracted from an interface MTU to obtain the RTPS-message (UDP
+// payload) budget usable for submessage/fragment packing: IPv4 (20) + UDP (8) +
+// RTPS message header (20) = 48 bytes. Matches
+// `FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE` for a 1500-byte MTU (1500 - 48 =
+// 1452).
+pub const DATAGRAM_HEADER_OVERHEAD: usize = 48;
+
+// Constant RTPS fragment size (serialized-payload bytes per fragment) used by
+// the writer when a sample must be sent as DATAFRAG. The RTPS spec requires the
+// fragment size to be fixed for a given Writer and identical for all remote
+// Readers (v2.5 Section 8.4.14.1.1), so this is a constant and must NOT be
+// varied per peer. Per-peer path MTU only controls how many fragments we pack
+// into each DATAFRAG submessage / datagram, never the fragment size itself.
+pub const FRAGMENT_SIZE: usize = 256;
+
+/// Convert an interface MTU into the RTPS-message (UDP payload) budget usable
+/// for submessage/fragment packing: `mtu - DATAGRAM_HEADER_OVERHEAD`, floored
+/// so a pathologically small MTU still yields a usable (if tiny) budget. The
+/// caller always emits at least the first submessage even if it exceeds the
+/// budget, so an underestimate degrades to one submessage per datagram rather
+/// than dropping data.
+pub const fn payload_budget_for_mtu(mtu: u32) -> usize {
+  let mtu = mtu as usize;
+  if mtu <= DATAGRAM_HEADER_OVERHEAD {
+    // Nonsensical / tiny MTU: fall back to a minimal but non-zero budget.
+    64
+  } else {
+    mtu - DATAGRAM_HEADER_OVERHEAD
+  }
+}
+
+// Serialized size of a trailing HEARTBEAT submessage (4-byte submessage header
+// + readerId 4 + writerId 4 + firstSN 8 + lastSN 8 + count 4). The coalescing
+// loop reserves this much of the datagram budget for reliable writers so the
+// single trailing HEARTBEAT always fits after the last DATA.
+pub const HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE: usize = 32;
 
 // Helper list for initializing remote standard (non-secure) built-in readers
 // Structure is (builtin_writer_entity_id, builtin_reader_entity_id,
@@ -287,6 +374,35 @@ pub const P2P_SECURE_DISCOVERY_PARTICIPANT_MESSAGE_TOKEN: Token = Token(60 + PTB
 pub const P2P_PARTICIPANT_STATELESS_MESSAGE_TOKEN: Token = Token(62 + PTB);
 pub const CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_TIMER_TOKEN: Token = Token(63 + PTB);
 pub const P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_TOKEN: Token = Token(64 + PTB);
+
+// nonblocking-transmit: write-readiness tokens for the sender sockets. The
+// unicast socket uses SENDER_WRITABLE_BASE; each multicast interface socket i
+// uses SENDER_WRITABLE_BASE + 1 + i. These are fixed poll tokens and must stay
+// within the PTB+79 maximum, so at most 13 multicast sender sockets are
+// supported (in practice one per multicast-capable local interface).
+// (see src/rtps/nonblocking_transmit_design.md)
+pub const SENDER_WRITABLE_BASE: usize = 65 + PTB;
+pub const SENDER_WRITABLE_MAX: usize = 79 + PTB;
+
+/// The fixed poll token used to watch a sender socket for write readiness.
+pub fn sender_writable_token(id: SocketId) -> Token {
+  match id {
+    SocketId::Unicast => Token(SENDER_WRITABLE_BASE),
+    SocketId::Multicast(i) => Token(SENDER_WRITABLE_BASE + 1 + i),
+  }
+}
+
+/// Decode a fixed poll token back into the sender socket it watches, if any.
+pub fn sender_writable_socket_id(token: Token) -> Option<SocketId> {
+  if token.0 < SENDER_WRITABLE_BASE || token.0 > SENDER_WRITABLE_MAX {
+    return None;
+  }
+  if token.0 == SENDER_WRITABLE_BASE {
+    Some(SocketId::Unicast)
+  } else {
+    Some(SocketId::Multicast(token.0 - SENDER_WRITABLE_BASE - 1))
+  }
+}
 
 // See note about maximum allowed number above.
 

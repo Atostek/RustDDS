@@ -1,6 +1,6 @@
 [package]
 name = "rustdds"
-version = "0.12.0" 
+version = "0.14.0" 
 authors = ["Juhana Helovuo <juhana.helovuo@atostek.com>",
   "Oiva Moisio <oiva.moisio@atostek.com>",
   "Miska Melkinen <miska.melkinen@atostek.com>",
@@ -13,13 +13,33 @@ readme = "README.md"
 keywords = ["network","protocol","dds","rtps"]
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.85.1"
+rust-version = "1.88.0"
 homepage = "https://atostek.com/en/products/rustdds/"  
 repository = "https://github.com/Atostek/RustDDS"
 categories = ["network-programming", "science::robotics"] 
 # the science-robotics category is because of ROS2
 
+# Optimized build that still carries debug info (and, on macOS, a packed .dSYM)
+# so sampling profilers (xctrace / Instruments Time Profiler, samply, perf) can
+# symbolicate the hot path. Build the perf examples with:
+#   cargo build --profile profiling --example ddsperf --example shape_main
+# Binaries land in target/profiling/examples/. Used by scripts/perf_profile.sh.
+[profile.profiling]
+inherits = "release"
+debug = true
+split-debuginfo = "packed"
+strip = false
+
 [features]
+# Feature "mio_08" exposes integration with the "mio" crate version 0.8.x:
+# DataReaders/DataWriters implement `mio_08::event::Source` so they can be
+# registered directly with a mio-0.8 `Poll`. When disabled, RustDDS still
+# supports synchronous polling via mio-0.6 (`Evented`) and asynchronous polling
+# via `futures::Stream`. Disabling this feature drops the `mio` (0.8) and
+# `socketpair` dependencies (and their transitive deps).
+# NOTE: this feature is NOT enabled by default.
+mio_08 = ["dep:mio_08", "dep:socketpair"]
+
 # Feature "security" implements the OMG "DDS Security" specification v 1.1
 # It adds a large amount of new code and dependencies.
 security = [
@@ -27,7 +47,7 @@ security = [
   "dep:x509-certificate", "dep:x509-cert", 
   "dep:tempfile", "dep:newline-converter", 
   "dep:ring", "dep:cms", "dep:der", 
-  "dep:bcder", "dep:const-oid",
+  "dep:bcder",
   "dep:openssl", "dep:cryptoki"
   ]
 
@@ -40,8 +60,8 @@ build_openssl = ["openssl?/vendored"]
 mio_06 = { package = "mio" , version ="^0.6.23" } 
 mio-extras = "2.0.6"
 
-mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"] } 
-socketpair = "0.19"
+mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"], optional = true } 
+socketpair = { version = "0.19", optional = true }
 
 bit-vec = "0.8.0"
 speedy = "0.8.0"
@@ -54,7 +74,6 @@ byteorder = { version = "1.3", features = ["i128"] }
 rand = "0.9.0"
 chrono = { version = "0.4", features = ["serde"] }
 enumflags2 = { version = "0.7.7", features = ["serde"] }
-if-addrs = "0.14"
 pastey = "0.2"
 md5 = "0.8.0"
 socket2 = { version = "0.6", features = ["all"] }
@@ -65,29 +84,31 @@ thiserror = "2.0.9"
 cdr-encoding = { version="0.11" }
 cdr-encoding-size = { version="^0.5" }
 futures = "0.3"
-io-extras = "0.18.0"
+# Cross-platform network-interface enumeration (index, IPv4 subnet, MTU,
+# loopback/multicast flags) used for per-peer path-MTU resolution and locator
+# selection. `default-features = false` drops the `gateway` feature (default
+# route / gateway lookup, which pulls in netlink on Linux); we only need
+# `get_interfaces()`.
+netdev = { version = "0.45", default-features = false }
 
 # For DDS Security:
 serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated XML config files
 glob = { version = "0.3" , optional = true } # for reading spec-mandated XML config files
-mailparse = { version = "0.15" , optional = true } # for reading S/MIME-encoded (XML) config files
+mailparse = { version = "0.16" , optional = true } # for reading S/MIME-encoded (XML) config files
 x509-certificate = { version = "0.24" , optional = true } # for configuration certificates
 x509-cert = { version = "0.2" , optional = true }
 tempfile = { version = "3" , optional = true } # for calling external openssl command. Remove when no longer used.
 newline-converter = { version = "0.3" , optional = true } # helper for handling S/MIME
 ring = { version = "0.17" , optional = true } # Cryptographic primitives
 cms = { version = "0.2" , optional = true } # for ASN.1 parsing
-der = { version = "0.7" , optional = true } # ASN.1 DER encoding
+der = { version = "0.7" , features = ["oid"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
-const-oid = { version = "0.9" , optional = true } # more ASN.1
 openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.10", optional = true }
-pnet = { version = "0.35.0", default-features = false, features = ["std", "pnet_datalink"] }
-pnet_sys = { version = "0.35.0", default-features = false }
-
-
-[target.'cfg(windows)'.dependencies]
-local-ip-address = "0.6.1"
+[target.'cfg(unix)'.dependencies]
+# Used to capture the receiving interface of incoming UDP datagrams via
+# recvmsg()/IP_PKTINFO for interface-aware transmit-locator selection.
+nix = { version = "0.29", features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
 serde_repr = {version = "0.1" }
@@ -118,4 +139,14 @@ termion = "4.0.2"
 
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-procfs = "0.17" # for ddsperf
+procfs = "0.18" # for ddsperf
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2" # for ddsperf CPU/RSS reporting on macOS
+
+# This example registers RustDDS entities with a mio-0.8 Poll, so it needs the
+# optional "mio_08" feature (and thus the mio-0.8 crate) to build.
+[[example]]
+name = "shapes_demo_mio_08"
+path = "examples/shapes_demo_mio_08/main.rs"
+required-features = ["mio_08"]
