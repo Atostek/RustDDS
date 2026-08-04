@@ -502,29 +502,37 @@ impl InnerPublisher {
     // Shared, flow-controlled send buffer between the DataWriter (producer) and
     // the RTPS Writer (consumer). The reliable send window is derived from the
     // writer's History / ResourceLimits QoS.
-    let window_limit = {
-      let resource_max = writer_qos
-        .resource_limits()
-        .map(|rl| rl.max_samples)
-        .filter(|&m| m > 0)
-        .map(|m| m as usize);
-      match writer_qos.history() {
-        Some(policy::History::KeepLast { depth }) => {
-          let d = depth as usize;
-          resource_max.map_or(d, |r| d.min(r))
-        }
-        _ => resource_max.unwrap_or(DEFAULT_WRITER_MAX_SAMPLES),
-      }
-    };
+    let resource_max = writer_qos
+      .resource_limits()
+      .map(|rl| rl.max_samples)
+      .filter(|&m| m > 0)
+      .map(|m| m as usize);
+    // The reliable send window bounds how many *unacknowledged* samples may be
+    // outstanding before a write is back-pressured. This is a flow-control
+    // quantity governed by RESOURCE_LIMITS (max_samples), NOT by the History
+    // depth: `KeepLast{depth}` controls how many samples are *retained*
+    // (newest-wins, see `max_retain` below), not how many may be in flight.
+    // Deriving the window from a small KeepLast depth (e.g. the ubiquitous
+    // ROS 2 default `KeepLast{1}`) collapses reliable delivery into strict
+    // stop-and-wait -- every write must await the previous sample's ACK -- and
+    // spuriously returns `WouldBlock` when an ACK is slower than
+    // `max_blocking_time` (e.g. under the normal discovery race). Use the
+    // resource limit when set, otherwise the default.
+    let window_limit = resource_max.unwrap_or(DEFAULT_WRITER_MAX_SAMPLES);
     // nonblocking-transmit: the unsent-backlog limit bounds how many admitted
     // samples may await transmission when the network socket is congested. We
     // reuse the same capacity as the reliable window.
     let backlog_limit = window_limit;
     // KeepLast-style hard cap on retained samples for best-effort (non-blocking)
-    // writes, which are not throttled at admission. Same capacity as the send
-    // window (History depth / ResourceLimits / default), so the writer never
-    // retains more than the application's configured history requires.
-    let max_retain = window_limit;
+    // writes, which are not throttled at admission, and for reliable writers
+    // before a reader matches. This is where the History depth applies.
+    let max_retain = match writer_qos.history() {
+      Some(policy::History::KeepLast { depth }) => {
+        let d = (depth as usize).max(1);
+        resource_max.map_or(d, |r| d.min(r))
+      }
+      _ => resource_max.unwrap_or(DEFAULT_WRITER_MAX_SAMPLES),
+    };
     // Default durability is VOLATILE (DDS v1.4 2.2.3). Only VOLATILE reliable
     // writers may trim KeepLast before a reader matches; durable writers must
     // retain samples for late joiners.
