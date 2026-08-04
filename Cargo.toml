@@ -104,7 +104,7 @@ cms = { version = "0.2" , optional = true } # for ASN.1 parsing
 der = { version = "0.7" , features = ["oid"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 openssl = { version = "0.10.70", optional = true }
-cryptoki = { version = "0.10", optional = true }
+cryptoki = { version = "0.12", optional = true }
 [target.'cfg(unix)'.dependencies]
 # Used to capture the receiving interface of incoming UDP datagrams via
 # recvmsg()/IP_PKTINFO for interface-aware transmit-locator selection.

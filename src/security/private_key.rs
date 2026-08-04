@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::collections::BTreeMap;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use bytes::Bytes;
 use x509_certificate::{signing::InMemorySigningKeyPair, Signer};
 use cryptoki::{
-  context::{CInitializeArgs, Pkcs11},
+  context::{CInitializeArgs, CInitializeFlags, Pkcs11},
   mechanism::{self, Mechanism},
   object::{Attribute, AttributeType, ObjectClass, ObjectHandle},
   session::{Session, UserType},
@@ -110,7 +110,7 @@ impl PrivateKey {
 
     info!("Opening PKCS#11 HSM client library {module_path}");
     let context = Pkcs11::new(module_path)?;
-    context.initialize(CInitializeArgs::OsThreads)?;
+    context.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
     debug!("PKCS#11 HSM library info: {:?}", context.get_library_info());
 
     let slots = context.get_all_slots()?;
@@ -125,8 +125,7 @@ impl PrivateKey {
                 info!("Found matching token \"{token_label}\" in slot {num}.");
                 let session = context.open_ro_session(*slot)?;
                 let secret_pin_opt: Option<AuthPin> =
-                  pin_value_opt.map(|p| AuthPin::from_str(p).unwrap());
-                // unwrap is safe, because error type is Infallible
+                  pin_value_opt.map(|p| AuthPin::new((*p).into()));
                 session.login(UserType::User, secret_pin_opt.as_ref())?; // bail on failure
                 info!(
                   "Logged into token \"{}\" , using PIN = {:?}",

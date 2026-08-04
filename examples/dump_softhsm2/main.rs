@@ -1,11 +1,8 @@
 #[cfg(feature = "security")]
-use std::str::FromStr;
-
-#[cfg(feature = "security")]
 use anyhow::Result;
 #[cfg(feature = "security")]
 use cryptoki::{
-  context::{CInitializeArgs, Pkcs11},
+  context::{CInitializeArgs, CInitializeFlags, Pkcs11},
   object::AttributeType,
   session::UserType,
   types::AuthPin,
@@ -22,7 +19,7 @@ fn main() -> Result<()> {
   let pkcs11client = Pkcs11::new("/usr/lib/softhsm/libsofthsm2.so")?;
 
   println!("Initializing Cryptoki.");
-  pkcs11client.initialize(CInitializeArgs::OsThreads)?;
+  pkcs11client.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
   println!("Initialized.");
 
   println!("Library info: {:?}", pkcs11client.get_library_info());
@@ -48,7 +45,7 @@ fn main() -> Result<()> {
           Err(e) => println!("Session open failed: {e:?}"),
           Ok(session) => {
             println!("Session opened. Trying login.");
-            let secret_pin = AuthPin::from_str("DDSTest_1234").unwrap();
+            let secret_pin = AuthPin::new("DDSTest_1234".into());
             let login_result = session.login(UserType::User, Some(&secret_pin));
             match login_result {
               Ok(()) => {
