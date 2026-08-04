@@ -108,7 +108,7 @@ cryptoki = { version = "0.10", optional = true }
 [target.'cfg(unix)'.dependencies]
 # Used to capture the receiving interface of incoming UDP datagrams via
 # recvmsg()/IP_PKTINFO for interface-aware transmit-locator selection.
-nix = { version = "0.29", features = ["net", "socket", "uio"] }
+nix = { version = "0.31", features = ["net", "socket", "uio"] }
 
 [dev-dependencies]
 serde_repr = {version = "0.1" }
