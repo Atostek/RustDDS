@@ -101,7 +101,7 @@ tempfile = { version = "3" , optional = true } # for calling external openssl co
 newline-converter = { version = "0.3" , optional = true } # helper for handling S/MIME
 ring = { version = "0.17" , optional = true } # Cryptographic primitives
 cms = { version = "0.2" , optional = true } # for ASN.1 parsing
-der = { version = "0.7" , features = ["oid"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
+der = { version = "0.8" , features = ["oid"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.12", optional = true }
