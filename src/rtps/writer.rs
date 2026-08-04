@@ -1268,6 +1268,13 @@ impl Writer {
   // shared send buffer. Called whenever acknowledgements arrive or the set of
   // matched readers changes. `None` means there are no reliable readers, so the
   // writer is never back-pressured.
+  //
+  // TODO: On first match a reader proxy can report `acked_up_to_before == 0`
+  // (sequence numbers are 1-based, so the initial frontier should be >= 1), and
+  // the first missed sample is only recovered via periodic-heartbeat repair,
+  // which can take ~1 s under load. This is harmless now that the send window is
+  // no longer tiny (writes pipeline instead of stalling), but the slow first-
+  // match repair and the off-by-one initial frontier are worth tidying up.
   fn refresh_acked_frontier(&self) {
     if self.like_stateless {
       // Stateless-like writer is BestEffort: never throttle, never wait.
