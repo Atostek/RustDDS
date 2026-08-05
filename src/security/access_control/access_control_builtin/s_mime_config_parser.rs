@@ -23,7 +23,6 @@ use der::{Decode, Encode};
 use ring::{digest, signature};
 
 use super::pkcs7_signed_data::{EncapsulatedContentInfo, MessageDigest, SignedData};
-
 use crate::{
   create_security_error_and_log,
   security::{

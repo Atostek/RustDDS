@@ -21,7 +21,8 @@ pub struct EncapsulatedContentInfo {
   pub econtent: Option<Any>,
 }
 
-// RFC 5280 AlgorithmIdentifier: SEQUENCE { algorithm OID, parameters ANY OPTIONAL }
+// RFC 5280 AlgorithmIdentifier: SEQUENCE { algorithm OID, parameters ANY
+// OPTIONAL }
 #[derive(Debug, Sequence, ValueOrd)]
 pub struct AlgorithmIdentifier {
   pub oid: ObjectIdentifier,
