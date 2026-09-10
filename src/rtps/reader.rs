@@ -265,10 +265,7 @@ impl Reader {
   }
 
   fn send_participant_status(&self, event: DomainParticipantStatusEvent) {
-    self
-      .participant_status_sender
-      .try_send(event)
-      .unwrap_or_else(|e| error!("Cannot report participant status: {e:?}"));
+    self.participant_status_sender.try_send_lossy(event);
   }
 
   // The deadline that the DataReader was expecting through its QosPolicy

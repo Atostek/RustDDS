@@ -94,7 +94,16 @@ pub struct StatusChannelReceiver<T> {
 }
 
 impl<T> StatusChannelSender<T> {
-  /// Best-effort send. If there is no receiver, this will fail silently.
+  /// Best-effort send.
+  ///
+  /// A full channel is reported to the caller as
+  /// [`mio_channel::TrySendError::Full`], carrying the unsent payload back. It
+  /// is not logged here: nobody is required to listen to status events, so a
+  /// full channel is a normal condition whose significance only the caller
+  /// knows. See [`Self::try_send_lossy`] for the "drop it, that is fine" case.
+  ///
+  /// The receiver is woken even when the channel is full, so a listener that
+  /// has fallen behind is prompted to drain.
   pub fn try_send(&self, t: T) -> Result<(), mio_channel::TrySendError<T>> {
     let mut w = self.waker.lock().unwrap(); // lock already at the beginning
     match self.actual_sender.try_send(t) {
@@ -104,18 +113,31 @@ impl<T> StatusChannelSender<T> {
         *w = None;
         Ok(())
       }
-      Err(mio_channel::TrySendError::Full(_tt)) => {
-        warn!("StatusChannelSender cannot send new status changes, channel is full.");
-        // It is perfectly normal to fail due to full channel, because
-        // no-one is required to be listening to these.
+      Err(mio_channel::TrySendError::Full(tt)) => {
         self.signal_sender.send(); // kick the receiver anyway
         w.as_ref().map(|w| w.wake_by_ref());
         *w = None;
-        // We convert the Err to Ok, bause we do not consider this to be an error.
-        // The caller loses the payload object (tt), even though it is not sent.
-        Ok(())
+        Err(mio_channel::TrySendError::Full(tt))
       }
       Err(other_fail) => Err(other_fail),
+    }
+  }
+
+  /// Best-effort send that treats a full channel as success.
+  ///
+  /// Status events are advisory. No-one is required to listen to them, and the
+  /// built-in Discovery endpoints (DCPSParticipant, DCPSPublication, ...) never
+  /// do -- their status channels are created, filled up to capacity and then
+  /// left alone for the lifetime of the participant. Dropping an event there is
+  /// the designed behaviour, not a fault, so it must not produce log output
+  /// that the application can neither prevent nor act on.
+  pub(crate) fn try_send_lossy(&self, t: T) {
+    match self.try_send(t) {
+      Ok(()) => (),
+      Err(mio_channel::TrySendError::Full(_)) => {
+        trace!("Status channel is full, dropping a status event.");
+      }
+      Err(other_fail) => error!("Cannot report status: {other_fail:?}"),
     }
   }
 }
@@ -537,3 +559,46 @@ pub struct QosPolicyCount {
   count: i32,
 }
 */
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // A full status channel must be reported to the caller, with the unsent
+  // payload handed back, so the caller can decide what it means. Previously
+  // `try_send` swallowed this into `Ok(())` and logged a `warn!` itself, which
+  // made the callers' own (deliberately quiet) `Full` handling unreachable and
+  // produced log spam the application could not switch off.
+  #[test]
+  fn full_channel_is_reported_to_caller_with_payload() {
+    let (sender, _receiver) = sync_status_channel::<i32>(2).unwrap();
+
+    assert!(sender.try_send(1).is_ok());
+    assert!(sender.try_send(2).is_ok());
+
+    match sender.try_send(3) {
+      Err(mio_channel::TrySendError::Full(unsent)) => assert_eq!(unsent, 3),
+      Ok(()) => panic!("third send should not have fit into a capacity-2 channel"),
+      Err(other) => panic!("expected Full, got {other:?}"),
+    }
+  }
+
+  // Draining the channel makes room again, and the receiver observes exactly
+  // the events that were accepted -- the dropped one leaves no gap or
+  // duplicate behind.
+  #[test]
+  fn channel_accepts_again_after_drain() {
+    let (sender, receiver) = sync_status_channel::<i32>(2).unwrap();
+
+    assert!(sender.try_send(1).is_ok());
+    assert!(sender.try_send(2).is_ok());
+    assert!(sender.try_send(3).is_err());
+
+    assert_eq!(receiver.try_recv().unwrap(), 1);
+    assert!(sender.try_send(4).is_ok());
+
+    assert_eq!(receiver.try_recv().unwrap(), 2);
+    assert_eq!(receiver.try_recv().unwrap(), 4);
+    assert!(receiver.try_recv().is_err());
+  }
+}

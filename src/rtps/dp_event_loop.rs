@@ -714,10 +714,7 @@ impl DPEventLoop {
   #[cfg(feature = "security")] // Currently used only with security.
                                // Just remove attribute if used also without.
   fn send_participant_status(&self, event: DomainParticipantStatusEvent) {
-    self
-      .participant_status_sender
-      .try_send(event)
-      .unwrap_or_else(|e| error!("Cannot report participant status: {e:?}"));
+    self.participant_status_sender.try_send_lossy(event);
   }
 
   fn handle_reader_action(&mut self, event: &Event, pending_removals: &mut Vec<GUID>) {
@@ -974,7 +971,7 @@ impl DPEventLoop {
     );
     self
       .participant_status_sender
-      .try_send(DomainParticipantStatusEvent::ReaderDetected {
+      .try_send_lossy(DomainParticipantStatusEvent::ReaderDetected {
         reader: EndpointDescription {
           updated_time: Utc::now(),
           guid: remote_reader.reader_proxy.remote_reader_guid,
@@ -983,8 +980,7 @@ impl DPEventLoop {
           qos: remote_reader.subscription_topic_data.qos(),
           user_data: remote_reader.user_data.clone(),
         },
-      })
-      .unwrap_or_else(|e| error!("Cannot report participant status: {e:?}"));
+      });
 
     for writer in self.writers.values_mut() {
       if remote_reader.subscription_topic_data.topic_name() == writer.topic_name() {
@@ -1063,7 +1059,7 @@ impl DPEventLoop {
   fn remote_writer_discovered(&mut self, remote_writer: &DiscoveredWriterData) {
     self
       .participant_status_sender
-      .try_send(DomainParticipantStatusEvent::WriterDetected {
+      .try_send_lossy(DomainParticipantStatusEvent::WriterDetected {
         writer: EndpointDescription {
           updated_time: Utc::now(),
           guid: remote_writer.writer_proxy.remote_writer_guid,
@@ -1072,8 +1068,7 @@ impl DPEventLoop {
           qos: remote_writer.publication_topic_data.qos(),
           user_data: remote_writer.user_data.clone(),
         },
-      })
-      .unwrap_or_else(|e| error!("Cannot report participant status: {e:?}"));
+      });
 
     // update writer proxies in local readers
     for reader in self.message_receiver.available_readers.values_mut() {
