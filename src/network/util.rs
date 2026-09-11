@@ -209,6 +209,12 @@ fn get_local_unicast_locators_inner(
 ) -> Vec<Locator> {
   ifaces
     .iter()
+    // Our unicast transport (both `UDPListener` and the `UDPSender` unicast
+    // socket) is IPv4-only, so an announced IPv6 locator is unreachable: peers
+    // -- including our own participant, which discovers itself over multicast
+    // loopback -- would try to send there and get EAFNOSUPPORT per datagram.
+    // Link-local IPv6 is doubly useless, as a `Locator` carries no scope id.
+    .filter(|ifa| ifa.ip.is_ipv4())
     .filter(|ifa| only_networks.is_none_or(|nets| nets.contains(&ifa.ip)))
     .map(|ifa| Locator::from(SocketAddr::new(ifa.ip, port)))
     .collect()
@@ -402,6 +408,38 @@ mod tests {
     assert_eq!(
       filtered,
       vec![Locator::from(SocketAddr::new(v4(10, 0, 0, 10), 7412))]
+    );
+  }
+
+  // Our unicast transport is IPv4-only, so IPv6 interface addresses must never
+  // be announced as unicast locators: peers (and we ourselves, via loopback
+  // discovery) would send there and get EAFNOSUPPORT on every datagram.
+  #[test]
+  fn unicast_locators_exclude_ipv6() {
+    let ifaces = vec![
+      iface(v4(192, 168, 0, 10), 1, false, true),
+      // link-local IPv6, as found on e.g. docker0 / veth interfaces
+      iface(
+        IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0xd494, 0x8fff, 0xfe08, 0x3ce3,
+        )),
+        1,
+        false,
+        true,
+      ),
+      iface(
+        IpAddr::V6(Ipv6Addr::new(0xfd73, 0x40a2, 0x1c3e, 0, 0, 0, 0, 1)),
+        1,
+        false,
+        true,
+      ),
+    ];
+
+    let filtered = get_local_unicast_locators_inner(&ifaces, 7412, None);
+
+    assert_eq!(
+      filtered,
+      vec![Locator::from(SocketAddr::new(v4(192, 168, 0, 10), 7412))]
     );
   }
 

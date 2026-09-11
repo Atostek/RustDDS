@@ -192,12 +192,33 @@ impl UDPSender {
     self.socket_ref(id).map(AsRawFd::as_raw_fd)
   }
 
+  /// Whether socket `id` can address `addr` at all. The unicast socket is
+  /// IPv4-only, and a multicast socket only speaks the family of the interface
+  /// address it was bound to. Sending across families fails with
+  /// `EAFNOSUPPORT` on every datagram, so we filter such destinations out
+  /// instead of letting them turn into a per-datagram warning. Peers legally
+  /// announce locators we cannot reach (a remote IPv6 locator, or our own
+  /// IPv6 interface addresses seen via loopback discovery), so this is normal.
+  fn socket_can_reach(&self, id: SocketId, addr: SocketAddr) -> bool {
+    match id {
+      SocketId::Unicast => addr.is_ipv4(),
+      SocketId::Multicast(i) => match self.multicast_sockets.get(i) {
+        Some((InterfaceSelector::Ip(iface_ip), _)) => iface_ip.is_ipv4() == addr.is_ipv4(),
+        None => false,
+      },
+    }
+  }
+
   /// One non-blocking datagram send. Never blocks; classifies the result.
   fn raw_send(&self, id: SocketId, addr: SocketAddr, buffer: &[u8]) -> SendOutcome {
     let Some(socket) = self.socket_ref(id) else {
       error!("raw_send: no socket for {id:?}");
       return SendOutcome::Dropped;
     };
+    if !self.socket_can_reach(id, addr) {
+      trace!("raw_send: {id:?} cannot reach {addr} (address family mismatch), dropping");
+      return SendOutcome::Dropped;
+    }
     match socket.send_to(buffer, addr) {
       Ok(bytes_sent) => {
         if bytes_sent != buffer.len() {
@@ -537,5 +558,28 @@ mod tests {
     assert_eq!(rec_data_1, data);
     assert_eq!(rec_data_2.len(), 6);
     assert_eq!(rec_data_2, data);
+  }
+
+  // The unicast socket is IPv4-only, so an IPv6 destination is unreachable and
+  // must be dropped without attempting (and warning about) a send that can only
+  // ever fail with EAFNOSUPPORT.
+  #[test]
+  fn unicast_socket_rejects_ipv6_destination() {
+    let sender = UDPSender::new(11401).expect("failed to create UDPSender");
+
+    let v4_dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10401);
+    let v6_dest = SocketAddr::new(
+      IpAddr::V6(std::net::Ipv6Addr::new(
+        0xfe80, 0, 0, 0, 0xd494, 0x8fff, 0xfe08, 0x3ce3,
+      )),
+      10401,
+    );
+
+    assert!(sender.socket_can_reach(SocketId::Unicast, v4_dest));
+    assert!(!sender.socket_can_reach(SocketId::Unicast, v6_dest));
+    assert_eq!(
+      sender.raw_send(SocketId::Unicast, v6_dest, &[0u8; 4]),
+      SendOutcome::Dropped
+    );
   }
 }
