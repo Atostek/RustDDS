@@ -1819,6 +1819,10 @@ impl Writer {
       .status_sender
       .try_send(status)
       .unwrap_or_else(|e| match e {
+        // TODO: dead code. `StatusChannelSender::try_send` currently converts a
+        // full channel into `Ok(())` (dropping the event), so this arm is never
+        // reached. Kept because the handling is correct if `try_send` is ever
+        // made to return `Full` again (cf. PR #442).
         TrySendError::Full(_) => (), // This is normal in case there is no receiver
         TrySendError::Disconnected(_) => {
           debug!("send_status - status receiver is disconnected");

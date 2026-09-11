@@ -247,6 +247,10 @@ impl Reader {
     match self.status_sender.try_send(change) {
       Ok(()) => (), // expected result
       Err(mio_channel::TrySendError::Full(_)) => {
+        // TODO: dead code. `StatusChannelSender::try_send` currently converts a
+        // full channel into `Ok(())` (dropping the event), so this arm is never
+        // reached. Kept because the handling is correct if `try_send` is ever
+        // made to return `Full` again (cf. PR #442).
         trace!("Reader cannot send new status changes, datareader is full.");
         // It is perfectly normal to fail due to full channel, because
         // no-one is required to be listening to these.

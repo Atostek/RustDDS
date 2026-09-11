@@ -105,7 +105,13 @@ impl<T> StatusChannelSender<T> {
         Ok(())
       }
       Err(mio_channel::TrySendError::Full(_tt)) => {
-        warn!("StatusChannelSender cannot send new status changes, channel is full.");
+        // Keep this at `trace!`: it is perfectly normal to fail due to a full
+        // channel, because no-one is required to be listening to these. In
+        // particular the built-in Discovery endpoints never drain their status
+        // channels, so this fires once per matched remote endpoint. Raising it
+        // to `warn!` (as commit 724950ca briefly did) spams production logs
+        // unstoppably.
+        trace!("StatusChannelSender cannot send new status changes, channel is full.");
         // It is perfectly normal to fail due to full channel, because
         // no-one is required to be listening to these.
         self.signal_sender.send(); // kick the receiver anyway
