@@ -646,29 +646,43 @@ impl InnerPublisher {
       None
     };
 
-    // Add the topic & writer to Discovery DB
-    let mut db = self
-      .discovery_db
-      .write()
-      .map_err(|e| CreateError::Poisoned {
-        reason: format!("Discovery DB: {e}"),
-      })?;
-
+    // Build the discovery record before taking the Discovery DB lock:
+    // `DiscoveredWriterData::new` locks the participant (`dpi`) for its domain
+    // id, participant id, networks and GUID. This keeps the two locks from
+    // overlapping. Taking `dpi` while holding `discovery_db` could deadlock
+    // against `DomainParticipant::find_topic()`, which holds `dpi` while
+    // reading the DB.
     let dwd = DiscoveredWriterData::new(&data_writer, topic, &dp, security_info);
-    db.update_local_topic_writer(dwd);
-    db.update_topic_data_p(topic);
 
-    // Inform Discovery about the topic
-    if let Err(e) = self.discovery_command.try_send(DiscoveryCommand::AddTopic {
-      topic_name: topic.name(),
-    }) {
-      // Log the error but don't quit, failing to inform Discovery about the topic
-      // shouldn't be that serious
-      error!(
-        "Failed send DiscoveryCommand::AddTopic about topic {}: {}",
-        topic.name(),
-        e
-      );
+    // Add the topic & writer to Discovery DB. The write guard is scoped so
+    // that it is released before the blocking `add_writer_sender.send` below:
+    // that channel is bounded and drained by the DP event loop, which itself
+    // takes `discovery_db` for reading, so holding the guard across the send
+    // could deadlock against it (the reader path below already scopes its
+    // guard the same way).
+    {
+      let mut db = self
+        .discovery_db
+        .write()
+        .map_err(|e| CreateError::Poisoned {
+          reason: format!("Discovery DB: {e}"),
+        })?;
+
+      db.update_local_topic_writer(dwd);
+      db.update_topic_data_p(topic);
+
+      // Inform Discovery about the topic
+      if let Err(e) = self.discovery_command.try_send(DiscoveryCommand::AddTopic {
+        topic_name: topic.name(),
+      }) {
+        // Log the error but don't quit, failing to inform Discovery about the topic
+        // shouldn't be that serious
+        error!(
+          "Failed send DiscoveryCommand::AddTopic about topic {}: {}",
+          topic.name(),
+          e
+        );
+      }
     }
 
     // Note: notifying Discovery about the new writer is no longer done here.
@@ -1234,13 +1248,19 @@ impl InnerSubscriber {
       None
     };
 
+    // Build the discovery record before taking the Discovery DB lock: it locks
+    // the participant (`dpi`) for its locators and GUID. Keeping the two locks
+    // from overlapping avoids the reverse of `DomainParticipant::find_topic()`'s
+    // nested `dpi` -> `discovery_db` order.
+    let drd = DiscoveryDB::local_topic_reader_data(&dp, topic, &new_reader, security_info);
+
     // Add the topic & reader to Discovery DB
     {
       let mut db = self
         .discovery_db
         .write()
         .or_else(|e| create_error_poisoned!("Cannot lock discovery_db. {}", e))?;
-      db.update_local_topic_reader(&dp, topic, &new_reader, security_info);
+      db.update_local_topic_reader(drd);
       db.update_topic_data_p(topic);
 
       // Inform Discovery about the topic

@@ -635,13 +635,21 @@ impl DiscoveryDB {
   }
 
   // local topic readers
-  pub fn update_local_topic_reader(
-    &mut self,
+
+  /// Builds the discovery record of a local reader.
+  ///
+  /// This locks the participant (`dpi`, for its locators and GUID), so it is
+  /// a separate step from [`Self::update_local_topic_reader`]: build the record
+  /// first, then take the Discovery DB lock and insert it. The two locks are
+  /// not held together. Calling this while holding `discovery_db` could
+  /// deadlock against `DomainParticipant::find_topic()`, which holds `dpi`
+  /// while reading the DB.
+  pub fn local_topic_reader_data(
     domain_participant: &DomainParticipant,
     topic: &Topic,
     reader: &ReaderIngredients,
     sec_info_opt: Option<EndpointSecurityInfo>,
-  ) {
+  ) -> DiscoveredReaderData {
     let reader_guid = reader.guid;
 
     let reader_proxy = RtpsReaderProxy::from_reader(reader, domain_participant);
@@ -658,16 +666,20 @@ impl DiscoveryDB {
     // TODO: possibly change content filter to dynamic value
     let content_filter = None;
 
-    let discovered_reader_data = DiscoveredReaderData {
+    DiscoveredReaderData {
       reader_proxy: ReaderProxy::from(reader_proxy),
       subscription_topic_data: subscription_data,
       content_filter,
       user_data: Vec::new(),
-    };
+    }
+  }
 
-    self
-      .local_topic_readers
-      .insert(reader_guid, discovered_reader_data);
+  /// Inserts a record built by [`Self::local_topic_reader_data`].
+  pub fn update_local_topic_reader(&mut self, discovered_reader_data: DiscoveredReaderData) {
+    self.local_topic_readers.insert(
+      discovered_reader_data.reader_proxy.remote_reader_guid,
+      discovered_reader_data,
+    );
   }
 
   pub fn remove_local_topic_reader(&mut self, guid: GUID) {
@@ -1100,12 +1112,22 @@ mod tests {
     };
 
     // Add the reader to the database and verify the info is updated
-    discoverydb.update_local_topic_reader(&dp, &topic, &reader1_ing, None);
+    discoverydb.update_local_topic_reader(DiscoveryDB::local_topic_reader_data(
+      &dp,
+      &topic,
+      &reader1_ing,
+      None,
+    ));
     assert_eq!(discoverydb.local_topic_readers.len(), 1);
     assert_eq!(discoverydb.get_local_topic_readers(&topic).len(), 1);
 
     // Verify that the info does not change if the reader is added a second time
-    discoverydb.update_local_topic_reader(&dp, &topic, &reader1_ing, None);
+    discoverydb.update_local_topic_reader(DiscoveryDB::local_topic_reader_data(
+      &dp,
+      &topic,
+      &reader1_ing,
+      None,
+    ));
     assert_eq!(discoverydb.local_topic_readers.len(), 1);
     assert_eq!(discoverydb.get_local_topic_readers(&topic).len(), 1);
 
@@ -1137,7 +1159,12 @@ mod tests {
     };
 
     // Add the second reader to the database and verify the info is updated
-    discoverydb.update_local_topic_reader(&dp, &topic, &reader2_ing, None);
+    discoverydb.update_local_topic_reader(DiscoveryDB::local_topic_reader_data(
+      &dp,
+      &topic,
+      &reader2_ing,
+      None,
+    ));
     assert_eq!(discoverydb.get_local_topic_readers(&topic).len(), 2);
     assert_eq!(discoverydb.get_all_local_topic_readers().count(), 2);
   }
