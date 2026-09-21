@@ -9,7 +9,7 @@ authors = ["Juhana Helovuo <juhana.helovuo@atostek.com>",
   "Selim Virtanen <selim.virtanen@atostek.com>"
 ]
 description = "Native Rust DDS implementation with RTPS"
-readme = "README.md"
+# readme = "README.md" # README.md is already the default.
 keywords = ["network","protocol","dds","rtps"]
 license = "Apache-2.0"
 edition = "2021"

@@ -415,7 +415,6 @@ impl MessageBuilder {
   // This whole MessageBuilder structure should be refactored into something more
   // coherent. Now it just looks messy.
   #[allow(clippy::too_many_arguments)]
-  #[allow(clippy::too_many_arguments)]
   pub fn data_frag_msg(
     mut self,
     cache_change: &CacheChange,

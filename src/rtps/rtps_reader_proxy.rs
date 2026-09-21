@@ -431,14 +431,23 @@ impl RtpsReaderProxy {
           return;
         }
 
-        // sanity check:
+        // RTPS ack state is monotonic for a matched reader. Other implementations
+        // (e.g. FastDDS) may send preemptive or reordered ACKNACK on discovery with
+        // a lower readerSNState.base — ignore rather than regress all_acked_before.
         if new_all_acked_before < self.all_acked_before {
-          error!(
-            "all_acked_before updated backwards! old={:?} new={:?}",
-            self.all_acked_before, new_all_acked_before
+          debug!(
+            "Ignoring ACKNACK that would move all_acked_before backwards: old={:?} new={:?} \
+             reader={:x?} count={}",
+            self.all_acked_before, new_all_acked_before, self.remote_reader_guid, acknack.count
           );
+          for nack_sn in acknack.reader_sn_state.iter() {
+            if nack_sn >= self.all_acked_before {
+              self.unsent_changes.insert(nack_sn);
+            }
+          }
+          return;
         }
-        self.remove_from_unsent_set_all_before(new_all_acked_before); // update anyway
+        self.remove_from_unsent_set_all_before(new_all_acked_before);
         self.all_acked_before = new_all_acked_before;
 
         // Insert the requested changes. These are (by construction) greater
@@ -739,6 +748,24 @@ mod acknack_tests {
     rp.handle_ack_nack(&AckSubmessage::AckNack(ack), SequenceNumber::from(100));
 
     assert_eq!(rp.all_acked_before, SequenceNumber::from(50));
+  }
+
+  #[test]
+  fn acknack_with_backwards_base_does_not_regress_all_acked_before() {
+    let guid = GUID::new(GuidPrefix::UNKNOWN, EntityId::UNKNOWN);
+    let mut rp = RtpsReaderProxy::new(guid, QosPolicies::default(), false);
+    rp.all_acked_before = SequenceNumber::from(4);
+
+    let ack = AckNack {
+      reader_id: EntityId::UNKNOWN,
+      writer_id: EntityId::UNKNOWN,
+      reader_sn_state: SequenceNumberSet::new_empty(SequenceNumber::from(2)),
+      count: 0,
+    };
+
+    rp.handle_ack_nack(&AckSubmessage::AckNack(ack), SequenceNumber::from(3));
+
+    assert_eq!(rp.all_acked_before, SequenceNumber::from(4));
   }
 }
 
