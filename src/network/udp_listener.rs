@@ -424,7 +424,12 @@ impl UDPListener {
       let mut spec_dst: Option<IpAddr> = None;
       for cmsg in msg.cmsgs()? {
         if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
-          ifindex = info.ipi_ifindex;
+          // libc::in_pktinfo.ipi_ifindex is i32 on older libc (MSRV 1.88) and
+          // u32 on newer; keep the cast so both compile.
+          #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+          {
+            ifindex = info.ipi_ifindex as u32;
+          }
           let addr = Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr));
           if !addr.is_unspecified() {
             spec_dst = Some(IpAddr::V4(addr));
