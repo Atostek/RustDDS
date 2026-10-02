@@ -775,6 +775,7 @@ mod route_tests {
 
   use super::*;
   use crate::{
+    discovery::sedp_messages::ReaderProxy,
     rtps::transmit::{DefaultRouteSelector, InterfaceObservations, InterfaceSelector},
     structure::guid::GuidPrefix,
   };
@@ -875,6 +876,16 @@ mod route_tests {
       rp.loopback_unicast_locators,
       vec![udp([127, 0, 0, 1], 7410)]
     );
+  }
+
+  #[test]
+  fn discovery_record_keeps_bucket_loopback() {
+    // A remote reader bound only to loopback, e.g. CycloneDDS on `lo`.
+    let mut rp = proxy_with_prefix(GuidPrefix::new(&[9; 12]));
+    rp.loopback_unicast_locators = vec![udp([127, 0, 0, 1], 7413)];
+
+    let record = ReaderProxy::from(rp);
+    assert_eq!(record.unicast_locator_list, vec![udp([127, 0, 0, 1], 7413)]);
   }
 
   #[test]
