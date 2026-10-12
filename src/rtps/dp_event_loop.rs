@@ -192,8 +192,14 @@ impl DPEventLoop {
     }
 
     let poll = try_init!(Poll::new(), "Unable to create new poll");
-    let (acknack_sender, acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(100);
+    // MessageReceiver -> Writer pipe for ACKNACK and NACK_FRAG submessages. Both
+    // ends are on this thread, so sending must not block. It must not discard
+    // either: a reader whose ACKNACK is lost waits a whole HEARTBEAT round more
+    // for its repair. So the pipe is unbounded. Its backlog stays small: the
+    // loop drains it completely each time it becomes readable, and in between
+    // each listener reads at most MAX_LISTENER_MESSAGES_PER_POLL datagrams per
+    // poll; further datagrams wait in the socket buffers.
+    let (acknack_sender, acknack_receiver) = mio_channel::channel::<(GuidPrefix, AckSubmessage)>();
     let mut udp_listeners = udp_listeners;
     for (token, listener) in &mut udp_listeners {
       try_init!(
@@ -1464,7 +1470,10 @@ fn check_are_endpoints_securities_compatible(
 mod tests {
   use std::{sync::Mutex, thread};
 
+  use bytes::Bytes;
+  use enumflags2::BitFlags;
   use mio_extras::channel as mio_channel;
+  use speedy::{Endianness, Writable};
 
   use super::*;
   use crate::{
@@ -1474,8 +1483,18 @@ mod tests {
       typedesc::TypeDesc,
       with_key::simpledatareader::ReaderCommand,
     },
+    messages::{
+      header::Header,
+      submessages::submessages::{ACKNACK_Flags, AckNack, INFODESTINATION_Flags, InfoDestination},
+    },
     mio_source,
-    structure::{dds_cache::TopicCache, guid::EntityKind},
+    network::udp_listener::PacketOrigin,
+    rtps::Message,
+    structure::{
+      dds_cache::TopicCache,
+      guid::EntityKind,
+      sequence_number::{SequenceNumber, SequenceNumberSet},
+    },
   };
 
   //#[test]
@@ -1796,6 +1815,83 @@ mod tests {
     assert_eq!(
       announced, readers,
       "Discovery was told only about some of the new local readers"
+    );
+  }
+
+  // One datagram as a remote SEDP publications reader sends it in answer to a
+  // HEARTBEAT: INFO_DST and an ACKNACK that requests SN 1.
+  fn acknack_datagram(reader_prefix: GuidPrefix, writer_prefix: GuidPrefix) -> Bytes {
+    let mut message = Message::new(Header::new(reader_prefix));
+    message.add_submessage(
+      InfoDestination {
+        guid_prefix: writer_prefix,
+      }
+      .create_submessage(BitFlags::from_flag(INFODESTINATION_Flags::Endianness)),
+    );
+    let acknack = AckNack {
+      reader_id: EntityId::SEDP_BUILTIN_PUBLICATIONS_READER,
+      writer_id: EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER,
+      reader_sn_state: SequenceNumberSet::from_base_and_set(
+        SequenceNumber::new(1),
+        &BTreeSet::from([SequenceNumber::new(1)]),
+      ),
+      count: 1,
+    };
+    message.add_submessage(acknack.create_submessage(
+      BitFlags::from_flag(ACKNACK_Flags::Endianness) | BitFlags::from_flag(ACKNACK_Flags::Final),
+    ));
+    Bytes::from(
+      message
+        .write_to_vec_with_ctx(Endianness::LittleEndian)
+        .unwrap(),
+    )
+  }
+
+  // The MessageReceiver passes each ACKNACK to the event loop, which hands it
+  // to the writer. A burst of ACKNACKs that arrives before the event loop gets
+  // to them, e.g. a crowd of remote readers answering HEARTBEATs, must reach
+  // the writer in full: a reader whose ACKNACK is discarded waits a whole
+  // HEARTBEAT round more for its repair.
+  #[test]
+  fn acknack_burst_reaches_writers() {
+    let (_add_reader_sender, add_reader_receiver) = mio_channel::channel();
+    let (_stop_poll_sender, stop_poll_receiver) = mio_channel::channel();
+    let (discovery_command_sender, _discovery_command_receiver) =
+      mio_channel::sync_channel::<DiscoveryCommand>(64);
+    let participant_guid = GUID::new_participant_guid();
+    let mut event_loop = test_event_loop(
+      participant_guid,
+      Arc::new(RwLock::new(DDSCache::new())),
+      add_reader_receiver,
+      stop_poll_receiver,
+      discovery_command_sender,
+    );
+
+    let readers: Vec<GuidPrefix> = (0..200u16)
+      .map(|i| {
+        let mut prefix = *b"acknackburst";
+        prefix[10..].copy_from_slice(&i.to_be_bytes());
+        GuidPrefix::new(&prefix)
+      })
+      .collect();
+    for reader in &readers {
+      event_loop.message_receiver.handle_received_packet(
+        &acknack_datagram(*reader, participant_guid.prefix),
+        PacketOrigin::UNKNOWN,
+      );
+    }
+
+    // What handle_writer_acknack_action gets when the event loop drains the pipe
+    let mut delivered = BTreeSet::new();
+    while let Ok((reader, _acknack)) = event_loop.ack_nack_receiver.try_recv() {
+      delivered.insert(reader);
+    }
+    let discarded = readers.iter().filter(|r| !delivered.contains(r)).count();
+    assert_eq!(
+      discarded,
+      0,
+      "{discarded} of {} ACKNACKs were discarded before the event loop got to them",
+      readers.len()
     );
   }
 
