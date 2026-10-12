@@ -1,4 +1,5 @@
 use std::{
+  cmp::max,
   collections::BTreeMap,
   sync::{Arc, Condvar, Mutex},
   time::{Duration as StdDuration, Instant},
@@ -311,11 +312,16 @@ impl WriterSendBuffer {
   /// `present` tells whether any reliable reader is currently matched. Wakes
   /// blocked producers / ack-waiters when the frontier advances or a reader
   /// goes away.
+  ///
+  /// A reader that has not sent an ACKNACK yet reports `all_acked_before == 0`.
+  /// Sequence numbers start at 1, so the frontier is never below 1: anything
+  /// lower would count a sample that does not exist against the send window.
   pub fn set_acked_frontier(&self, acked_before: Option<SequenceNumber>) {
     let shared = &*self.shared;
     let mut inner = shared.inner.lock().unwrap();
     let advanced = match acked_before {
       Some(sn) => {
+        let sn = max(sn, SequenceNumber::new(1));
         let adv = sn > inner.acked_before || !inner.reliable_readers_present;
         inner.acked_before = sn;
         inner.reliable_readers_present = true;
@@ -462,6 +468,32 @@ mod tests {
     WriteOptionsBuilder::new()
       .best_effort_may_block(true)
       .build()
+  }
+
+  // A matched reliable reader that has not sent an ACKNACK yet reports
+  // `all_acked_before == 0`. Sequence numbers start at 1, so that frontier
+  // leaves nothing unacknowledged on a fresh writer: the window must still
+  // admit `window_limit` samples.
+  #[test]
+  fn unacknowledged_reader_frontier_leaves_full_window() {
+    let buf = WriterSendBuffer::new(
+      GUID::GUID_UNKNOWN,
+      "t".to_string(),
+      /* reliable_writer */ true,
+      /* is_builtin */ false,
+      /* volatile */ true,
+      /* window_limit */ 1,
+      /* backlog_limit */ 1000,
+      /* max_retain */ 1,
+    );
+    buf.set_acked_frontier(Some(SequenceNumber::zero()));
+
+    assert!(admit_now(&buf, WriteOptions::default())); // seq 1
+    assert!(!admit_now(&buf, WriteOptions::default())); // window full
+
+    // The reader's first ACKNACK acknowledges seq 1.
+    buf.set_acked_frontier(Some(SequenceNumber::new(2)));
+    assert!(admit_now(&buf, WriteOptions::default())); // seq 2
   }
 
   // nonblocking-transmit: a best-effort writer that opted in via
