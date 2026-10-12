@@ -1078,8 +1078,11 @@ impl Discovery {
       }
 
       // This may be a rediscovery of a previously seen participant that
-      // was temporarily lost due to network outage. Check if we already know
-      // what it has (readers, writers, topics).
+      // was temporarily lost due to network outage. Process the SEDP samples
+      // (topics, readers, writers) that are already pending in our discovery
+      // readers, so that we know what it has. Reading takes the samples out of
+      // the readers, so this processes the pending samples of all participants,
+      // not only those of this one.
       debug!("Participant rediscovery start");
       self.sedp_receive_topic_data(Some(guid_prefix));
       self.sedp_receive_subscription(Some(guid_prefix));
@@ -1161,15 +1164,21 @@ impl Discovery {
       match self.dcps_subscription.reader.into_iterator() {
         Ok(ds) => ds
           .map(|d| d.map_dispose(|g| g.0)) // map_dispose removes Endpoint_GUID wrapper around GUID
-          .filter(|d|
-              // If a participant was specified, we must match its GUID prefix.
-              match (read_history, d) {
-                (None, _) => true, // Not asked to filter by participant
-                (Some(participant_to_update), Sample::Value(drd)) =>
-                  drd.reader_proxy.remote_reader_guid.prefix == participant_to_update,
-                (Some(participant_to_update), Sample::Dispose(guid)) =>
-                  guid.prefix == participant_to_update,
-              })
+          // into_iterator() took these samples out of the reader, so all of them
+          // must be processed, also when a participant was specified. A sample
+          // skipped here would be lost for good.
+          .inspect(|d| {
+            let reader_guid = match d {
+              Sample::Value(drd) => drd.reader_proxy.remote_reader_guid,
+              Sample::Dispose(guid) => *guid,
+            };
+            match read_history {
+              Some(participant) if participant != reader_guid.prefix => {
+                debug!("Rediscovery of {participant:?} processes pending reader {reader_guid:?}");
+              }
+              _ => (),
+            }
+          })
           .collect(),
         Err(e) => {
           error!("sedp_receive_subscription: {e:?}");
@@ -1202,7 +1211,7 @@ impl Discovery {
             self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
               discovered_reader_data: drd,
             });
-            if read_history.is_some() {
+            if read_history == Some(d.reader_proxy.remote_reader_guid.prefix) {
               info!(
                 "Rediscovered reader {:?} topic={:?}",
                 d.reader_proxy.remote_reader_guid,
@@ -1234,14 +1243,19 @@ impl Discovery {
         // a reader and thus self
         Ok(ds) => ds
           .map(|d| d.map_dispose(|g| g.0)) // map_dispose removes Endpoint_GUID wrapper around GUID
-          // If a participant was specified, we must match its GUID prefix.
-          .filter(|d| match (read_history, d) {
-            (None, _) => true, // Not asked to filter by participant
-            (Some(participant_to_update), Sample::Value(dwd)) => {
-              dwd.writer_proxy.remote_writer_guid.prefix == participant_to_update
-            }
-            (Some(participant_to_update), Sample::Dispose(guid)) => {
-              guid.prefix == participant_to_update
+          // into_iterator() took these samples out of the reader, so all of them
+          // must be processed, also when a participant was specified. A sample
+          // skipped here would be lost for good.
+          .inspect(|d| {
+            let writer_guid = match d {
+              Sample::Value(dwd) => dwd.writer_proxy.remote_writer_guid,
+              Sample::Dispose(guid) => *guid,
+            };
+            match read_history {
+              Some(participant) if participant != writer_guid.prefix => {
+                debug!("Rediscovery of {participant:?} processes pending writer {writer_guid:?}");
+              }
+              _ => (),
             }
           })
           .collect(),
@@ -1632,20 +1646,13 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  pub fn secure_sedp_receive_subscription(&mut self, read_history: Option<GuidPrefix>) {
+  pub fn secure_sedp_receive_subscription(&mut self, _read_history: Option<GuidPrefix>) {
     let sec_subs: Vec<Sample<SubscriptionBuiltinTopicDataSecure, GUID>> =
       match self.dcps_subscriptions_secure.reader.into_iterator() {
+        // into_iterator() took these samples out of the reader, so all of them
+        // must be processed.
         Ok(ds) => ds
           .map(|d| d.map_dispose(|g| g.0)) // map_dispose removes Endpoint_GUID wrapper around GUID
-          .filter(|d|
-              // If a participant was specified, we must match its GUID prefix.
-              match (read_history, d) {
-                (None, _) => true, // Not asked to filter by participant
-                (Some(participant_to_update), Sample::Value(sec_sub)) =>
-                sec_sub.discovered_reader_data.reader_proxy.remote_reader_guid.prefix == participant_to_update,
-                (Some(participant_to_update), Sample::Dispose(guid)) =>
-                  guid.prefix == participant_to_update,
-              })
           .collect(),
         Err(e) => {
           error!("secure_sedp_receive_subscription: {e:?}");
@@ -1686,26 +1693,13 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  pub fn secure_sedp_receive_publication(&mut self, read_history: Option<GuidPrefix>) {
+  pub fn secure_sedp_receive_publication(&mut self, _read_history: Option<GuidPrefix>) {
     let sec_pubs: Vec<Sample<PublicationBuiltinTopicDataSecure, GUID>> =
       match self.dcps_publications_secure.reader.into_iterator() {
+        // into_iterator() took these samples out of the reader, so all of them
+        // must be processed.
         Ok(ds) => ds
           .map(|d| d.map_dispose(|g| g.0)) // map_dispose removes Endpoint_GUID wrapper around GUID
-          // If a participant was specified, we must match its GUID prefix.
-          .filter(|d| match (read_history, d) {
-            (None, _) => true, // Not asked to filter by participant
-            (Some(participant_to_update), Sample::Value(sec_pub)) => {
-              sec_pub
-                .discovered_writer_data
-                .writer_proxy
-                .remote_writer_guid
-                .prefix
-                == participant_to_update
-            }
-            (Some(participant_to_update), Sample::Dispose(guid)) => {
-              guid.prefix == participant_to_update
-            }
-          })
           .collect(),
         Err(e) => {
           error!("secure_sedp_receive_publication: {e:?}");
@@ -2133,11 +2127,12 @@ mod tests {
 
   use super::*;
   use crate::{
-    dds::adapters::no_key::DeserializerAdapter,
+    dds::{adapters::no_key::DeserializerAdapter, ddsdata::DDSData},
     discovery::sedp_messages::TopicBuiltinTopicData,
     messages::submessages::submessages::{InterpreterSubmessage, WriterSubmessage},
     network::{constant::*, udp_listener::UDPListener, udp_sender::UDPSender},
     rtps::submessage::*,
+    structure::cache_change::ChangeKind,
     test::{
       shape_type::ShapeType,
       test_data::{
@@ -2145,7 +2140,7 @@ mod tests {
         spdp_subscription_msg,
       },
     },
-    RepresentationIdentifier,
+    RepresentationIdentifier, SerializedPayload,
   };
 
   #[test]
@@ -2399,5 +2394,310 @@ mod tests {
       .unwrap();
 
     udp_sender.send_to_all(&rr, &addresses);
+  }
+
+  // Stores sample sn of an SEDP writer in a built-in reader's topic cache as the
+  // RTPS Reader does for reliably received DATA, but without notifying the
+  // DataReader. The sample stays pending until Discovery reads that DataReader
+  // for some other reason.
+  fn add_pending_sedp_sample(
+    participant: &DomainParticipant,
+    topic_name: &str,
+    writer_guid: GUID,
+    sn: i64,
+    data: DDSData,
+  ) {
+    use crate::{
+      structure::{cache_change::CacheChange, sequence_number::SequenceNumber},
+      WriteOptions,
+    };
+
+    let topic_cache = participant
+      .dds_cache()
+      .read()
+      .unwrap()
+      .get_existing_topic_cache(topic_name)
+      .unwrap();
+    let mut topic_cache = topic_cache.lock().unwrap();
+    let sn = SequenceNumber::new(sn);
+    topic_cache.add_change(
+      &Timestamp::now(),
+      CacheChange::new(writer_guid, sn, WriteOptions::default(), data),
+    );
+    topic_cache.mark_reliably_received_before(writer_guid, sn.plus_1());
+  }
+
+  // SEDP sample announcing an endpoint
+  fn sedp_value(endpoint_data: &impl PlCdrSerialize) -> DDSData {
+    DDSData::new(SerializedPayload::new_from_bytes(
+      RepresentationIdentifier::PL_CDR_LE,
+      endpoint_data
+        .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
+        .unwrap(),
+    ))
+  }
+
+  // SEDP sample disposing an endpoint
+  fn sedp_dispose(endpoint: GUID) -> DDSData {
+    DDSData::new_disposed_by_key(
+      ChangeKind::NotAliveDisposed,
+      SerializedPayload::new_from_bytes(
+        RepresentationIdentifier::PL_CDR_LE,
+        Endpoint_GUID(endpoint)
+          .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
+          .unwrap(),
+      ),
+    )
+  }
+
+  // When Discovery sees a participant for the first time, it reads the SEDP
+  // readers again for that participant ("rediscovery"). SEDP samples of other
+  // participants that are pending at that moment must not be lost: reading takes
+  // them out of the reader, and the reliable SEDP writer will not send them
+  // again.
+  #[test]
+  fn rediscovery_keeps_pending_sedp_samples_of_other_participants() {
+    use crate::{
+      dds::statusevents::{DataReaderStatus, DataWriterStatus},
+      discovery::sedp_messages::{
+        PublicationBuiltinTopicData, ReaderProxy, SubscriptionBuiltinTopicData, WriterProxy,
+      },
+      structure::guid::EntityKind,
+      StatusEvented, TopicKind,
+    };
+
+    // Status events reported so far by the observer and its local endpoints
+    #[derive(Default)]
+    struct Reported {
+      writer: Vec<DataWriterStatus>,
+      reader: Vec<DataReaderStatus>,
+      participant: Vec<DomainParticipantStatusEvent>,
+    }
+    impl Reported {
+      fn publication_matched(&self, remote_reader: GUID, current_change: i32) -> bool {
+        self.writer.iter().any(|s| {
+          matches!(s, DataWriterStatus::PublicationMatched { reader, current, .. }
+            if *reader == remote_reader && current.count_change() == current_change)
+        })
+      }
+      fn subscription_matched(&self, remote_writer: GUID, current_change: i32) -> bool {
+        self.reader.iter().any(|s| {
+          matches!(s, DataReaderStatus::SubscriptionMatched { writer, current, .. }
+            if *writer == remote_writer && current.count_change() == current_change)
+        })
+      }
+      fn disposed(&self, endpoint: GUID) -> bool {
+        self.participant.iter().any(|e| {
+          matches!(e,
+            DomainParticipantStatusEvent::ReaderLost { guid, reason: LostReason::Disposed }
+            | DomainParticipantStatusEvent::WriterLost { guid, reason: LostReason::Disposed }
+            if *guid == endpoint)
+        })
+      }
+    }
+
+    const DOMAIN_ID: u16 = 47; // not used by other tests
+    const TOPIC: &str = "pending";
+
+    let observer = DomainParticipant::new(DOMAIN_ID).expect("participant creation");
+    let observer_status = observer.status_listener();
+
+    // Readers and writers of some other participant, on the topic of the
+    // observer's local endpoints
+    let other = GuidPrefix::new(b"otherpartcpt");
+    let endpoint = |key, kind| GUID::new(other, EntityId::new([0, 0, key], kind));
+    let reader_guid = endpoint(1, EntityKind::READER_WITH_KEY_USER_DEFINED);
+    let writer_guid = endpoint(2, EntityKind::WRITER_WITH_KEY_USER_DEFINED);
+    let disposed_reader_guid = endpoint(3, EntityKind::READER_WITH_KEY_USER_DEFINED);
+    let disposed_writer_guid = endpoint(4, EntityKind::WRITER_WITH_KEY_USER_DEFINED);
+    let reader_data = |guid| DiscoveredReaderData {
+      reader_proxy: ReaderProxy::new(guid, false, vec![], vec![]),
+      subscription_topic_data: SubscriptionBuiltinTopicData::new(
+        guid,
+        None,
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        &QosPolicies::qos_none(),
+        None,
+      ),
+      content_filter: None,
+      user_data: Vec::new(),
+    };
+    let writer_data = |guid| DiscoveredWriterData {
+      last_updated: std::time::Instant::now(),
+      writer_proxy: WriterProxy::new(guid, vec![], vec![]),
+      publication_topic_data: PublicationBuiltinTopicData::new(
+        guid,
+        None,
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        None,
+      ),
+      user_data: Vec::new(),
+    };
+    let subscriptions_writer = GUID::new(other, EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER);
+    let publications_writer = GUID::new(other, EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER);
+
+    // A reader and a writer that the observer knows and matches before the
+    // new participant appears. Their dispose is pending below.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_SUBSCRIPTION,
+      subscriptions_writer,
+      1,
+      sedp_value(&reader_data(disposed_reader_guid)),
+    );
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PUBLICATION,
+      publications_writer,
+      1,
+      sedp_value(&writer_data(disposed_writer_guid)),
+    );
+    // The observer's own SEDP announcements of its local endpoints come back
+    // through its SEDP readers. That wakes Discovery, which then processes the
+    // two samples above as well.
+    let topic = observer
+      .create_topic(
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        &QosPolicies::qos_none(),
+        TopicKind::WithKey,
+      )
+      .unwrap();
+    let publisher = observer.create_publisher(&QosPolicies::qos_none()).unwrap();
+    let local_writer = publisher
+      .create_datawriter_cdr::<ShapeType>(&topic, None)
+      .unwrap();
+    let subscriber = observer
+      .create_subscriber(&QosPolicies::qos_none())
+      .unwrap();
+    let local_reader = subscriber
+      .create_datareader_cdr::<ShapeType>(&topic, None)
+      .unwrap();
+
+    let reader_known = |guid| {
+      observer
+        .discovered_readers()
+        .iter()
+        .any(|d| d.reader_proxy.remote_reader_guid == guid)
+    };
+    let writer_known = |guid| {
+      observer
+        .discovered_writers()
+        .iter()
+        .any(|d| d.writer_proxy.remote_writer_guid == guid)
+    };
+    let mut reported = Reported::default();
+    // Polls the condition, collecting status events, until it holds or the
+    // timeout expires
+    let mut wait_until = |timeout: StdDuration, condition: &dyn Fn(&Reported) -> bool| {
+      let deadline = std::time::Instant::now() + timeout;
+      loop {
+        reported
+          .writer
+          .extend(std::iter::from_fn(|| local_writer.try_recv_status()));
+        reported
+          .reader
+          .extend(std::iter::from_fn(|| local_reader.try_recv_status()));
+        reported
+          .participant
+          .extend(std::iter::from_fn(|| observer_status.try_recv_status()));
+        if condition(&reported) || std::time::Instant::now() >= deadline {
+          return condition(&reported);
+        }
+        std::thread::sleep(StdDuration::from_millis(20));
+      }
+    };
+    // Once the observer's own endpoints are in its DiscoveryDB, its own
+    // announcements have been processed, and nothing else wakes its SEDP
+    // readers until the new participant appears.
+    assert!(
+      wait_until(StdDuration::from_secs(10), &|r| {
+        reader_known(local_reader.guid())
+          && writer_known(local_writer.guid())
+          && r.publication_matched(disposed_reader_guid, 1)
+          && r.subscription_matched(disposed_writer_guid, 1)
+      }),
+      "the observer did not match its local endpoints with the other participant's endpoints"
+    );
+
+    // A new reader and writer, and the dispose of the ones above, received by
+    // the observer's SEDP readers but not yet processed by its Discovery.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_SUBSCRIPTION,
+      subscriptions_writer,
+      2,
+      sedp_value(&reader_data(reader_guid)),
+    );
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_SUBSCRIPTION,
+      subscriptions_writer,
+      3,
+      sedp_dispose(disposed_reader_guid),
+    );
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PUBLICATION,
+      publications_writer,
+      2,
+      sedp_value(&writer_data(writer_guid)),
+    );
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PUBLICATION,
+      publications_writer,
+      3,
+      sedp_dispose(disposed_writer_guid),
+    );
+
+    // A new participant appears. The observer's Discovery processes its SPDP
+    // sample while the SEDP samples above are still pending.
+    let newcomer = DomainParticipant::new(DOMAIN_ID).expect("participant creation");
+
+    let observer_db = observer.discovery_db();
+    assert!(
+      wait_until(StdDuration::from_secs(10), &|_| {
+        discovery_db_read(&observer_db)
+          .find_participant_proxy(newcomer.guid_prefix())
+          .is_some()
+      }),
+      "the observer did not discover the new participant"
+    );
+    wait_until(StdDuration::from_secs(2), &|r| {
+      reader_known(reader_guid)
+        && writer_known(writer_guid)
+        && !reader_known(disposed_reader_guid)
+        && !writer_known(disposed_writer_guid)
+        && r.publication_matched(reader_guid, 1)
+        && r.subscription_matched(writer_guid, 1)
+        && r.publication_matched(disposed_reader_guid, -1)
+        && r.subscription_matched(disposed_writer_guid, -1)
+        && r.disposed(disposed_reader_guid)
+        && r.disposed(disposed_writer_guid)
+    });
+    assert!(
+      reader_known(reader_guid) && writer_known(writer_guid),
+      "the pending SEDP samples were dropped when the new participant was discovered"
+    );
+    assert!(
+      !reader_known(disposed_reader_guid) && !writer_known(disposed_writer_guid),
+      "the pending SEDP disposes were dropped when the new participant was discovered"
+    );
+    assert!(
+      reported.publication_matched(reader_guid, 1) && reported.subscription_matched(writer_guid, 1),
+      "the local endpoints were not matched with the pending reader and writer"
+    );
+    assert!(
+      reported.publication_matched(disposed_reader_guid, -1)
+        && reported.subscription_matched(disposed_writer_guid, -1),
+      "the local endpoints are still matched with the disposed reader and writer"
+    );
+    assert!(
+      reported.disposed(disposed_reader_guid) && reported.disposed(disposed_writer_guid),
+      "the disposed reader and writer were not reported lost"
+    );
   }
 }
