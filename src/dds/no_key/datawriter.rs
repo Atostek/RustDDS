@@ -466,12 +466,13 @@ mod tests {
   use crate::{
     dds::{participant::DomainParticipant, topic::TopicKind},
     serialization::*,
-    test::random_data::*,
+    test::{random_data::*, test_domain::test_domain_id},
   };
 
   #[test]
   fn dw_write_test() {
-    let domain_participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
     let qos = QosPolicies::qos_none();
     let _default_dw_qos = QosPolicies::qos_none();
     let publisher = domain_participant
@@ -512,7 +513,8 @@ mod tests {
 
   #[test]
   fn dw_wait_for_ack_test() {
-    let domain_participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
     let qos = QosPolicies::qos_none();
     let publisher = domain_participant
       .create_publisher(&qos)

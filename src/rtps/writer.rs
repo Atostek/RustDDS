@@ -2517,12 +2517,13 @@ mod tests {
       with_key::datawriter::DataWriter,
     },
     serialization::CDRSerializerAdapter,
-    test::random_data::*,
+    test::{random_data::*, test_domain::test_domain_id},
   };
 
   #[test]
   fn test_writer_receives_datawriter_cache_change_notifications() {
-    let domain_participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
     let qos = QosPolicies::qos_none();
     let _default_dw_qos = QosPolicies::qos_none();
 

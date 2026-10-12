@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use rustdds::{policy, DomainParticipant, QosPolicyBuilder, TopicKind};
 use serde::{Deserialize, Serialize};
 
+mod common;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct Ping {
   seq: u32,
@@ -16,7 +18,7 @@ struct Ping {
 #[test]
 fn late_writer_can_reach_early_reader() {
   // Participant A: creates a reader immediately.
-  let participant_a = DomainParticipant::new(51).unwrap();
+  let participant_a = DomainParticipant::new(common::test_domain_id(51)).unwrap();
   let qos = QosPolicyBuilder::new()
     .reliability(policy::Reliability::Reliable {
       max_blocking_time: rustdds::Duration::from_secs(1),
@@ -40,7 +42,7 @@ fn late_writer_can_reach_early_reader() {
 
   // Participant B: wait for SEDP discovery to complete with A, then create a
   // late writer.
-  let participant_b = DomainParticipant::new(51).unwrap();
+  let participant_b = DomainParticipant::new(common::test_domain_id(51)).unwrap();
   std::thread::sleep(Duration::from_secs(3));
 
   let topic_b = participant_b
@@ -77,7 +79,7 @@ fn late_writer_can_reach_early_reader() {
 #[test]
 fn late_reader_can_receive_from_early_writer() {
   // Participant A: creates a writer immediately.
-  let participant_a = DomainParticipant::new(52).unwrap();
+  let participant_a = DomainParticipant::new(common::test_domain_id(52)).unwrap();
   let qos = QosPolicyBuilder::new()
     .reliability(policy::Reliability::Reliable {
       max_blocking_time: rustdds::Duration::from_secs(1),
@@ -101,7 +103,7 @@ fn late_reader_can_receive_from_early_writer() {
 
   // Participant B: wait for SEDP discovery to complete with A, then create a
   // late reader.
-  let participant_b = DomainParticipant::new(52).unwrap();
+  let participant_b = DomainParticipant::new(common::test_domain_id(52)).unwrap();
   std::thread::sleep(Duration::from_secs(3));
 
   let topic_b = participant_b

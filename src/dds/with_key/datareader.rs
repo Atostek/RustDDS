@@ -1150,7 +1150,7 @@ mod tests {
       guid::{EntityId, EntityKind, GuidPrefix},
       sequence_number::SequenceNumber,
     },
-    test::random_data::*,
+    test::{random_data::*, test_domain::test_domain_id},
     RepresentationIdentifier,
   };
 
@@ -1158,7 +1158,7 @@ mod tests {
   fn read_and_take() {
     // Test the read and take methods of the DataReader
 
-    let dp = DomainParticipant::new(0).expect("Participant creation failed!");
+    let dp = DomainParticipant::new(test_domain_id(0)).expect("Participant creation failed!");
 
     let mut qos = QosPolicies::qos_none();
     qos.history = Some(policy::History::KeepAll); // Just for testing
@@ -1341,7 +1341,7 @@ mod tests {
   fn read_and_take_with_instance() {
     // Test the methods read_instance and take_instance of the DataReader
 
-    let dp = DomainParticipant::new(0).expect("Participant creation failed!");
+    let dp = DomainParticipant::new(test_domain_id(0)).expect("Participant creation failed!");
 
     let mut qos = QosPolicies::qos_none();
     qos.history = Some(policy::History::KeepAll); // Just for testing

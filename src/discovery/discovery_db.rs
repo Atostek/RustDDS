@@ -854,6 +854,7 @@ mod tests {
     test::{
       random_data::RandomData,
       test_data::{reader_proxy_data, spdp_participant_data, subscription_builtin_topic_data},
+      test_domain::test_domain_id,
     },
   };
 
@@ -913,7 +914,8 @@ mod tests {
       status_sender,
     );
 
-    let domain_participant = DomainParticipant::new(0).expect("Failed to create publisher");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create publisher");
     let topic = domain_participant
       .create_topic(
         "Foobar".to_string(),
@@ -1021,7 +1023,8 @@ mod tests {
     discovery_db.update_subscription(&dreader);
 
     // Discover one external Writer via SEDP publication data.
-    let domain_participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
     let topic = domain_participant
       .create_topic(
         "Foobar".to_string(),
@@ -1065,7 +1068,7 @@ mod tests {
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
       mio_channel::sync_channel::<()>(4);
 
-    let dp = DomainParticipant::new(0).expect("Failed to create participant");
+    let dp = DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
     let topic = dp
       .create_topic(
         "some topic name".to_string(),

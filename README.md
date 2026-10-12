@@ -58,6 +58,14 @@ See [test reports](interop/results).
 
 Please see the examples included within the crate and also [Interoperability test](https://github.com/jhelovuo/dds-rtps) .
 
+## Running the tests
+
+The tests create DomainParticipants on DDS domain 0, and a few on domains 11, 51 and 52 to keep them apart from the others. On a network shared with other DDS systems, the tests join those systems' domain 0. To move them, set `RUSTDDS_TEST_DOMAIN_ID`, which is added to the domain id of each test participant: with `RUSTDDS_TEST_DOMAIN_ID=42`, the tests use domains 42, 53, 93 and 94. The value must be at most 147, so that the tests stay below the domains 200-229, which the lock-order test picks for itself. Not moved by the variable: those lock-order domains, the programs in `examples/`, and the examples in the API documentation. The doc tests always create their participants on domain 0, so plain `cargo test` still joins domain 0; `cargo test --tests` leaves the doc tests out:
+
+```
+RUSTDDS_TEST_DOMAIN_ID=42 cargo test --tests -- --test-threads=1
+```
+
 
 # Data serialization and keying
 

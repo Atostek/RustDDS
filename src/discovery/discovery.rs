@@ -2144,6 +2144,7 @@ mod tests {
         create_cdr_pl_rtps_data_message, spdp_participant_msg_mod, spdp_publication_msg,
         spdp_subscription_msg,
       },
+      test_domain::test_domain_id,
     },
     RepresentationIdentifier,
   };
@@ -2151,10 +2152,10 @@ mod tests {
   #[test]
   fn discovery_participant_data_test() {
     let poll = Poll::new().unwrap();
-    const LISTENER_PORT: u16 = spdp_well_known_unicast_port(12, 0);
+    let listener_port = spdp_well_known_unicast_port(test_domain_id(12), 0);
 
     let mut udp_listener =
-      UDPListener::new_unicast("127.0.0.1", LISTENER_PORT).expect("udp listener creation");
+      UDPListener::new_unicast("127.0.0.1", listener_port).expect("udp listener creation");
     poll
       .register(
         udp_listener.mio_socket(),
@@ -2166,7 +2167,7 @@ mod tests {
 
     // sending participant data to discovery
     let udp_sender = UDPSender::new_with_random_port().expect("failed to create UDPSender");
-    let addresses = vec![SocketAddr::new("127.0.0.1".parse().unwrap(), LISTENER_PORT)];
+    let addresses = vec![SocketAddr::new("127.0.0.1".parse().unwrap(), listener_port)];
 
     let tdata = spdp_participant_msg_mod(11000);
     let msg_data = tdata
@@ -2191,7 +2192,7 @@ mod tests {
       serialization::pl_cdr_adapters::PlCdrSerialize, structure::locator::Locator, TopicKind,
     };
 
-    let participant = DomainParticipant::new(0).expect("participant creation");
+    let participant = DomainParticipant::new(test_domain_id(0)).expect("participant creation");
 
     let topic = participant
       .create_topic(
@@ -2216,9 +2217,9 @@ mod tests {
       subscriber.create_datareader::<ShapeType, CDRDeserializerAdapter<ShapeType>>(&topic, None);
 
     let poll: Poll = Poll::new().unwrap();
-    const LISTENER_PORT: u16 = spdp_well_known_unicast_port(14, 0);
+    let listener_port = spdp_well_known_unicast_port(test_domain_id(14), 0);
 
-    let mut udp_listener = UDPListener::new_unicast("127.0.0.1", LISTENER_PORT).unwrap();
+    let mut udp_listener = UDPListener::new_unicast("127.0.0.1", listener_port).unwrap();
     poll
       .register(
         udp_listener.mio_socket(),
@@ -2231,7 +2232,7 @@ mod tests {
     let udp_sender: UDPSender =
       UDPSender::new_with_random_port().expect("failed to create UDPSender");
     let addresses: Vec<SocketAddr> =
-      vec![SocketAddr::new("127.0.0.1".parse().unwrap(), LISTENER_PORT)];
+      vec![SocketAddr::new("127.0.0.1".parse().unwrap(), listener_port)];
 
     let mut tdata: crate::rtps::Message = spdp_subscription_msg();
     let mut data: bytes::Bytes;
@@ -2280,7 +2281,8 @@ mod tests {
   #[test]
   fn discovery_writer_data_test() {
     use crate::TopicKind;
-    let participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
 
     let topic = participant
       .create_topic(
@@ -2318,7 +2320,7 @@ mod tests {
     let udp_sender = UDPSender::new_with_random_port().expect("failed to create UDPSender");
     let addresses = vec![SocketAddr::new(
       "127.0.0.1".parse().unwrap(),
-      spdp_well_known_unicast_port(15, 0),
+      spdp_well_known_unicast_port(test_domain_id(15), 0),
     )];
 
     let mut tdata = spdp_publication_msg();
@@ -2360,7 +2362,7 @@ mod tests {
 
   #[test]
   fn discovery_topic_data_test() {
-    let _participant = DomainParticipant::new(0);
+    let _participant = DomainParticipant::new(test_domain_id(0));
 
     let topic_data = DiscoveredTopicData::new(
       Utc::now(),
@@ -2391,7 +2393,7 @@ mod tests {
     let udp_sender = UDPSender::new_with_random_port().expect("failed to create UDPSender");
     let addresses = vec![SocketAddr::new(
       "127.0.0.1".parse().unwrap(),
-      spdp_well_known_unicast_port(16, 0),
+      spdp_well_known_unicast_port(test_domain_id(16), 0),
     )];
 
     let rr = rtps_message

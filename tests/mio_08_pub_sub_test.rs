@@ -3,6 +3,8 @@ use log::error;
 use mio_08::{Events, Interest, Poll, Token};
 use serde::{Deserialize, Serialize};
 
+mod common;
+
 // Publish-subscribe test using polling from mio-0.8.x
 // This is based on code from @garamgim (https://github.com/garamgim)
 
@@ -20,7 +22,7 @@ fn mio_08_pub_sub_test_main() {
   const READER_STATUS_READY: Token = Token(2);
   const WRITER_STATUS_READY: Token = Token(3);
 
-  let domain_participant = DomainParticipant::new(11).unwrap();
+  let domain_participant = DomainParticipant::new(common::test_domain_id(11)).unwrap();
 
   let qos = QosPolicyBuilder::new()
     .reliability(policy::Reliability::BestEffort)
