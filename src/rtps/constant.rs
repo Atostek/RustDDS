@@ -22,6 +22,15 @@ pub const CACHE_CLEAN_PERIOD: Duration = Duration::from_secs(4);
 pub const NACK_RESPONSE_DELAY: Duration = Duration::from_millis(200);
 pub const NACK_SUPPRESSION_DURATION: Duration = Duration::from_millis(0);
 
+// Upper bound on the number of samples a built-in (discovery) Writer repairs
+// for one reader in one round, i.e. on one ACKNACK or one SendRepairData timer
+// event. Built-in Writers repair synchronously on the ACKNACK, so the bound
+// keeps a reader that requests a large history from holding the event loop for
+// the whole retransmission; the rest continues on the timer. 256 is the most
+// sequence numbers one ACKNACK can request (RTPS v2.5 Section 8.3.5.5: at most
+// 256 bits in a SequenceNumberSet), so one round answers a full ACKNACK.
+pub const BUILTIN_REPAIR_MAX_SAMPLES_PER_ROUND: usize = 256;
+
 // Periodic HEARTBEAT period for reliable Writers. The period is adaptive: while
 // some matched reader is behind (has unacknowledged samples), heartbeats are
 // sent at the FAST period to prompt prompt repair (some peers rely on a
