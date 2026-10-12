@@ -71,6 +71,10 @@ use crate::no_security::security_plugins::SecurityPluginsHandle;
 // writer while being flooded with data from that not-yet-matched writer.
 const MAX_LISTENER_MESSAGES_PER_POLL: usize = 16;
 
+// Commands for Discovery that wait this long for room in its command channel
+// get a warning, because their endpoints stay unannounced until they get in.
+const DISCOVERY_COMMAND_WAIT_WARNING: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
 pub struct DomainInfo {
   pub domain_participant_guid: GUID,
@@ -137,6 +141,12 @@ pub struct DPEventLoop {
 
   discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
   discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
+  // Commands for Discovery that did not fit into its bounded command channel
+  // yet. See `send_pending_discovery_commands`.
+  pending_discovery_commands: VecDeque<DiscoveryCommand>,
+  // Since when commands have been waiting, and whether that was warned about
+  pending_discovery_commands_since: Option<Instant>,
+  pending_discovery_commands_warned: bool,
 
   // Same-host loopback feature (participant-builder `same_host_loopback` knob):
   // when true, the SPDP writer announces to the localhost peers and writers may
@@ -328,6 +338,9 @@ impl DPEventLoop {
       discovery_update_notification_receiver,
       participant_status_sender,
       discovery_command_sender,
+      pending_discovery_commands: VecDeque::new(),
+      pending_discovery_commands_since: None,
+      pending_discovery_commands_warned: false,
       same_host_loopback,
     })
   }
@@ -352,7 +365,11 @@ impl DPEventLoop {
       // nonblocking-transmit: on platforms without write-readiness registration
       // we poll queued outbound work with a short timeout; on unix the sender
       // sockets' writable readiness wakes us, so a long idle timeout is fine.
-      let poll_timeout = if cfg!(unix) || !ev_wrapper.has_pending_outbound() {
+      // Discovery commands waiting for room in its channel are retried with the
+      // same short timeout: nothing wakes us when Discovery drains the channel.
+      let poll_timeout = if ev_wrapper.pending_discovery_commands.is_empty()
+        && (cfg!(unix) || !ev_wrapper.has_pending_outbound())
+      {
         Duration::from_millis(2000)
       } else {
         Duration::from_millis(2)
@@ -605,6 +622,8 @@ impl DPEventLoop {
           ev_wrapper.remove_local_writer(&writer_guid);
         }
       } // if
+
+      ev_wrapper.send_pending_discovery_commands();
 
       // nonblocking-transmit: service the per-socket outbound queues and keep
       // write-readiness interest in sync with what is pending.
@@ -1313,19 +1332,89 @@ impl DPEventLoop {
     }
   }
 
-  fn inform_discovery_about_new_local_endpoint(&self, guid: GUID) {
+  fn inform_discovery_about_new_local_endpoint(&mut self, guid: GUID) {
     let discovery_command = if guid.entity_id.kind().is_writer() {
       DiscoveryCommand::AddLocalWriter { guid }
     } else {
       DiscoveryCommand::AddLocalReader { guid }
     };
 
-    if let Err(e) = self.discovery_command_sender.try_send(discovery_command) {
-      log::error!(
-        "Failed to inform Discovery about the new endpoint: {e}. Endpoint guid: {guid:?}"
+    // Queue behind the commands that are still waiting, to keep the order.
+    self.pending_discovery_commands.push_back(discovery_command);
+    self.send_pending_discovery_commands();
+    if !self.pending_discovery_commands.is_empty() {
+      debug!(
+        "Discovery command channel is full, {} command(s) wait for a retry. Endpoint guid: \
+         {guid:?}",
+        self.pending_discovery_commands.len()
       );
-      // Improvement TODO: that's it, just an error log entry on failing to
-      // inform discovery?
+    }
+  }
+
+  // Hand the queued commands to Discovery, in order, as far as its command
+  // channel has room. The channel is bounded and only the Discovery thread
+  // drains it, so it fills up while Discovery is busy, e.g. during a burst of
+  // new endpoints. A command that does not fit must not be dropped: Discovery
+  // would never announce that endpoint, so no remote participant would match
+  // it. A blocking send is not an option either: Discovery blocks on its
+  // notification channel to this thread when that is full, and then each
+  // thread would wait for the other. So the rest stays queued, and the event
+  // loop calls this again on every iteration.
+  fn send_pending_discovery_commands(&mut self) {
+    while let Some(command) = self.pending_discovery_commands.pop_front() {
+      match self.discovery_command_sender.try_send(command) {
+        Ok(()) => {}
+        Err(mio_channel::TrySendError::Full(command)) => {
+          self.pending_discovery_commands.push_front(command);
+          break;
+        }
+        // Discovery stops before the event loop when the participant shuts down.
+        Err(mio_channel::TrySendError::Disconnected(_)) => {
+          info!(
+            "Discovery has stopped. Dropping {} command(s) about new local endpoints.",
+            self.pending_discovery_commands.len() + 1
+          );
+          self.pending_discovery_commands.clear();
+          self.pending_discovery_commands_since = None;
+          self.pending_discovery_commands_warned = false;
+          return;
+        }
+        // The command is in the channel, only waking up Discovery failed.
+        Err(mio_channel::TrySendError::Io(e)) => {
+          error!("Failed to wake up Discovery for a new local endpoint: {e}");
+        }
+      }
+    }
+
+    // A Discovery that has stopped taking commands would otherwise show only in
+    // the debug log, while the waiting endpoints stay unannounced. Warn once
+    // per wait, and say when it is over.
+    if self.pending_discovery_commands.is_empty() {
+      if let Some(since) = self.pending_discovery_commands_since.take() {
+        if self.pending_discovery_commands_warned {
+          info!(
+            "Discovery has taken the waiting commands about new local endpoints, after {:?}.",
+            since.elapsed()
+          );
+          self.pending_discovery_commands_warned = false;
+        }
+      }
+    } else {
+      let since = *self
+        .pending_discovery_commands_since
+        .get_or_insert_with(Instant::now);
+      if !self.pending_discovery_commands_warned
+        && since.elapsed() >= DISCOVERY_COMMAND_WAIT_WARNING
+      {
+        warn!(
+          "Commands about new local endpoints have been waiting for room in Discovery's command \
+           channel for {:?}, {} now. Discovery announces these endpoints only when it takes their \
+           commands.",
+          since.elapsed(),
+          self.pending_discovery_commands.len()
+        );
+        self.pending_discovery_commands_warned = true;
+      }
     }
   }
 }
@@ -1386,6 +1475,7 @@ mod tests {
       with_key::simpledatareader::ReaderCommand,
     },
     mio_source,
+    structure::{dds_cache::TopicCache, guid::EntityKind},
   };
 
   //#[test]
@@ -1534,6 +1624,179 @@ mod tests {
     info!("\nsending end token\n");
     sender_stop.send(0).unwrap();
     child.join().unwrap();
+  }
+
+  // A DPEventLoop without UDP listeners. The channel ends that the tests do not
+  // use stay open, because the event loop stops or logs errors when they close.
+  fn test_event_loop(
+    participant_guid: GUID,
+    dds_cache: Arc<RwLock<DDSCache>>,
+    add_reader_receiver: mio_channel::Receiver<ReaderIngredients>,
+    stop_poll_receiver: mio_channel::Receiver<EventLoopCommand>,
+    discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
+  ) -> DPEventLoop {
+    let (remove_reader_sender, remove_reader_receiver) = mio_channel::channel::<GUID>();
+    let (add_writer_sender, add_writer_receiver) = mio_channel::channel::<WriterIngredients>();
+    let (remove_writer_sender, remove_writer_receiver) = mio_channel::channel::<GUID>();
+    let (discovery_update_notification_sender, discovery_update_notification_receiver) =
+      mio_channel::channel();
+    let (spdp_liveness_sender, spdp_liveness_receiver) = mio_channel::sync_channel(8);
+    let (participant_status_sender, participant_status_receiver) = sync_status_channel(16).unwrap();
+    let (discovery_db_event_sender, discovery_db_event_receiver) =
+      mio_channel::sync_channel::<()>(4);
+    std::mem::forget((
+      remove_reader_sender,
+      add_writer_sender,
+      remove_writer_sender,
+      discovery_update_notification_sender,
+      spdp_liveness_receiver,
+      participant_status_receiver,
+      discovery_db_event_receiver,
+    ));
+
+    let discovery_db = Arc::new(RwLock::new(DiscoveryDB::new(
+      participant_guid,
+      discovery_db_event_sender,
+      participant_status_sender.clone(),
+    )));
+    DPEventLoop::new(
+      DomainInfo {
+        domain_participant_guid: participant_guid,
+        domain_id: 0,
+        participant_id: 0,
+      },
+      dds_cache,
+      HashMap::new(),
+      discovery_db,
+      participant_guid.prefix,
+      TokenReceiverPair {
+        token: ADD_READER_TOKEN,
+        receiver: add_reader_receiver,
+      },
+      TokenReceiverPair {
+        token: REMOVE_READER_TOKEN,
+        receiver: remove_reader_receiver,
+      },
+      TokenReceiverPair {
+        token: ADD_WRITER_TOKEN,
+        receiver: add_writer_receiver,
+      },
+      TokenReceiverPair {
+        token: REMOVE_WRITER_TOKEN,
+        receiver: remove_writer_receiver,
+      },
+      stop_poll_receiver,
+      discovery_update_notification_receiver,
+      discovery_command_sender,
+      spdp_liveness_sender,
+      participant_status_sender,
+      None,
+      None,
+      0,
+      true,
+    )
+    .expect("DPEventLoop::new in test")
+  }
+
+  // Ingredients of a reader as a DataReader leaves them, with the DataReader's
+  // channel ends kept open.
+  fn test_reader_ingredients(
+    guid: GUID,
+    topic_cache: &Arc<Mutex<TopicCache>>,
+  ) -> ReaderIngredients {
+    let (notification_sender, notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (_poll_event_source, poll_event_sender) = mio_source::make_poll_channel().unwrap();
+    let (status_sender, status_receiver) = sync_status_channel::<DataReaderStatus>(4).unwrap();
+    let (reader_command_sender, reader_command_receiver) =
+      mio_channel::sync_channel::<ReaderCommand>(10);
+    std::mem::forget((
+      notification_receiver,
+      status_receiver,
+      reader_command_sender,
+    ));
+    ReaderIngredients {
+      guid,
+      notification_sender,
+      status_sender,
+      topic_cache_handle: topic_cache.clone(),
+      topic_name: "test".to_string(),
+      like_stateless: false,
+      qos_policy: QosPolicies::qos_none(),
+      data_reader_command_receiver: reader_command_receiver,
+      data_reader_waker: Arc::new(Mutex::new(None)),
+      poll_event_sender,
+      security_plugins: None,
+    }
+  }
+
+  // The event loop tells Discovery about each new local endpoint over
+  // Discovery's bounded command channel, and Discovery announces the endpoint
+  // over SEDP only when it gets that command. Here the channel has room for one
+  // command when three readers are added, as when Discovery is busy while a
+  // node creates its endpoints. Discovery must still learn about all three.
+  #[test]
+  fn every_new_local_endpoint_is_announced_to_discovery() {
+    let (discovery_command_sender, discovery_command_receiver) =
+      mio_channel::sync_channel::<DiscoveryCommand>(1);
+    let (add_reader_sender, add_reader_receiver) = mio_channel::channel::<ReaderIngredients>();
+    let (stop_poll_sender, stop_poll_receiver) = mio_channel::channel();
+    let participant_guid = GUID::new_participant_guid();
+    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let mut event_loop = test_event_loop(
+      participant_guid,
+      Arc::clone(&dds_cache),
+      add_reader_receiver,
+      stop_poll_receiver,
+      discovery_command_sender,
+    );
+
+    let topic_cache = dds_cache.write().unwrap().add_new_topic(
+      "test".to_string(),
+      TypeDesc::new("test_type".to_string()),
+      &QosPolicies::qos_none(),
+    );
+    let readers: Vec<GUID> = (1..=3)
+      .map(|i| {
+        GUID::new(
+          participant_guid.prefix,
+          EntityId::create_custom_entity_id([0, 0, i], EntityKind::READER_WITH_KEY_USER_DEFINED),
+        )
+      })
+      .collect();
+    for guid in &readers {
+      add_reader_sender
+        .send(test_reader_ingredients(*guid, &topic_cache))
+        .unwrap();
+    }
+    // Add the readers here, as the event loop does on their event, so that all
+    // three commands have been tried before Discovery takes the first one.
+    event_loop.handle_reader_action(
+      &Event::new(Ready::readable(), ADD_READER_TOKEN),
+      &mut Vec::new(),
+    );
+
+    // Discovery takes the commands as they come, then stops the event loop.
+    let expected = readers.len();
+    let discovery = thread::spawn(move || {
+      let mut announced = Vec::new();
+      let deadline = Instant::now() + Duration::from_secs(5);
+      while announced.len() < expected && Instant::now() < deadline {
+        match discovery_command_receiver.try_recv() {
+          Ok(DiscoveryCommand::AddLocalReader { guid }) => announced.push(guid),
+          Ok(_) => {}
+          Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+      }
+      stop_poll_sender.send(EventLoopCommand::Stop).unwrap();
+      announced
+    });
+    event_loop.event_loop();
+    let announced = discovery.join().unwrap();
+
+    assert_eq!(
+      announced, readers,
+      "Discovery was told only about some of the new local readers"
+    );
   }
 
   // TODO: Rewrite / remove this test - all asserts in it use
