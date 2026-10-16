@@ -1678,7 +1678,12 @@ mod tests {
       header::Header, protocol_id::ProtocolId, protocol_version::ProtocolVersion,
       submessages::submessages::*, vendor_id::VendorId,
     },
-    network::{constant::user_traffic_unicast_port, udp_sender::UDPSender},
+    network::{
+      constant::{
+        spdp_well_known_unicast_port, user_traffic_multicast_port, user_traffic_unicast_port,
+      },
+      udp_sender::UDPSender,
+    },
     rtps::{submessage::*, Message},
     serialization::CDRSerializerAdapter,
     structure::{
@@ -1686,7 +1691,7 @@ mod tests {
       locator::Locator,
       sequence_number::{SequenceNumber, SequenceNumberSet},
     },
-    test::random_data::RandomData,
+    test::{random_data::RandomData, test_domain::test_domain_id},
   };
   use super::DomainParticipant;
 
@@ -1695,17 +1700,21 @@ mod tests {
   fn dp_basic_domain_participant() {
     // let _dp = DomainParticipant::new();
 
-    let sender = UDPSender::new(11401).unwrap();
+    let sender = UDPSender::new(user_traffic_multicast_port(test_domain_id(16))).unwrap();
     let data: Vec<u8> = vec![0, 1, 2, 3, 4];
 
-    let addrs = vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 7412)];
+    let addrs = vec![SocketAddr::new(
+      "127.0.0.1".parse().unwrap(),
+      spdp_well_known_unicast_port(test_domain_id(0), 1),
+    )];
     sender.send_to_all(&data, &addrs);
 
     // TODO: get result data from Reader
   }
   #[test]
   fn dp_writer_heartbeat_test() {
-    let domain_participant = DomainParticipant::new(0).expect("Participant creation failed!");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Participant creation failed!");
     let qos = QosPolicies::qos_none();
     let _default_dw_qos = QosPolicies::qos_none();
     let publisher = domain_participant
@@ -1729,7 +1738,8 @@ mod tests {
   #[test]
   fn dp_receive_acknack_message_test() {
     // TODO SEND ACKNACK
-    let domain_participant = DomainParticipant::new(0).expect("Failed to create participant");
+    let domain_participant =
+      DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
 
     let qos = QosPolicies::qos_none();
     let _default_dw_qos = QosPolicies::qos_none();
@@ -1751,7 +1761,7 @@ mod tests {
       .create_datawriter::<RandomData, CDRSerializerAdapter<RandomData, LittleEndian>>(&topic, None)
       .expect("Failed to create datawriter");
 
-    let port_number: u16 = user_traffic_unicast_port(5, 0);
+    let port_number: u16 = user_traffic_unicast_port(test_domain_id(5), 0);
     let sender = UDPSender::new(1234).unwrap();
     let mut m: Message = Message::default();
 
