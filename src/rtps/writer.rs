@@ -29,9 +29,10 @@ use crate::{
   polling::SharedTimer,
   rtps::{
     constant::{
-      DEFAULT_WRITER_MAX_SAMPLES, FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, FRAGMENT_SIZE,
-      HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW, HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE,
-      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION,
+      BUILTIN_REPAIR_MAX_SAMPLES_PER_ROUND, DEFAULT_WRITER_MAX_SAMPLES,
+      FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, FRAGMENT_SIZE, HEARTBEAT_PERIOD_FAST,
+      HEARTBEAT_PERIOD_SLOW, HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE, NACK_RESPONSE_DELAY,
+      NACK_SUPPRESSION_DURATION,
     },
     outbound::{SocketId, TrafficClass},
     rtps_reader_proxy::RtpsReaderProxy,
@@ -460,22 +461,8 @@ impl Writer {
       TimedEvent::SendRepairData {
         to_reader: reader_guid,
       } => {
-        self.handle_repair_data_send(reader_guid);
-        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-          if rp.repair_mode {
-            let delay_to_next_repair = self
-              .qos_policies
-              .deadline()
-              .map_or_else(|| Duration::from_millis(1), |dl| dl.0)
-              / 5;
-            self.schedule_timed_event(
-              std::time::Duration::from(delay_to_next_repair),
-              TimedEvent::SendRepairData {
-                to_reader: reader_guid,
-              },
-            );
-          }
-        }
+        self.handle_repair_data_send(reader_guid, self.repair_samples_per_round());
+        self.continue_repair_data_send(reader_guid);
       }
       TimedEvent::SendRepairFrags {
         to_reader: reader_guid,
@@ -1234,12 +1221,14 @@ impl Writer {
         }
 
         // Built-in writers repair synchronously (see note above): the missed
-        // sample is retransmitted now, on this ACKNACK event, without waiting
+        // samples are retransmitted now, on this ACKNACK event, without waiting
         // for the (starvable) shared timer. `handle_repair_data_send` detaches
         // and re-inserts the reader proxy internally, so it must run after the
-        // borrows above are released.
+        // borrows above are released. A reader that is owed more than one
+        // round's worth continues on SendRepairData, like a user writer's.
         if do_immediate_repair {
-          self.handle_repair_data_send(reader_guid);
+          self.handle_repair_data_send(reader_guid, self.repair_samples_per_round());
+          self.continue_repair_data_send(reader_guid);
         }
       } // AckNack
       AckSubmessage::NackFrag(ref nackfrag) => {
@@ -1292,7 +1281,43 @@ impl Writer {
 
   // Send out missing data
 
-  fn handle_repair_data_send(&mut self, to_reader: GUID) {
+  // How many of a reader's unsent changes one repair round sends. A user
+  // writer sends one per SendRepairData event and re-arms the event while the
+  // reader is in repair mode. A built-in writer repairs on the ACKNACK itself
+  // (see handle_ack_nack), so it sends the whole request there, up to
+  // BUILTIN_REPAIR_MAX_SAMPLES_PER_ROUND.
+  fn repair_samples_per_round(&self) -> usize {
+    if self.my_guid.entity_id.kind().is_built_in() {
+      BUILTIN_REPAIR_MAX_SAMPLES_PER_ROUND
+    } else {
+      1
+    }
+  }
+
+  // If the reader is still in repair mode after a round, schedule the next
+  // round.
+  fn continue_repair_data_send(&mut self, to_reader: GUID) {
+    // A user writer continues after a fifth of its Deadline period, or of 1 ms
+    // without a Deadline. The built-in QoS has an infinite Deadline, which
+    // would put the next round years away, so built-in writers use the 1 ms.
+    let deadline = if self.my_guid.entity_id.kind().is_built_in() {
+      None
+    } else {
+      self.qos_policies.deadline().map(|dl| dl.0)
+    };
+    let delay_to_next_repair = deadline.unwrap_or_else(|| Duration::from_millis(1)) / 5;
+    if let Some(rp) = self.lookup_reader_proxy_mut(to_reader) {
+      if rp.repair_mode {
+        self.schedule_timed_event(
+          std::time::Duration::from(delay_to_next_repair),
+          TimedEvent::SendRepairData { to_reader },
+        );
+      }
+    }
+  }
+
+  // Send up to `max_samples` of the reader's unsent changes.
+  fn handle_repair_data_send(&mut self, to_reader: GUID, max_samples: usize) {
     if self.like_stateless {
       warn!(
         "Not sending repair data in a stateless-like Writer, since it currently supports only \
@@ -1308,7 +1333,14 @@ impl Writer {
       // We use a worker function to ensure that afterwards we can insert the
       // reader_proxy back. This technique ensures that all return paths lead to
       // re-insertion.
-      self.handle_repair_data_send_worker(&mut reader_proxy);
+      // Each worker call sends (as DATA or GAP) the first unsent change, or,
+      // when there is none left, switches repair mode off.
+      for _ in 0..max_samples {
+        self.handle_repair_data_send_worker(&mut reader_proxy);
+        if !reader_proxy.repair_mode {
+          break;
+        }
+      }
       // insert reader back
       if let Some(rp) = self
         .readers
@@ -2570,5 +2602,241 @@ mod tests {
 
     thread::sleep(std::time::Duration::from_millis(100));
     info!("writerResult:  {write_result:?}");
+  }
+
+  // Repair (ACKNACK response) tests. The Writer runs without an event loop and
+  // its matched reader has no locators, so nothing goes on the wire, but the
+  // repair bookkeeping (the reader proxy's unsent changes, its repair mode and
+  // the SendRepairData timer) runs as it does in a DomainParticipant.
+  mod repair {
+    use std::{
+      cell::RefCell,
+      rc::Rc,
+      time::{Duration as StdDuration, Instant},
+    };
+
+    use super::super::*;
+    use crate::{
+      dds::{
+        ddsdata::DDSData,
+        qos::{policy::Durability, QosPolicyBuilder},
+        statusevents::{sync_status_channel, StatusChannelReceiver},
+        with_key::datawriter::WriteOptions,
+      },
+      discovery::discovery::Discovery,
+      messages::submessages::{
+        elements::serialized_payload::SerializedPayload, submessages::AckNack,
+      },
+      polling::new_shared_timer,
+      rtps::writer_send_buffer::Admission,
+      structure::{guid::EntityKind, sequence_number::SequenceNumberSet},
+      RepresentationIdentifier,
+    };
+
+    struct Fixture {
+      writer: Writer,
+      reader_guid: GUID,
+      timer: SharedTimer<DpTimerEvent>,
+      _status: StatusChannelReceiver<DataWriterStatus>,
+      _participant_status: StatusChannelReceiver<DomainParticipantStatusEvent>,
+    }
+
+    impl Fixture {
+      // A reliable Writer that holds samples 1..=sample_count and is matched
+      // with one remote reader.
+      fn new(
+        writer_id: EntityId,
+        writer_qos: QosPolicies,
+        reader_id: EntityId,
+        reader_qos: &QosPolicies,
+        sample_count: i64,
+      ) -> Self {
+        let guid = GUID::new(GuidPrefix::new(&[1; 12]), writer_id);
+        let send_buffer = WriterSendBuffer::new(
+          guid,
+          "repair_test".to_string(),
+          true, // reliable
+          writer_id.kind().is_built_in(),
+          false, // TransientLocal: keep the history for late joiners
+          DEFAULT_WRITER_MAX_SAMPLES,
+          DEFAULT_WRITER_MAX_SAMPLES,
+          DEFAULT_WRITER_MAX_SAMPLES,
+        );
+        for _ in 0..sample_count {
+          let data = DDSData::new(SerializedPayload::new(
+            RepresentationIdentifier::CDR_LE,
+            vec![0; 8],
+          ));
+          assert!(matches!(
+            send_buffer.admit_blocking(WriteOptions::default(), data, Some(StdDuration::ZERO)),
+            Admission::Admitted(_)
+          ));
+        }
+        let (doorbell_registration, doorbell) = Registration::new2();
+        let (status_sender, status) = sync_status_channel(4).unwrap();
+        let (participant_status_sender, participant_status) = sync_status_channel(16).unwrap();
+        let timer = new_shared_timer();
+        let mut writer = Writer::new(
+          WriterIngredients {
+            guid,
+            send_buffer,
+            doorbell_registration,
+            doorbell,
+            topic_name: "repair_test".to_string(),
+            like_stateless: false,
+            qos_policies: writer_qos,
+            status_sender,
+            security_plugins: None,
+          },
+          Rc::new(UDPSender::new(0).unwrap()),
+          Rc::clone(&timer),
+          participant_status_sender,
+          Rc::new(RefCell::new(InterfaceObservations::default())),
+          Rc::from(Vec::<IfAddr>::new()),
+        );
+        let reader_guid = GUID::new(GuidPrefix::new(&[2; 12]), reader_id);
+        writer.update_reader_proxy(
+          &RtpsReaderProxy::new(reader_guid, reader_qos.clone(), false),
+          reader_qos,
+        );
+        assert!(
+          writer.readers.contains_key(&reader_guid),
+          "reader did not match"
+        );
+        Self {
+          writer,
+          reader_guid,
+          timer,
+          _status: status,
+          _participant_status: participant_status,
+        }
+      }
+
+      // A built-in SEDP publications Writer and a remote SEDP publications
+      // reader, with the QoS Discovery gives them.
+      fn sedp(sample_count: i64) -> Self {
+        Self::new(
+          EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER,
+          Discovery::builtin_publisher_qos(),
+          EntityId::SEDP_BUILTIN_PUBLICATIONS_READER,
+          &Discovery::builtin_subscriber_qos(),
+          sample_count,
+        )
+      }
+
+      fn reader_proxy(&self) -> &RtpsReaderProxy {
+        &self.writer.readers[&self.reader_guid]
+      }
+
+      fn unsent(&self) -> usize {
+        self.reader_proxy().unsent_changes_count()
+      }
+
+      // The reader has received nothing and requests `requested`.
+      fn ack_nack(&mut self, requested: impl IntoIterator<Item = i64>) {
+        let requested: BTreeSet<SequenceNumber> =
+          requested.into_iter().map(SequenceNumber::new).collect();
+        let ack_nack = AckNack {
+          reader_id: self.reader_guid.entity_id,
+          writer_id: self.writer.my_guid.entity_id,
+          reader_sn_state: SequenceNumberSet::from_base_and_set(SequenceNumber::new(1), &requested),
+          count: 1,
+        };
+        self
+          .writer
+          .handle_ack_nack(self.reader_guid.prefix, &AckSubmessage::AckNack(ack_nack));
+      }
+
+      // The next SendRepairData timeout scheduled for our reader, waiting up to
+      // `max_wait` for it to expire. Other timeouts are skipped.
+      fn next_repair_event(&self, max_wait: StdDuration) -> Option<TimedEvent> {
+        let give_up = Instant::now() + max_wait;
+        loop {
+          while let Some(fired) = self.timer.borrow_mut().poll() {
+            if let DpTimerEvent::Writer {
+              event: TimedEvent::SendRepairData { to_reader },
+              ..
+            } = fired
+            {
+              if to_reader == self.reader_guid {
+                return Some(TimedEvent::SendRepairData { to_reader });
+              }
+            }
+          }
+          if Instant::now() >= give_up {
+            return None;
+          }
+          std::thread::sleep(StdDuration::from_millis(1));
+        }
+      }
+    }
+
+    // An ACKNACK that requests a built-in Writer's whole history is answered
+    // in full on that ACKNACK.
+    #[test]
+    fn builtin_writer_repairs_whole_acknack() {
+      let mut f = Fixture::sedp(40);
+      f.ack_nack(1..=40);
+      assert_eq!(f.unsent(), 0, "samples left unsent after the ACKNACK");
+      assert!(!f.reader_proxy().repair_mode);
+    }
+
+    // A built-in Writer that owes a reader more samples than one round may send
+    // sends BUILTIN_REPAIR_MAX_SAMPLES_PER_ROUND of them on the ACKNACK and
+    // continues with SendRepairData, which sends the rest.
+    #[test]
+    fn builtin_writer_repair_is_capped_per_round_and_continues() {
+      let cap = BUILTIN_REPAIR_MAX_SAMPLES_PER_ROUND as i64;
+      let total = cap + 10;
+      let mut f = Fixture::sedp(total);
+      // The Writer also owes the reader the samples above what one ACKNACK can
+      // request (e.g. new samples it has not pushed yet).
+      let rp = f.writer.lookup_reader_proxy_mut(f.reader_guid).unwrap();
+      for sn in 1..=total {
+        rp.notify_new_cache_change(SequenceNumber::new(sn));
+      }
+      f.ack_nack(1..=cap);
+      assert_eq!(f.unsent(), 10);
+      assert!(f.reader_proxy().repair_mode);
+
+      let event = f
+        .next_repair_event(StdDuration::from_secs(5))
+        .expect("SendRepairData was not scheduled for the rest");
+      f.writer.handle_timed_event(event);
+      assert_eq!(f.unsent(), 0);
+      assert!(!f.reader_proxy().repair_mode);
+    }
+
+    // User Writers keep their repair pacing: the ACKNACK schedules
+    // SendRepairData after nack_response_delay, and each SendRepairData sends
+    // one sample and re-arms itself while the reader is in repair mode.
+    #[test]
+    fn user_writer_repairs_one_sample_per_timer_event() {
+      let qos = QosPolicyBuilder::new()
+        .reliability(Reliability::Reliable {
+          max_blocking_time: Duration::from_millis(100),
+        })
+        .history(History::KeepAll)
+        .durability(Durability::TransientLocal)
+        .build();
+      let mut f = Fixture::new(
+        EntityId::new([0, 0, 1], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+        qos.clone(),
+        EntityId::new([0, 0, 2], EntityKind::READER_WITH_KEY_USER_DEFINED),
+        &qos,
+        5,
+      );
+      f.ack_nack(1..=5);
+      assert_eq!(f.unsent(), 5, "a user Writer repaired on the ACKNACK");
+
+      for unsent_after in (3..=4).rev() {
+        let event = f
+          .next_repair_event(StdDuration::from_secs(5))
+          .expect("SendRepairData was not scheduled");
+        f.writer.handle_timed_event(event);
+        assert_eq!(f.unsent(), unsent_after);
+        assert!(f.reader_proxy().repair_mode);
+      }
+    }
   }
 }
