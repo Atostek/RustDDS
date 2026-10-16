@@ -297,7 +297,11 @@ should be validated manually:
   `from_discovered_reader_data` and `update` split on the way in; a freshly
   inserted proxy (e.g. the inline built-in path) is normalized in
   `matched_reader_update`. `resolve_path_mtu` also scans the bucket so a
-  loopback-only same-host peer inherits the large loopback MTU.
+  loopback-only same-host peer inherits the large loopback MTU. The discovery
+  `ReaderProxy` stores that union, including loopback; only a live
+  `RtpsReaderProxy` splits it. `ReaderProxy::from` chains
+  `loopback_unicast_locators` back into `unicast_locator_list`. Dropping the
+  bucket would store a loopback-only reader with no address.
 - **Same-host detection.** `ObservedRoutes::seen_from_loopback` is set (sticky)
   when any packet from a participant arrives from a loopback source address,
   exposed via `is_same_host()`.

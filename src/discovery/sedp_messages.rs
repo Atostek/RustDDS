@@ -135,6 +135,10 @@ impl ReaderProxy {
 
 impl From<RtpsReaderProxy> for ReaderProxy {
   fn from(rtps_reader_proxy: RtpsReaderProxy) -> Self {
+    // The discovery record stores the announced union, including loopback.
+    // `RtpsReaderProxy::from_discovered_reader_data` splits that list again
+    // before anything is sent, so the loopback bucket must be chained back in
+    // here. Dropping it stores a loopback-only reader with no address.
     Self {
       remote_reader_guid: rtps_reader_proxy.remote_reader_guid,
       expects_inline_qos: rtps_reader_proxy.expects_inline_qos(),
