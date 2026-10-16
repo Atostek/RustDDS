@@ -5,7 +5,7 @@ use std::{
 };
 
 use enumflags2::BitFlags;
-use mio_extras::{channel as mio_channel, channel::TrySendError};
+use mio_extras::channel as mio_channel;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use bytes::Bytes;
@@ -111,7 +111,7 @@ pub(crate) struct MessageReceiver {
   pub available_readers: BTreeMap<EntityId, Reader>,
   // GuidPrefix sent in this channel needs to be RTPSMessage source_guid_prefix. Writer needs this
   // to locate RTPSReaderProxy if negative acknack.
-  acknack_sender: mio_channel::SyncSender<(GuidPrefix, AckSubmessage)>,
+  acknack_sender: mio_channel::Sender<(GuidPrefix, AckSubmessage)>,
   // We send notification of remote DomainParticipant liveness to Discovery to
   // bypass Reader, DDSCache, DatasampleCache, and DataReader, because these will drop
   // repeated messages with duplicate SequenceNumbers, but Discovery needs to see them.
@@ -145,7 +145,7 @@ pub(crate) struct MessageReceiver {
 impl MessageReceiver {
   pub fn new(
     participant_guid_prefix: GuidPrefix,
-    acknack_sender: mio_channel::SyncSender<(GuidPrefix, AckSubmessage)>,
+    acknack_sender: mio_channel::Sender<(GuidPrefix, AckSubmessage)>,
     spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
     security_plugins: Option<SecurityPluginsHandle>,
     interface_observations: Rc<RefCell<InterfaceObservations>>,
@@ -862,33 +862,25 @@ impl MessageReceiver {
     match submessage {
       ReaderSubmessage::AckNack(acknack, _) => {
         // Note: This must not block, because the receiving end is the same thread,
-        // i.e. blocking here is an instant deadlock.
-        match self
+        // i.e. blocking here is an instant deadlock. The pipe is unbounded, so the
+        // send neither blocks nor discards the ACKNACK.
+        if let Err(e) = self
           .acknack_sender
-          .try_send((self.source_guid_prefix, AckSubmessage::AckNack(acknack)))
+          .send((self.source_guid_prefix, AckSubmessage::AckNack(acknack)))
         {
-          Ok(_) => (),
-          Err(TrySendError::Full(_)) => {
-            info!("AckNack pipe full. Looks like I am very busy. Discarding submessage.");
-          }
-          Err(e) => warn!("AckNack pipe fail: {e:?}"),
+          warn!("AckNack pipe fail: {e:?}");
         }
       }
 
       ReaderSubmessage::NackFrag(nackfrag, _) => {
         // Forward the fragment retransmission request to the target writer, the
         // same way AckNack is forwarded. The writer handles it via
-        // `AckSubmessage::NackFrag` (scheduling repair-fragment sends). Must not
-        // block: the receiving end is on this same thread.
-        match self
+        // `AckSubmessage::NackFrag` (scheduling repair-fragment sends).
+        if let Err(e) = self
           .acknack_sender
-          .try_send((self.source_guid_prefix, AckSubmessage::NackFrag(nackfrag)))
+          .send((self.source_guid_prefix, AckSubmessage::NackFrag(nackfrag)))
         {
-          Ok(_) => (),
-          Err(TrySendError::Full(_)) => {
-            info!("NackFrag pipe full. Looks like I am very busy. Discarding submessage.");
-          }
-          Err(e) => warn!("NackFrag pipe fail: {e:?}"),
+          warn!("NackFrag pipe fail: {e:?}");
         }
       }
     }
@@ -1187,8 +1179,7 @@ mod tests {
     );
 
     // Create a message receiver
-    let (acknack_sender, _acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(10);
+    let (acknack_sender, _acknack_receiver) = mio_channel::channel::<(GuidPrefix, AckSubmessage)>();
     let (spdp_liveness_sender, _spdp_liveness_receiver) = mio_channel::sync_channel(8);
     let mut message_receiver = MessageReceiver::new(
       target_gui_prefix,
@@ -1315,8 +1306,7 @@ mod tests {
     ]);
 
     let guid_new = GUID::default();
-    let (acknack_sender, _acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(10);
+    let (acknack_sender, _acknack_receiver) = mio_channel::channel::<(GuidPrefix, AckSubmessage)>();
     let (spdp_liveness_sender, _spdp_liveness_receiver) = mio_channel::sync_channel(8);
     let mut message_receiver = MessageReceiver::new(
       guid_new.prefix,
