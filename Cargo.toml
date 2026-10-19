@@ -90,7 +90,7 @@ futures = "0.3.28"
 # selection. `default-features = false` drops the `gateway` feature (default
 # route / gateway lookup, which pulls in netlink on Linux); we only need
 # `get_interfaces()`.
-netdev = { version = "0.45", default-features = false }
+netdev = { version = "0.46", default-features = false }
 
 # For DDS Security:
 serde-xml-rs = { version = "0.6" , optional = true } # for reading spec-mandated XML config files
