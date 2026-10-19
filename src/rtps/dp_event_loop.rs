@@ -182,8 +182,12 @@ impl DPEventLoop {
     }
 
     let poll = try_init!(Poll::new(), "Unable to create new poll");
+    // Both ends are this thread, and the channel is drained completely when its
+    // readiness event runs. Until then each of the four listeners can deliver
+    // MAX_LISTENER_MESSAGES_PER_POLL datagrams, and a datagram can carry several
+    // ACKNACKs. 1024 absorbs that burst; a still larger one is discarded.
     let (acknack_sender, acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(100);
+      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(1024);
     let mut udp_listeners = udp_listeners;
     for (token, listener) in &mut udp_listeners {
       try_init!(

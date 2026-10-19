@@ -293,8 +293,14 @@ impl DomainParticipantBuilder {
     // * Participant commands Discovery to assert liveness, i.e. send liveness
     // message to remote participants.
     // * Discovery commands Discovery (thread) to terminate on exit.
+    // Capacity 1024 absorbs a few hundred endpoints created while Discovery is
+    // busy, including while it blocks on the 32-slot notification channel back
+    // to the event loop. Each create_datareader / create_datawriter enqueues
+    // AddTopic plus AddLocalReader or AddLocalWriter, and try_send drops a
+    // command that does not fit, so Discovery never announces that endpoint.
+    // A still larger burst is dropped.
     let (discovery_command_sender, discovery_command_receiver) =
-      mio_channel::sync_channel::<DiscoveryCommand>(64);
+      mio_channel::sync_channel::<DiscoveryCommand>(1024);
 
     // Channel used to report noteworthy events to DomainParticipant.
     // Capacity must be large enough to absorb the SEDP burst when multiple
