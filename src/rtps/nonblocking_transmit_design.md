@@ -143,9 +143,30 @@ even across several concurrently-sending large writers.
 
 ### 5.3 NACK-driven repair
 
-The repair path (`handle_repair_data_send_worker`) also emits many DATAFRAGs when
-a reader NACKs missing fragments. It reuses the same bulk queue and `(seq, frag)`
-cursor treatment, so repair of large samples is likewise resumable and fair.
+Repair DATA, DATAFRAG and GAP go through the never-dropped **control** queue:
+dropping a repair on `WouldBlock` would livelock under sustained congestion (the
+reader re-NACKs, the retransmit is dropped again). Pacing replaces dropping:
+
+- Every reliable writer, built-in or user, answers an ACKNACK after
+  `nack_response_delay` (200 ms, RTPS v2.5 Section 8.4.7.1.1) with a
+  `SendRepairData` timer. A reader has at most one repair timer pending
+  (`RtpsReaderProxy::repair_data_scheduled`), so ACKNACKs that arrive meanwhile
+  are served by the same round.
+- One round sends the reader's unsent changes, lowest first, until
+  `REPAIR_BATCH_MAX_BYTES` (8 KiB) have gone out, at least one change. GAPs and
+  unfragmented DATA are packed into unicast datagrams of the reader's path-MTU
+  budget; a fragmented sample goes out on its own and its fragments are then
+  repaired by `SendRepairFrags`, 8 per round.
+- While the reader is still behind, the next round follows after the repair
+  interval: a fifth of the writer's Deadline, clamped to 1..100 ms, or 10 ms
+  without a finite positive Deadline (`REPAIR_INTERVAL_*` in
+  `src/rtps/constant.rs`).
+- Before a round, the writer checks whether the socket the repair would use
+  already has queued control datagrams (`UDPSender::control_backlogged`). If so
+  it sends nothing and tries again after the repair interval, so a congested
+  link sees at most one round's worth of repair queued at a time.
+- An ACKNACK or NACK_FRAG with the same `count` as the previous one from that
+  reader is a copy (readers send one to each writer locator) and is ignored.
 
 ## 6. Application back-pressure
 
@@ -262,9 +283,10 @@ The implementation follows this design with a few deliberate simplifications:
   at admission and drop the sample on socket `WouldBlock` instead of holding it;
   the flag has no effect on reliable writers.
 - NACK-driven repair (`handle_repair_data_send_worker`,
-  `handle_repair_frags_send_worker`) sends DATA/DATAFRAG as bulk but simply
-  drops on WouldBlock: the reader re-NACKs, so repair is self-healing and never
-  buffers or stalls. Only the push path (`process_pending`) is resumable.
+  `handle_repair_frags_send_worker`) sends through the control queue and is
+  paced instead of resumable: byte-limited rounds on the repair interval, held
+  back while the target socket has queued control (section 5.3). Only the push
+  path (`process_pending`) is resumable.
 - Write-readiness registration uses `mio_06::unix::EventedFd` over the mio_08
   sender sockets' raw fds (level-triggered, armed on demand). On non-unix the
   loop falls back to draining the queues each iteration with a short poll

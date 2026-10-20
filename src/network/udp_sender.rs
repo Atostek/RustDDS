@@ -296,6 +296,26 @@ impl UDPSender {
     true
   }
 
+  /// Whether socket `id` currently has queued (undelivered) control datagrams.
+  pub(crate) fn control_backlogged(&self, id: SocketId) -> bool {
+    self.control_queue_nonempty(id)
+  }
+
+  /// Queue a datagram on socket `id` without sending, as if the socket had
+  /// returned WouldBlock.
+  #[cfg(test)]
+  pub(crate) fn inject_control_backlog(&self, id: SocketId) {
+    self
+      .control_queues
+      .borrow_mut()
+      .entry(id)
+      .or_default()
+      .push_back(Datagram {
+        addr: SocketAddr::from(([127, 0, 0, 1], 9)),
+        bytes: vec![0; 4],
+      });
+  }
+
   /// Sockets that currently have queued (undelivered) control datagrams.
   pub(crate) fn pending_control_sockets(&self) -> Vec<SocketId> {
     self

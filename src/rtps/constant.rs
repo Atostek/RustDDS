@@ -22,6 +22,20 @@ pub const CACHE_CLEAN_PERIOD: Duration = Duration::from_secs(4);
 pub const NACK_RESPONSE_DELAY: Duration = Duration::from_millis(200);
 pub const NACK_SUPPRESSION_DURATION: Duration = Duration::from_millis(0);
 
+// Time between two repair rounds (SendRepairData, SendRepairFrags) for one
+// reader, and the backoff while the reader's send socket has queued control
+// datagrams. A Writer with a finite, positive Deadline uses a fifth of it,
+// clamped to [REPAIR_INTERVAL_MIN, REPAIR_INTERVAL_MAX]; otherwise (no
+// Deadline, INFINITE, zero) REPAIR_INTERVAL_DEFAULT. The minimum keeps a short
+// Deadline from flooding slow links with back-to-back repair rounds.
+pub const REPAIR_INTERVAL_DEFAULT: Duration = Duration::from_millis(10);
+pub const REPAIR_INTERVAL_MIN: Duration = Duration::from_millis(1);
+pub const REPAIR_INTERVAL_MAX: Duration = Duration::from_millis(100);
+
+// Most bytes of DATA, DATAFRAG and GAP submessages one repair round sends to
+// one reader. A round always sends at least one sample, even a larger one.
+pub const REPAIR_BATCH_MAX_BYTES: usize = 8192;
+
 // Periodic HEARTBEAT period for reliable Writers. The period is adaptive: while
 // some matched reader is behind (has unacknowledged samples), heartbeats are
 // sent at the FAST period to prompt prompt repair (some peers rely on a

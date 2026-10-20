@@ -71,6 +71,14 @@ pub(crate) struct RtpsReaderProxy {
   // true = send repair data messages due to NACKs, buffer messages by DataWriter
   // false = send data messages directly from DataWriter
   pub repair_mode: bool,
+  // A SendRepairData / SendRepairFrags timer for this reader is pending. Keeps
+  // each reader to one repair round at a time, however many ACKNACKs arrive.
+  pub repair_data_scheduled: bool,
+  pub repair_frags_scheduled: bool,
+  // Count of the last ACKNACK / NACK_FRAG accepted from this reader. A reader
+  // sends one ACKNACK to each of our locators; the copies carry the same count.
+  pub last_acknack_count: Option<i32>,
+  pub last_nackfrag_count: Option<i32>,
   qos: QosPolicies,
   frags_requested: BTreeMap<SequenceNumber, BitVec>,
 
@@ -103,6 +111,10 @@ impl RtpsReaderProxy {
       unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
+      repair_data_scheduled: false,
+      repair_frags_scheduled: false,
+      last_acknack_count: None,
+      last_nackfrag_count: None,
       qos,
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
@@ -228,6 +240,10 @@ impl RtpsReaderProxy {
       unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
+      repair_data_scheduled: false,
+      repair_frags_scheduled: false,
+      last_acknack_count: None,
+      last_nackfrag_count: None,
       qos: reader.qos_policy.clone(),
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
@@ -302,6 +318,10 @@ impl RtpsReaderProxy {
       unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
+      repair_data_scheduled: false,
+      repair_frags_scheduled: false,
+      last_acknack_count: None,
+      last_nackfrag_count: None,
       qos: discovered_reader_data.subscription_topic_data.qos(),
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),

@@ -342,6 +342,15 @@ sequenceDiagram
 - Under sustained overload, reliable writers block or drop per
   `max_blocking_time`; readers keep NACKing until repair or GAP.
 
+**RustDDS repair:** built-in (discovery) and user writers repair the same way.
+The first round follows an ACKNACK after `NACK_RESPONSE_DELAY`; each round
+sends up to 8 KiB of the requested samples (at least one), packed into
+path-MTU datagrams; further rounds follow every fifth of the writer's Deadline
+(clamped to 1..100 ms, 10 ms without a usable Deadline) until the reader has
+everything. A round is postponed while the send socket has queued control
+datagrams, and an ACKNACK repeating the previous `count` is ignored. Details:
+`nonblocking_transmit_design.md` section 5.3.
+
 ---
 
 ## 7. Fragmentation (large samples)

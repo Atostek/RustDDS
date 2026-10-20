@@ -31,7 +31,8 @@ use crate::{
     constant::{
       DEFAULT_WRITER_MAX_SAMPLES, FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, FRAGMENT_SIZE,
       HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW, HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE,
-      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION,
+      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION, REPAIR_BATCH_MAX_BYTES,
+      REPAIR_INTERVAL_DEFAULT, REPAIR_INTERVAL_MAX, REPAIR_INTERVAL_MIN,
     },
     outbound::{SocketId, TrafficClass},
     rtps_reader_proxy::RtpsReaderProxy,
@@ -169,7 +170,6 @@ pub(crate) struct Writer {
   /// from a negative acknowledgment.
   pub nack_response_delay: std::time::Duration,
   pub nackfrag_response_delay: std::time::Duration,
-  pub repairfrags_continue_delay: std::time::Duration,
 
   /// Protocol tuning parameter that
   /// allows the RTPS Writer to ignore
@@ -353,7 +353,6 @@ impl Writer {
       cache_cleaning_period,
       nack_response_delay: NACK_RESPONSE_DELAY, // default value from dp_event_loop
       nackfrag_response_delay: NACK_RESPONSE_DELAY, // default value from dp_event_loop
-      repairfrags_continue_delay: std::time::Duration::from_millis(1),
       nack_suppression_duration: NACK_SUPPRESSION_DURATION,
       // Conservative fallback for any discovery advertisement of max sample size.
       data_max_size_serialized: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
@@ -430,6 +429,68 @@ impl Writer {
     );
   }
 
+  // Time between repair rounds for one reader. See REPAIR_INTERVAL_DEFAULT.
+  fn repair_interval(&self) -> std::time::Duration {
+    repair_interval_for(self.qos_policies.deadline().map(|dl| dl.0))
+  }
+
+  // Arm SendRepairData for `reader_guid` unless one is already pending, so one
+  // reader never has two repair rounds running in parallel.
+  fn schedule_repair_data(&mut self, reader_guid: GUID, after: std::time::Duration) {
+    if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
+      if !rp.repair_data_scheduled {
+        rp.repair_data_scheduled = true;
+        self.schedule_timed_event(
+          after,
+          TimedEvent::SendRepairData {
+            to_reader: reader_guid,
+          },
+        );
+      }
+    }
+  }
+
+  // Same as schedule_repair_data, for SendRepairFrags.
+  fn schedule_repair_frags(&mut self, reader_guid: GUID, after: std::time::Duration) {
+    if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
+      if !rp.repair_frags_scheduled {
+        rp.repair_frags_scheduled = true;
+        self.schedule_timed_event(
+          after,
+          TimedEvent::SendRepairFrags {
+            to_reader: reader_guid,
+          },
+        );
+      }
+    }
+  }
+
+  // Whether the socket a unicast repair to this reader goes out on already has
+  // queued control datagrams. Repairs are never dropped, so sending more there
+  // would only lengthen the queue; the round waits for the next interval.
+  fn repair_backlogged(&self, reader_guid: GUID) -> bool {
+    let Some(rp) = self.readers.get(&reader_guid) else {
+      return false;
+    };
+    // Same choice as send_message_to_readers makes for DeliveryMode::Unicast.
+    let route = rp.send_route();
+    let uses_unicast = if route.fallback {
+      rp.unicast_locator_list.iter().any(Locator::is_udp)
+    } else {
+      route.unicast.is_some()
+    };
+    if uses_unicast {
+      self.udp_sender.control_backlogged(SocketId::Unicast)
+    } else {
+      self
+        .udp_sender
+        .socket_ids()
+        .into_iter()
+        .filter(|id| matches!(id, SocketId::Multicast(_)))
+        .any(|id| self.udp_sender.control_backlogged(id))
+    }
+  }
+
   // Handle a single timed event. The shared timer is drained by the event loop,
   // which dispatches each expired event to the addressed Writer.
   pub fn handle_timed_event(&mut self, event: TimedEvent) {
@@ -460,38 +521,40 @@ impl Writer {
       TimedEvent::SendRepairData {
         to_reader: reader_guid,
       } => {
-        self.handle_repair_data_send(reader_guid);
-        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-          if rp.repair_mode {
-            let delay_to_next_repair = self
-              .qos_policies
-              .deadline()
-              .map_or_else(|| Duration::from_millis(1), |dl| dl.0)
-              / 5;
-            self.schedule_timed_event(
-              std::time::Duration::from(delay_to_next_repair),
-              TimedEvent::SendRepairData {
-                to_reader: reader_guid,
-              },
-            );
-          }
+        match self.lookup_reader_proxy_mut(reader_guid) {
+          Some(rp) => rp.repair_data_scheduled = false,
+          None => return, // reader is gone
+        }
+        // Do not add to a send socket that already holds queued control
+        // datagrams: back off and try again in the next round.
+        if !self.repair_backlogged(reader_guid) {
+          self.handle_repair_data_send(reader_guid);
+        }
+        if self
+          .readers
+          .get(&reader_guid)
+          .is_some_and(|rp| rp.repair_mode)
+        {
+          self.schedule_repair_data(reader_guid, self.repair_interval());
         }
       }
       TimedEvent::SendRepairFrags {
         to_reader: reader_guid,
       } => {
-        self.handle_repair_frags_send(reader_guid);
-        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-          if rp.repair_frags_requested() {
-            // more repair needed?
-            self.schedule_timed_event(
-              self.repairfrags_continue_delay,
-              TimedEvent::SendRepairFrags {
-                to_reader: reader_guid,
-              },
-            );
-          } // if
-        } // if let
+        match self.lookup_reader_proxy_mut(reader_guid) {
+          Some(rp) => rp.repair_frags_scheduled = false,
+          None => return, // reader is gone
+        }
+        if !self.repair_backlogged(reader_guid) {
+          self.handle_repair_frags_send(reader_guid);
+        }
+        if self
+          .readers
+          .get(&reader_guid)
+          .is_some_and(RtpsReaderProxy::repair_frags_requested)
+        {
+          self.schedule_repair_frags(reader_guid, self.repair_interval());
+        }
       } // SendRepairFrags
     } // match
   } // fn
@@ -1134,24 +1197,24 @@ impl Writer {
 
         let my_topic = self.my_topic_name.clone(); // for debugging
 
-        // Built-in (discovery) writers must recover a missed sample promptly and
-        // independently of the shared timer: under a flat-out user writer the
-        // timer thread is CPU-starved and the deferred `SendRepairData` timeout
-        // fires late or never, so a NACKed DiscoveredWriterData is never
-        // retransmitted and the remote endpoint stays undiscovered. For built-in
-        // writers we therefore repair synchronously, right here on the ACKNACK
-        // event (which the event loop always services). Discovery is low-volume,
-        // so responding immediately (no nack-batching delay) is cheap.
-        let repair_immediately = self.my_guid.entity_id.kind().is_built_in();
-        let mut do_immediate_repair = false;
+        let mut start_repair = false;
 
         if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
+          if reader_proxy.last_acknack_count == Some(an.count) {
+            trace!(
+              "Ignoring duplicate ACKNACK count={} from {:?} topic={:?}",
+              an.count,
+              reader_guid,
+              my_topic
+            );
+            return;
+          }
+          reader_proxy.last_acknack_count = Some(an.count);
+
           // Mark requested SNs as "unsent changes"
 
           //TODO: We should drop SNs in "pending gap" from unsent changes
           reader_proxy.handle_ack_nack(ack_submessage, last_seq);
-
-          let reader_guid = reader_proxy.remote_reader_guid; // copy to avoid double mut borrow
 
           // Sanity Check: if the reader asked for something we did not even advertise
           // yet. TODO: This
@@ -1192,27 +1255,18 @@ impl Writer {
           if reader_proxy.all_acked_before > last_seq {
             reader_proxy.repair_mode = false;
           } else {
-            reader_proxy.repair_mode = true; // TODO: Is this correct? Do we need to repair immediately?
-            if repair_immediately {
-              // Built-in writer: repair now (see note above), not via the timer.
-              do_immediate_repair = true;
-            } else {
-              // set repair timer to fire
-              // Note: `reader_proxy` holds a mutable borrow of `self`, so we
-              // cannot call the `&self` helper here; access disjoint fields
-              // directly instead.
-              self.timed_event_timer.borrow_mut().set_timeout(
-                self.nack_response_delay,
-                DpTimerEvent::Writer {
-                  entity_id: self.my_guid.entity_id,
-                  event: TimedEvent::SendRepairData {
-                    to_reader: reader_guid,
-                  },
-                },
-              );
-            }
+            reader_proxy.repair_mode = true;
+            start_repair = true;
           }
         } // if have reader_proxy
+
+        // Every Writer, built-in or user, answers after nack_response_delay
+        // (RTPS v2.5 Section 8.4.7.1.1), so that ACKNACKs arriving close
+        // together are served by one repair round. If a round is already
+        // pending, it also serves what this ACKNACK requested.
+        if start_repair {
+          self.schedule_repair_data(reader_guid, self.nack_response_delay);
+        }
 
         // See if we need to respond by GAP message
         if let Some(reader_proxy) = self.readers.get(&reader_guid) {
@@ -1232,28 +1286,24 @@ impl Writer {
             );
           }
         }
-
-        // Built-in writers repair synchronously (see note above): the missed
-        // sample is retransmitted now, on this ACKNACK event, without waiting
-        // for the (starvable) shared timer. `handle_repair_data_send` detaches
-        // and re-inserts the reader proxy internally, so it must run after the
-        // borrows above are released.
-        if do_immediate_repair {
-          self.handle_repair_data_send(reader_guid);
-        }
       } // AckNack
       AckSubmessage::NackFrag(ref nackfrag) => {
         // NackFrag is negative acknowledgement only, i.e. requesting missing fragments.
         let reader_guid = GUID::new(reader_guid_prefix, nackfrag.reader_id);
-        if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
-          reader_proxy.mark_frags_requested(nackfrag.writer_sn, &nackfrag.fragment_number_state);
+        let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) else {
+          return;
+        };
+        if reader_proxy.last_nackfrag_count == Some(nackfrag.count) {
+          trace!(
+            "Ignoring duplicate NACK_FRAG count={} from {:?}",
+            nackfrag.count,
+            reader_guid
+          );
+          return;
         }
-        self.schedule_timed_event(
-          self.nackfrag_response_delay,
-          TimedEvent::SendRepairFrags {
-            to_reader: reader_guid,
-          },
-        );
+        reader_proxy.last_nackfrag_count = Some(nackfrag.count);
+        reader_proxy.mark_frags_requested(nackfrag.writer_sn, &nackfrag.fragment_number_state);
+        self.schedule_repair_frags(reader_guid, self.nackfrag_response_delay);
       }
     }
 
@@ -1343,115 +1393,194 @@ impl Writer {
     }
   }
 
+  // One repair round for a reader: send its unsent changes, lowest first, until
+  // REPAIR_BATCH_MAX_BYTES have gone out (at least one change) or nothing is
+  // left, which ends repair mode. GAPs and unfragmented DATA are packed into
+  // datagrams of the reader's path-MTU budget; a fragmented sample goes out on
+  // its own.
   fn handle_repair_data_send_worker(&mut self, reader_proxy: &mut RtpsReaderProxy) {
     // Note: The reader_proxy is now removed from readers map
     let reader_guid = reader_proxy.remote_reader_guid;
 
     debug!(
-      "Repair data send to {reader_guid:?} due to ACKNACK. ReaderProxy Unsent changes: {:?}",
+      "Repair data send to {reader_guid:?}. ReaderProxy Unsent changes: {:?}",
       reader_proxy.unsent_changes_debug()
     );
 
-    if let Some(unsent_sn) = reader_proxy.first_unsent_change() {
-      // There are unsent changes.
-      let mut no_longer_relevant: BTreeSet<SequenceNumber> = BTreeSet::new();
-      let mut all_irrelevant_before = None;
+    // Security encodes each message for its readers as a whole, so with
+    // security on every sample keeps a message of its own.
+    let coalesce = self.security_plugins.is_none();
+    let mut datagram: Option<MessageBuilder> = None;
+    // Whether an INFO_TS in `datagram` still applies to the next DATA.
+    let mut ts_active = false;
+    let mut pending_gap_sent = false;
+    let mut round_bytes = 0;
 
-      // If we have set the reader as pending GAP for the unsent sequence number,
-      // just send a GAP message, not DATA.
-      let pending_gaps = reader_proxy.get_pending_gap();
-
-      // Check what we actually have in store
+    while round_bytes < REPAIR_BATCH_MAX_BYTES {
+      let Some(unsent_sn) = reader_proxy.first_unsent_change() else {
+        break;
+      };
       let first_available = self.send_buffer.first_change_sequence_number();
+      let pending_gaps = reader_proxy.get_pending_gap().clone();
+
+      let mut gap = MessageBuilder::new();
+      let mut cache_change = None;
       if unsent_sn < first_available {
         // Reader is requesting older than what we actually have. Notify that they are
         // gone.
-        all_irrelevant_before = Some(first_available);
-      }
-
-      // If all_irrelevant_before is still None, then TopicCache has SNs that are
-      // less than equal to the requested "unsent_sn". But might not have that exact
-      // SN.
-      if pending_gaps.contains(&unsent_sn) || all_irrelevant_before.is_some() {
-        no_longer_relevant.extend(pending_gaps);
-      } else {
-        // Reader not pending gap on unsent_sn. Get the cache change from the send
-        // buffer
-        if let Some(cc) = self.send_buffer.get_by_sn(unsent_sn) {
-          // The cache change was found. Send it to the reader
-          let data_was_fragmented = self.send_cache_change(&cc, false, Some(reader_proxy));
-
-          if data_was_fragmented {
-            // Mark the reader as having requested all frags
-            let (num_frags, _frag_size) =
-              self.num_frags_and_frag_size(cc.data_value.payload_size());
-            reader_proxy.mark_all_frags_requested(unsent_sn, num_frags);
-
-            // Set a timer to send repair frags if needed
-            self.schedule_timed_event(
-              self.repairfrags_continue_delay,
-              TimedEvent::SendRepairFrags {
-                to_reader: reader_guid,
-              },
-            );
-          }
-          // mark as sent
-          reader_proxy.mark_change_sent(unsent_sn);
-        } else {
-          // Did not find a cache change for the sequence number. Mark for GAP.
-          no_longer_relevant.insert(unsent_sn);
-          // Try to find a reason why and log about it
-          if unsent_sn < first_available {
-            info!(
-              "Reader {:?} requested too old data {:?}. I have only from {:?}. Topic {:?}",
-              reader_proxy, unsent_sn, first_available, self.my_topic_name
-            );
-          } else {
+        debug!(
+          "Reader {reader_guid:?} requested too old data {unsent_sn:?}. I have only from \
+           {first_available:?}. Topic {:?}",
+          self.my_topic_name
+        );
+        gap = gap.gap_msg_before(
+          first_available,
+          self.entity_id(),
+          self.endianness,
+          reader_guid,
+        );
+        reader_proxy.remove_from_unsent_set_all_before(first_available);
+      } else if !pending_gaps.contains(&unsent_sn) {
+        match self.send_buffer.get_by_sn(unsent_sn) {
+          Some(cc) => cache_change = Some(cc),
+          None => {
             // we are running out of excuses
             error!(
               "handle_repair_data_send_worker {:?} seq.number {:?} missing. first_change={:?}",
               self.my_guid, unsent_sn, first_available
             );
+            gap = gap.gap_msg(
+              &BTreeSet::from([unsent_sn]),
+              self.entity_id(),
+              self.endianness,
+              reader_guid,
+            );
+            reader_proxy.mark_change_sent(unsent_sn);
           }
         }
       }
-
-      // Send a GAP if we marked a sequence number as no longer relevant
-      if !no_longer_relevant.is_empty() || all_irrelevant_before.is_some() {
-        let mut gap_msg = MessageBuilder::new().dst_submessage(self.endianness, reader_guid.prefix);
-        if let Some(all_irrelevant_before) = all_irrelevant_before {
-          gap_msg = gap_msg.gap_msg_before(
-            all_irrelevant_before,
-            self.entity_id(),
-            self.endianness,
-            reader_guid,
-          );
-          reader_proxy.remove_from_unsent_set_all_before(all_irrelevant_before);
-        }
-        if !no_longer_relevant.is_empty() {
-          gap_msg = gap_msg.gap_msg(
-            &no_longer_relevant,
-            self.entity_id(),
-            self.endianness,
-            reader_guid,
-          );
-          no_longer_relevant
-            .iter()
-            .for_each(|sn| reader_proxy.mark_change_sent(*sn));
-        }
-        let gap_msg = gap_msg.add_header_and_build(self.my_guid.prefix);
-
-        self.send_control_to_readers(
-          DeliveryMode::Unicast,
-          gap_msg,
-          &mut std::iter::once(&*reader_proxy),
+      // SNs we are not going to send to this reader: announce them once per
+      // round, together with the first change that goes out.
+      if !pending_gaps.is_empty() && (!pending_gap_sent || pending_gaps.contains(&unsent_sn)) {
+        gap = gap.gap_msg(
+          &pending_gaps,
+          self.entity_id(),
+          self.endianness,
+          reader_guid,
         );
-      } // if sending GAP
-    } else {
-      // Unsent list is empty. Switch off repair mode.
+        for sn in &pending_gaps {
+          reader_proxy.mark_change_sent(*sn);
+        }
+        pending_gap_sent = true;
+      }
+      let gap_len = gap.submessage_bytes_len();
+      if gap_len > 0 {
+        round_bytes += gap_len;
+        self.add_to_repair_datagram(&mut datagram, gap, 0, reader_proxy);
+      }
+
+      let Some(cc) = cache_change else {
+        continue;
+      };
+      let payload_size = cc.data_value.payload_size();
+      if !coalesce || payload_size > self.max_unfragmented_serialized_payload(Some(reader_proxy)) {
+        // Keep the order: whatever is packed so far goes first.
+        self.flush_repair_datagram(&mut datagram, reader_proxy);
+        ts_active = false;
+        let data_was_fragmented = self.send_cache_change(&cc, false, Some(reader_proxy));
+        if data_was_fragmented {
+          // Mark the reader as having requested all frags
+          let (num_frags, _frag_size) = self.num_frags_and_frag_size(payload_size);
+          reader_proxy.mark_all_frags_requested(unsent_sn, num_frags);
+          // The reader proxy is detached from `self.readers`, so this does
+          // what schedule_repair_frags would.
+          if !reader_proxy.repair_frags_scheduled {
+            reader_proxy.repair_frags_scheduled = true;
+            self.schedule_timed_event(
+              self.repair_interval(),
+              TimedEvent::SendRepairFrags {
+                to_reader: reader_guid,
+              },
+            );
+          }
+        }
+        round_bytes += payload_size + DATA_SUBMESSAGE_OVERHEAD;
+      } else {
+        let source_timestamp = cc.write_options.source_timestamp();
+        let mut data = MessageBuilder::new();
+        if source_timestamp.is_some() {
+          data = data.ts_msg(self.endianness, source_timestamp);
+        }
+        data = data.data_msg(
+          &cc,
+          reader_guid.entity_id,
+          self.my_guid,
+          self.endianness,
+          self.security_plugins.as_ref(),
+        );
+        // An INFO_TS applies to every following DATA in the datagram, so a DATA
+        // without a timestamp after one with must invalidate it.
+        let invalidate_len = if source_timestamp.is_none() && ts_active {
+          SUBMESSAGE_INFO_TS_INVALIDATE_SIZE
+        } else {
+          0
+        };
+        round_bytes += data.submessage_bytes_len();
+        self.add_to_repair_datagram(&mut datagram, data, invalidate_len, reader_proxy);
+        ts_active = source_timestamp.is_some();
+      }
+      reader_proxy.mark_change_sent(unsent_sn);
+    }
+
+    self.flush_repair_datagram(&mut datagram, reader_proxy);
+    if reader_proxy.first_unsent_change().is_none() {
       reader_proxy.repair_mode = false;
     }
   } // fn
+
+  // Append `part` to the repair datagram being built for `reader_proxy`, first
+  // sending the datagram if `part` (plus `invalidate_len` bytes for an INFO_TS
+  // invalidation) would not fit the reader's path-MTU budget. A fresh datagram
+  // starts with INFO_DST and takes `part` even if it alone is too large. When
+  // the part joins an existing datagram and `invalidate_len > 0`, an
+  // invalidating INFO_TS goes in front of it.
+  fn add_to_repair_datagram(
+    &self,
+    datagram: &mut Option<MessageBuilder>,
+    part: MessageBuilder,
+    invalidate_len: usize,
+    reader_proxy: &RtpsReaderProxy,
+  ) {
+    let fits = datagram.as_ref().is_some_and(|d| {
+      d.len_serialized() + invalidate_len + part.submessage_bytes_len()
+        <= reader_proxy.max_datagram_payload()
+    });
+    if !fits {
+      self.flush_repair_datagram(datagram, reader_proxy);
+    }
+    let started_new = datagram.is_none();
+    let d = datagram.get_or_insert_with(|| {
+      MessageBuilder::new().dst_submessage(self.endianness, reader_proxy.remote_reader_guid.prefix)
+    });
+    if !started_new && invalidate_len > 0 {
+      d.append(MessageBuilder::new().ts_msg(self.endianness, None));
+    }
+    d.append(part);
+  }
+
+  fn flush_repair_datagram(
+    &self,
+    datagram: &mut Option<MessageBuilder>,
+    reader_proxy: &RtpsReaderProxy,
+  ) {
+    if let Some(d) = datagram.take() {
+      self.send_control_to_readers(
+        DeliveryMode::Unicast,
+        d.add_header_and_build(self.my_guid.prefix),
+        &mut std::iter::once(reader_proxy),
+      );
+    }
+  }
 
   fn handle_repair_frags_send_worker(
     &mut self,
@@ -2122,6 +2251,9 @@ impl HasQoSPolicy for Writer {
 // causes earlier fragmentation (safe), never datagram overflow.
 const DATA_SUBMESSAGE_OVERHEAD: usize = 48;
 
+// An invalidating INFO_TS is a bare submessage header.
+const SUBMESSAGE_INFO_TS_INVALIDATE_SIZE: usize = 4;
+
 // Serialized overhead of one DATAFRAG submessage excluding its payload:
 // submessage header (4) + extraFlags (2) + octetsToInlineQos (2) + readerId (4)
 // + writerId (4) + writerSN (8) + fragmentStartingNum (4) +
@@ -2130,6 +2262,18 @@ const DATA_SUBMESSAGE_OVERHEAD: usize = 48;
 // risks a slight overestimate, which degrades to benign IP fragmentation rather
 // than data loss.
 const DATAFRAG_SUBMESSAGE_OVERHEAD: usize = 36;
+
+// A fifth of a finite, positive Deadline, clamped to
+// [REPAIR_INTERVAL_MIN, REPAIR_INTERVAL_MAX]. No Deadline, INFINITE, zero or
+// negative give REPAIR_INTERVAL_DEFAULT.
+fn repair_interval_for(deadline: Option<Duration>) -> std::time::Duration {
+  match deadline {
+    Some(d) if d != Duration::INFINITE && d > Duration::ZERO => {
+      std::time::Duration::from(d / 5).clamp(REPAIR_INTERVAL_MIN, REPAIR_INTERVAL_MAX)
+    }
+    _ => REPAIR_INTERVAL_DEFAULT,
+  }
+}
 
 // Adaptive packing: how many contiguous fragments (starting at 1-based `start`)
 // to place in a single DATAFRAG submessage so the datagram stays within
@@ -2570,5 +2714,317 @@ mod tests {
 
     thread::sleep(std::time::Duration::from_millis(100));
     info!("writerResult:  {write_result:?}");
+  }
+
+  #[test]
+  fn repair_interval_is_fifth_of_deadline_clamped() {
+    use super::{repair_interval_for, Duration};
+    // DDS Durations count 2^-32 s, so a fifth may be off by a nanosecond.
+    let interval_ms = |deadline: Option<Duration>| {
+      (repair_interval_for(deadline).as_micros() as f64 / 1000.0).round() as u64
+    };
+    assert_eq!(interval_ms(Some(Duration::from_millis(50))), 10);
+    assert_eq!(interval_ms(Some(Duration::from_secs(1))), 100);
+    assert_eq!(interval_ms(Some(Duration::from_millis(1))), 1);
+    assert_eq!(interval_ms(Some(Duration::from_millis(200))), 40);
+    assert_eq!(interval_ms(None), 10);
+    assert_eq!(interval_ms(Some(Duration::INFINITE)), 10);
+    assert_eq!(interval_ms(Some(Duration::ZERO)), 10);
+  }
+
+  // Repair (ACKNACK response) tests. The Writer runs without an event loop, so
+  // the tests poll the shared timer themselves and hand SendRepairData to the
+  // Writer as the event loop would.
+  mod repair {
+    use std::{
+      cell::RefCell,
+      net::SocketAddr,
+      rc::Rc,
+      time::{Duration as StdDuration, Instant},
+    };
+
+    use super::super::*;
+    use crate::{
+      dds::{
+        ddsdata::DDSData,
+        qos::{policy::Durability, QosPolicyBuilder},
+        statusevents::{sync_status_channel, StatusChannelReceiver},
+        with_key::datawriter::WriteOptions,
+      },
+      discovery::discovery::Discovery,
+      messages::submessages::{
+        elements::serialized_payload::SerializedPayload, submessages::AckNack,
+      },
+      polling::new_shared_timer,
+      rtps::writer_send_buffer::Admission,
+      structure::{guid::EntityKind, sequence_number::SequenceNumberSet},
+      RepresentationIdentifier,
+    };
+
+    struct Fixture {
+      writer: Writer,
+      reader_guid: GUID,
+      timer: SharedTimer<DpTimerEvent>,
+      _status: StatusChannelReceiver<DataWriterStatus>,
+      _participant_status: StatusChannelReceiver<DomainParticipantStatusEvent>,
+    }
+
+    impl Fixture {
+      // A reliable Writer that holds samples 1..=sample_count of `payload_len`
+      // bytes and is matched with one remote reader. Without a locator the
+      // reader gets nothing on the wire, but the repair bookkeeping runs.
+      fn new(
+        writer_id: EntityId,
+        writer_qos: QosPolicies,
+        reader_id: EntityId,
+        reader_qos: &QosPolicies,
+        sample_count: i64,
+        payload_len: usize,
+        reader_locator: Option<SocketAddr>,
+      ) -> Self {
+        let guid = GUID::new(GuidPrefix::new(&[1; 12]), writer_id);
+        let send_buffer = WriterSendBuffer::new(
+          guid,
+          "repair_test".to_string(),
+          true, // reliable
+          writer_id.kind().is_built_in(),
+          false,
+          DEFAULT_WRITER_MAX_SAMPLES,
+          DEFAULT_WRITER_MAX_SAMPLES,
+          DEFAULT_WRITER_MAX_SAMPLES,
+        );
+        for _ in 0..sample_count {
+          let data = DDSData::new(SerializedPayload::new(
+            RepresentationIdentifier::CDR_LE,
+            vec![0; payload_len],
+          ));
+          assert!(matches!(
+            send_buffer.admit_blocking(WriteOptions::default(), data, Some(StdDuration::ZERO)),
+            Admission::Admitted(_)
+          ));
+        }
+        let (doorbell_registration, doorbell) = Registration::new2();
+        let (status_sender, status) = sync_status_channel(4).unwrap();
+        let (participant_status_sender, participant_status) = sync_status_channel(16).unwrap();
+        let timer = new_shared_timer();
+        let mut writer = Writer::new(
+          WriterIngredients {
+            guid,
+            send_buffer,
+            doorbell_registration,
+            doorbell,
+            topic_name: "repair_test".to_string(),
+            like_stateless: false,
+            qos_policies: writer_qos,
+            status_sender,
+            security_plugins: None,
+          },
+          Rc::new(UDPSender::new(0).unwrap()),
+          Rc::clone(&timer),
+          participant_status_sender,
+          Rc::new(RefCell::new(InterfaceObservations::default())),
+          Rc::from(Vec::<IfAddr>::new()),
+        );
+        let reader_guid = GUID::new(GuidPrefix::new(&[2; 12]), reader_id);
+        let mut reader_proxy = RtpsReaderProxy::new(reader_guid, reader_qos.clone(), false);
+        reader_proxy
+          .unicast_locator_list
+          .extend(reader_locator.map(Locator::from));
+        writer.update_reader_proxy(&reader_proxy, reader_qos);
+        assert!(
+          writer.readers.contains_key(&reader_guid),
+          "reader did not match"
+        );
+        Self {
+          writer,
+          reader_guid,
+          timer,
+          _status: status,
+          _participant_status: participant_status,
+        }
+      }
+
+      // A built-in SEDP publications Writer and a remote SEDP publications
+      // reader, with the QoS Discovery gives them.
+      fn sedp(sample_count: i64, payload_len: usize) -> Self {
+        Self::new(
+          EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER,
+          Discovery::builtin_publisher_qos(),
+          EntityId::SEDP_BUILTIN_PUBLICATIONS_READER,
+          &Discovery::builtin_subscriber_qos(),
+          sample_count,
+          payload_len,
+          None,
+        )
+      }
+
+      fn user(sample_count: i64, payload_len: usize, reader_locator: Option<SocketAddr>) -> Self {
+        let qos = QosPolicyBuilder::new()
+          .reliability(Reliability::Reliable {
+            max_blocking_time: Duration::from_millis(100),
+          })
+          .history(History::KeepAll)
+          .durability(Durability::TransientLocal)
+          .build();
+        Self::new(
+          EntityId::new([0, 0, 1], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+          qos.clone(),
+          EntityId::new([0, 0, 2], EntityKind::READER_WITH_KEY_USER_DEFINED),
+          &qos,
+          sample_count,
+          payload_len,
+          reader_locator,
+        )
+      }
+
+      fn reader_proxy(&self) -> &RtpsReaderProxy {
+        &self.writer.readers[&self.reader_guid]
+      }
+
+      fn unsent(&self) -> usize {
+        self.reader_proxy().unsent_changes_count()
+      }
+
+      // The reader has received nothing and requests `requested`.
+      fn ack_nack(&mut self, requested: impl IntoIterator<Item = i64>, count: i32) {
+        let requested: BTreeSet<SequenceNumber> =
+          requested.into_iter().map(SequenceNumber::new).collect();
+        let ack_nack = AckNack {
+          reader_id: self.reader_guid.entity_id,
+          writer_id: self.writer.my_guid.entity_id,
+          reader_sn_state: SequenceNumberSet::from_base_and_set(SequenceNumber::new(1), &requested),
+          count,
+        };
+        self
+          .writer
+          .handle_ack_nack(self.reader_guid.prefix, &AckSubmessage::AckNack(ack_nack));
+      }
+
+      // The next SendRepairData timeout scheduled for our reader, waiting up to
+      // `max_wait` for it to expire. Other timeouts are skipped.
+      fn next_repair_event(&self, max_wait: StdDuration) -> Option<TimedEvent> {
+        let give_up = Instant::now() + max_wait;
+        loop {
+          while let Some(fired) = self.timer.borrow_mut().poll() {
+            if let DpTimerEvent::Writer {
+              event: TimedEvent::SendRepairData { to_reader },
+              ..
+            } = fired
+            {
+              if to_reader == self.reader_guid {
+                return Some(TimedEvent::SendRepairData { to_reader });
+              }
+            }
+          }
+          if Instant::now() >= give_up {
+            return None;
+          }
+          std::thread::sleep(StdDuration::from_millis(1));
+        }
+      }
+
+      // Run one repair round; returns how many changes it sent.
+      fn repair_round(&mut self) -> usize {
+        let event = self
+          .next_repair_event(StdDuration::from_secs(5))
+          .expect("SendRepairData was not scheduled");
+        let before = self.unsent();
+        self.writer.handle_timed_event(event);
+        before - self.unsent()
+      }
+    }
+
+    // Built-in and user Writers alike answer an ACKNACK only after
+    // nack_response_delay, from the SendRepairData timer.
+    #[test]
+    fn acknack_schedules_repair_after_nack_response_delay() {
+      for mut f in [Fixture::sedp(5, 8), Fixture::user(5, 8, None)] {
+        f.ack_nack(1..=5, 1);
+        assert_eq!(f.unsent(), 5, "repaired on the ACKNACK");
+        assert!(f.reader_proxy().repair_mode);
+        assert!(
+          f.next_repair_event(StdDuration::from_millis(100)).is_none(),
+          "repair before nack_response_delay"
+        );
+        assert_eq!(f.repair_round(), 5);
+        assert!(!f.reader_proxy().repair_mode);
+      }
+    }
+
+    // A round stops once REPAIR_BATCH_MAX_BYTES have gone out and the next
+    // round continues where it stopped.
+    #[test]
+    fn repair_round_is_byte_limited_and_continues() {
+      // 1000-byte samples: the eighth crosses 8 KiB.
+      let mut f = Fixture::user(20, 1000, None);
+      f.writer.nack_response_delay = StdDuration::ZERO;
+      f.ack_nack(1..=20, 1);
+      assert_eq!(f.repair_round(), 8);
+      assert_eq!(f.repair_round(), 8);
+      assert!(f.reader_proxy().repair_mode);
+      assert_eq!(f.repair_round(), 4);
+      assert!(!f.reader_proxy().repair_mode);
+      assert!(f.next_repair_event(StdDuration::from_millis(50)).is_none());
+
+      // Small SEDP-sized samples: many per round, still more than one round.
+      let mut f = Fixture::sedp(250, 64);
+      f.writer.nack_response_delay = StdDuration::ZERO;
+      f.ack_nack(1..=250, 1);
+      let first = f.repair_round();
+      assert!(first > 50 && first < 250, "first round sent {first}");
+      while f.reader_proxy().repair_mode {
+        f.repair_round();
+      }
+      assert_eq!(f.unsent(), 0);
+    }
+
+    // A sample larger than a whole round still goes out, one per round.
+    #[test]
+    fn repair_round_sends_at_least_one_sample() {
+      let mut f = Fixture::user(3, 20_000, None);
+      f.writer.nack_response_delay = StdDuration::ZERO;
+      f.ack_nack(1..=3, 1);
+      assert_eq!(f.repair_round(), 1);
+      assert_eq!(f.repair_round(), 1);
+      assert_eq!(f.repair_round(), 1);
+      assert!(!f.reader_proxy().repair_mode);
+    }
+
+    // A repeated ACKNACK count is a copy and changes nothing; a new count does.
+    #[test]
+    fn duplicate_acknack_count_is_ignored() {
+      let mut f = Fixture::user(5, 8, None);
+      f.writer.nack_response_delay = StdDuration::ZERO;
+      f.ack_nack(1..=5, 1);
+      assert_eq!(f.repair_round(), 5);
+
+      f.ack_nack(1..=5, 1);
+      assert_eq!(f.unsent(), 0);
+      assert!(!f.reader_proxy().repair_mode);
+      assert!(f.next_repair_event(StdDuration::from_millis(50)).is_none());
+
+      f.ack_nack(1..=5, 2);
+      assert_eq!(f.unsent(), 5);
+      assert_eq!(f.repair_round(), 5);
+    }
+
+    // While the reader's send socket has queued control datagrams, a round
+    // sends nothing and re-arms; once the queue drains, repair proceeds.
+    #[test]
+    fn repair_waits_for_control_backlog() {
+      // A loopback locator would not be used before route resolution.
+      let mut f = Fixture::user(5, 8, Some(SocketAddr::from(([192, 0, 2, 1], 9))));
+      f.writer.nack_response_delay = StdDuration::ZERO;
+      f.writer
+        .udp_sender
+        .inject_control_backlog(SocketId::Unicast);
+      f.ack_nack(1..=5, 1);
+      assert_eq!(f.repair_round(), 0);
+      assert!(f.reader_proxy().repair_mode);
+
+      f.writer.udp_sender.flush_control(SocketId::Unicast);
+      assert_eq!(f.repair_round(), 5);
+      assert!(!f.reader_proxy().repair_mode);
+    }
   }
 }
