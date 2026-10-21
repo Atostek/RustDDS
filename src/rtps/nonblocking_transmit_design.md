@@ -155,8 +155,8 @@ reader re-NACKs, the retransmit is dropped again). Pacing replaces dropping:
 - One round sends the reader's unsent changes, lowest first, until
   `REPAIR_BATCH_MAX_BYTES` (8 KiB) have gone out, at least one change. GAPs and
   unfragmented DATA are packed into unicast datagrams of the reader's path-MTU
-  budget; a fragmented sample goes out on its own and its fragments are then
-  repaired by `SendRepairFrags`, 8 per round.
+  budget; a fragmented sample goes out once, in full, on its own. `SendRepairFrags`
+  answers NACK_FRAG only, 8 fragments per round.
 - While the reader is still behind, the next round follows after the repair
   interval: a fifth of the writer's Deadline, clamped to 1..100 ms, or 10 ms
   without a finite positive Deadline (`REPAIR_INTERVAL_*` in

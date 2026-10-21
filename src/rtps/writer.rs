@@ -1487,23 +1487,9 @@ impl Writer {
         // Keep the order: whatever is packed so far goes first.
         self.flush_repair_datagram(&mut datagram, reader_proxy);
         ts_active = false;
-        let data_was_fragmented = self.send_cache_change(&cc, false, Some(reader_proxy));
-        if data_was_fragmented {
-          // Mark the reader as having requested all frags
-          let (num_frags, _frag_size) = self.num_frags_and_frag_size(payload_size);
-          reader_proxy.mark_all_frags_requested(unsent_sn, num_frags);
-          // The reader proxy is detached from `self.readers`, so this does
-          // what schedule_repair_frags would.
-          if !reader_proxy.repair_frags_scheduled {
-            reader_proxy.repair_frags_scheduled = true;
-            self.schedule_timed_event(
-              self.repair_interval(),
-              TimedEvent::SendRepairFrags {
-                to_reader: reader_guid,
-              },
-            );
-          }
-        }
+        // This emits the whole sample, including every fragment when it does
+        // not fit one datagram. A later NACK_FRAG is what arms SendRepairFrags.
+        self.send_cache_change(&cc, false, Some(reader_proxy));
         round_bytes += payload_size + DATA_SUBMESSAGE_OVERHEAD;
       } else {
         let source_timestamp = cc.write_options.source_timestamp();
@@ -2900,6 +2886,31 @@ mod tests {
           .handle_ack_nack(self.reader_guid.prefix, &AckSubmessage::AckNack(ack_nack));
       }
 
+      // Timed events addressed to our reader that expire within `max_wait`.
+      // This keeps SendRepairFrags, which next_repair_event skips.
+      fn reader_events(&self, max_wait: StdDuration) -> Vec<TimedEvent> {
+        let give_up = Instant::now() + max_wait;
+        let mut found = Vec::new();
+        loop {
+          while let Some(fired) = self.timer.borrow_mut().poll() {
+            if let DpTimerEvent::Writer { event, .. } = fired {
+              let to_reader = match event {
+                TimedEvent::SendRepairData { to_reader }
+                | TimedEvent::SendRepairFrags { to_reader } => Some(to_reader),
+                TimedEvent::Heartbeat | TimedEvent::CacheCleaning => None,
+              };
+              if to_reader == Some(self.reader_guid) {
+                found.push(event);
+              }
+            }
+          }
+          if Instant::now() >= give_up {
+            return found;
+          }
+          std::thread::sleep(StdDuration::from_millis(1));
+        }
+      }
+
       // The next SendRepairData timeout scheduled for our reader, waiting up to
       // `max_wait` for it to expire. Other timeouts are skipped.
       fn next_repair_event(&self, max_wait: StdDuration) -> Option<TimedEvent> {
@@ -2978,16 +2989,23 @@ mod tests {
       assert_eq!(f.unsent(), 0);
     }
 
-    // A sample larger than a whole round still goes out, one per round.
+    // A sample larger than a whole round still goes out, one per round. These
+    // samples are fragmented, and that send is the only one: it does not arm
+    // SendRepairFrags.
     #[test]
     fn repair_round_sends_at_least_one_sample() {
       let mut f = Fixture::user(3, 20_000, None);
       f.writer.nack_response_delay = StdDuration::ZERO;
       f.ack_nack(1..=3, 1);
-      assert_eq!(f.repair_round(), 1);
-      assert_eq!(f.repair_round(), 1);
-      assert_eq!(f.repair_round(), 1);
+      for _ in 0..3 {
+        assert_eq!(f.repair_round(), 1);
+        assert!(!f.reader_proxy().repair_frags_requested());
+      }
       assert!(!f.reader_proxy().repair_mode);
+      assert!(f
+        .reader_events(StdDuration::from_millis(50))
+        .iter()
+        .all(|event| !matches!(event, TimedEvent::SendRepairFrags { .. })));
     }
 
     // A repeated ACKNACK count is a copy and changes nothing; a new count does.
