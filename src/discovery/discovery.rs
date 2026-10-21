@@ -15,7 +15,7 @@ use crate::{
     qos::{
       policy::{
         Deadline, DestinationOrder, Durability, History, Liveliness, Ownership, Presentation,
-        PresentationAccessScope, Reliability, TimeBasedFilter,
+        PresentationAccessScope, Reliability, ResourceLimits, TimeBasedFilter,
       },
       QosPolicies, QosPolicyBuilder,
     },
@@ -351,6 +351,7 @@ impl Discovery {
       ( $repr:ident, $has_key:ident,
         $topic_name:expr, $topic_type_name:expr, $message_type:ty,
         $endpoint_qos_opt:expr,
+        $reader_qos_opt:expr,
         $stateless_RTPS:expr,
         $reader_entity_id:expr, $reader_token:expr,
         $writer_entity_id:expr,
@@ -384,7 +385,7 @@ impl Discovery {
               ::<$message_type, [<$repr DeserializerAdapter>] <$message_type>>(
               &topic,
               $reader_entity_id,
-              $endpoint_qos_opt,
+              $reader_qos_opt.or_else(|| endpoint_qos_opt_bind.clone()),
               $stateless_RTPS,
             ),
             "Unable to create discovery DataReader."
@@ -442,6 +443,7 @@ impl Discovery {
       builtin_topic_type_names::DCPS_PARTICIPANT,
       SpdpDiscoveredParticipantData,
       Some(Self::create_spdp_participant_qos()),
+      None,  // Reader QoS: as above
       false, // Regular stateful RTPS Reader & Writer
       EntityId::SPDP_BUILTIN_PARTICIPANT_READER,
       DISCOVERY_PARTICIPANT_DATA_TOKEN,
@@ -457,8 +459,9 @@ impl Discovery {
       builtin_topic_names::DCPS_SUBSCRIPTION,
       builtin_topic_type_names::DCPS_SUBSCRIPTION,
       DiscoveredReaderData,
-      None,  // QoS
-      false, // Regular stateful RTPS Reader & Writer
+      None,                                  // QoS
+      Some(Self::builtin_sedp_reader_qos()), // Reader QoS
+      false,                                 // Regular stateful RTPS Reader & Writer
       EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_READER,
       DISCOVERY_READER_DATA_TOKEN,
       EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
@@ -472,8 +475,9 @@ impl Discovery {
       builtin_topic_names::DCPS_PUBLICATION,
       builtin_topic_type_names::DCPS_PUBLICATION,
       DiscoveredWriterData,
-      None,  // QoS,
-      false, // Regular stateful RTPS Reader & Writer
+      None,                                  // QoS,
+      Some(Self::builtin_sedp_reader_qos()), // Reader QoS
+      false,                                 // Regular stateful RTPS Reader & Writer
       EntityId::SEDP_BUILTIN_PUBLICATIONS_READER,
       DISCOVERY_WRITER_DATA_TOKEN,
       EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER,
@@ -487,8 +491,9 @@ impl Discovery {
       builtin_topic_names::DCPS_TOPIC,
       builtin_topic_type_names::DCPS_TOPIC,
       DiscoveredTopicData,
-      None,  // QoS,
-      false, // Regular stateful RTPS Reader & Writer
+      None,                                  // QoS,
+      Some(Self::builtin_sedp_reader_qos()), // Reader QoS
+      false,                                 // Regular stateful RTPS Reader & Writer
       EntityId::SEDP_BUILTIN_TOPIC_READER,
       DISCOVERY_TOPIC_DATA_TOKEN,
       EntityId::SEDP_BUILTIN_TOPIC_WRITER,
@@ -503,6 +508,7 @@ impl Discovery {
       builtin_topic_type_names::DCPS_PARTICIPANT_MESSAGE,
       ParticipantMessageData,
       Some(Self::PARTICIPANT_MESSAGE_QOS),
+      None,  // Reader QoS: as above
       false, // Regular stateful RTPS Reader & Writer
       EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
       DISCOVERY_PARTICIPANT_MESSAGE_TOKEN,
@@ -521,6 +527,7 @@ impl Discovery {
       builtin_topic_type_names::DCPS_PARTICIPANT_SECURE,
       ParticipantBuiltinTopicDataSecure,
       None,  // QoS
+      None,  // Reader QoS: as above
       false, // Regular stateful RTPS Reader & Writer
       EntityId::SPDP_RELIABLE_BUILTIN_PARTICIPANT_SECURE_READER,
       SECURE_DISCOVERY_PARTICIPANT_DATA_TOKEN,
@@ -537,8 +544,9 @@ impl Discovery {
       builtin_topic_names::DCPS_SUBSCRIPTIONS_SECURE,
       builtin_topic_type_names::DCPS_SUBSCRIPTIONS_SECURE,
       SubscriptionBuiltinTopicDataSecure,
-      None,  // QoS
-      false, // Regular stateful RTPS Reader & Writer
+      None,                                  // QoS
+      Some(Self::builtin_sedp_reader_qos()), // Reader QoS
+      false,                                 // Regular stateful RTPS Reader & Writer
       EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_SECURE_READER,
       SECURE_DISCOVERY_READER_DATA_TOKEN,
       EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_SECURE_WRITER,
@@ -553,8 +561,9 @@ impl Discovery {
       builtin_topic_names::DCPS_PUBLICATIONS_SECURE,
       builtin_topic_type_names::DCPS_PUBLICATIONS_SECURE,
       PublicationBuiltinTopicDataSecure,
-      None,  // QoS
-      false, // Regular stateful RTPS Reader & Writer
+      None,                                  // QoS
+      Some(Self::builtin_sedp_reader_qos()), // Reader QoS
+      false,                                 // Regular stateful RTPS Reader & Writer
       EntityId::SEDP_BUILTIN_PUBLICATIONS_SECURE_READER,
       SECURE_DISCOVERY_WRITER_DATA_TOKEN,
       EntityId::SEDP_BUILTIN_PUBLICATIONS_SECURE_WRITER,
@@ -570,6 +579,7 @@ impl Discovery {
       builtin_topic_type_names::DCPS_PARTICIPANT_MESSAGE_SECURE,
       ParticipantMessageData, // actually reuse the non-secure data type
       None,                   // QoS
+      None,                   // Reader QoS: as above
       false,                  // Regular stateful RTPS Reader & Writer
       EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_SECURE_READER,
       P2P_SECURE_DISCOVERY_PARTICIPANT_MESSAGE_TOKEN,
@@ -586,6 +596,7 @@ impl Discovery {
       builtin_topic_type_names::DCPS_PARTICIPANT_STATELESS_MESSAGE,
       ParticipantStatelessMessage,
       Some(Self::create_participant_stateless_message_qos()),
+      None, // Reader QoS: as above
       true, // Important: STATELESS RTPS Reader & Writer (see Security spec. section 7.4.3)
       EntityId::P2P_BUILTIN_PARTICIPANT_STATELESS_READER,
       P2P_PARTICIPANT_STATELESS_MESSAGE_TOKEN,
@@ -603,6 +614,7 @@ impl Discovery {
       builtin_topic_type_names::DCPS_PARTICIPANT_VOLATILE_MESSAGE_SECURE,
       ParticipantVolatileMessageSecure,
       Some(Self::create_participant_volatile_message_secure_qos()),
+      None,  // Reader QoS: as above
       false, // Regular stateful RTPS Reader & Writer
       EntityId::P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_READER,
       P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_TOKEN,
@@ -1977,19 +1989,45 @@ impl Discovery {
       // use somewhat higher to avoid losing data at the receiver in case
       // it comes in bursts and there is some delay in Discovery processing.
       .history(History::KeepLast { depth: 4 })
-    // TODO:
-    // Spec says all resource limits should be "LENGTH_UNLIMITED",
-    // but that may lead to memory exhaustion.
-    //
-    // .resource_limits(ResourceLimits { // TODO: Maybe lower limits would
-    // suffice?   max_instances: std::i32::MAX,
-    //   max_samples: std::i32::MAX,
-    //   max_samples_per_instance: std::i32::MAX,
-    // })
+    // Spec says all resource limits should be "LENGTH_UNLIMITED", but that may
+    // lead to memory exhaustion. The built-in SEDP readers get finite limits
+    // (see builtin_sedp_reader_qos); the other built-in readers keep the
+    // DDSCache default.
   }
 
   pub const fn builtin_subscriber_qos() -> QosPolicies {
     Self::builtin_subscriber_qos_builder().build()
+  }
+
+  // ResourceLimits of the built-in SEDP DataReaders.
+  //
+  // Without ResourceLimits, the DDSCache keeps at most 64 samples of a topic,
+  // counted over all remote writers. Its garbage collection removes the oldest
+  // samples above the limit, read or not. A reliable DataReader reads each
+  // remote writer's samples in sequence number order, so an SEDP sample that
+  // arrives while an earlier one is being repaired waits in the cache. Once 64
+  // newer SEDP samples arrive, it may be removed unread. The RTPS Reader has
+  // already acknowledged it, so the endpoint it announces stays undiscovered.
+  //
+  // The cache holds samples up to the limit whether or not they have been
+  // read. 4096 lets a waiting sample outlast 4096 newer announcements instead
+  // of 64; at a few hundred bytes per sample, a full cache takes a few MiB per
+  // SEDP topic and DomainParticipant. RustDDS does not enforce max_instances,
+  // and the DataReader keeps History depth samples per instance, so all three
+  // limits are kept consistent.
+  const SEDP_READER_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
+    max_samples: 4096,
+    max_instances: 4096,
+    max_samples_per_instance: 4096,
+  };
+
+  // QoS of the built-in SEDP DataReaders (DCPSPublication,
+  // DCPSSubscription, DCPSTopic, and secure publication/subscription).
+  // Their Topics and DataWriters keep the built-in QoS without ResourceLimits.
+  pub(crate) const fn builtin_sedp_reader_qos() -> QosPolicies {
+    Self::builtin_subscriber_qos_builder()
+      .resource_limits(Self::SEDP_READER_RESOURCE_LIMITS)
+      .build()
   }
 
   pub const fn builtin_publisher_qos() -> QosPolicies {
@@ -2143,6 +2181,42 @@ mod tests {
     },
     RepresentationIdentifier, SerializedPayload,
   };
+
+  #[test]
+  fn sedp_topic_caches_get_sedp_reader_limits() {
+    let participant = DomainParticipant::new(test_domain_id(47)).expect("participant creation");
+    let dds_cache = participant.dds_cache();
+    let max_samples = |topic: &str| {
+      dds_cache
+        .read()
+        .unwrap()
+        .get_existing_topic_cache(topic)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .max_keep_samples()
+    };
+
+    for topic in [
+      builtin_topic_names::DCPS_PUBLICATION,
+      builtin_topic_names::DCPS_SUBSCRIPTION,
+      builtin_topic_names::DCPS_TOPIC,
+    ] {
+      assert_eq!(max_samples(topic), 4096, "{topic} cache limit");
+    }
+    #[cfg(feature = "security")]
+    for topic in [
+      builtin_topic_names::DCPS_PUBLICATIONS_SECURE,
+      builtin_topic_names::DCPS_SUBSCRIPTIONS_SECURE,
+    ] {
+      assert_eq!(max_samples(topic), 4096, "{topic} cache limit");
+    }
+    assert_eq!(
+      max_samples(builtin_topic_names::DCPS_PARTICIPANT),
+      64,
+      "SPDP keeps the default cache limit"
+    );
+  }
 
   #[test]
   fn discovery_participant_data_test() {

@@ -481,6 +481,11 @@ impl TopicCache {
   pub fn topic_name(&self) -> String {
     self.topic_name.clone()
   }
+
+  #[cfg(test)]
+  pub(crate) fn max_keep_samples(&self) -> i32 {
+    self.max_keep_samples
+  }
 }
 
 type ChangesInRangeBestEffort<'a, F> = iter::Map<btree_map::Range<'a, Timestamp, CacheChange>, F>;
@@ -530,18 +535,85 @@ where
 #[cfg(test)]
 mod tests {
   use std::{
+    collections::BTreeMap,
     sync::{Arc, RwLock},
     thread,
   };
 
-  use super::DDSCache;
+  use super::{DDSCache, TopicCache};
   use crate::{
     dds::{
       ddsdata::DDSData, qos::QosPolicies, typedesc::TypeDesc, with_key::datawriter::WriteOptions,
     },
+    discovery::discovery::Discovery,
     messages::submessages::elements::serialized_payload::SerializedPayload,
-    structure::{cache_change::CacheChange, guid::GUID, sequence_number::SequenceNumber},
+    structure::{
+      cache_change::CacheChange,
+      guid::{EntityId, GuidPrefix, GUID},
+      sequence_number::SequenceNumber,
+      time::Timestamp,
+    },
   };
+
+  // A reliable DataReader reads each remote writer's samples in sequence
+  // number order. Sample 2 waits while sample 1 is repaired; collection must
+  // not evict it before that repair arrives.
+  fn read_after_repair(reader_qos: &QosPolicies) -> Vec<SequenceNumber> {
+    let sample = |writer, sn| {
+      CacheChange::new(
+        writer,
+        SequenceNumber::new(sn),
+        WriteOptions::default(),
+        DDSData::new(SerializedPayload::default()),
+      )
+    };
+    let sedp_writer = |prefix| {
+      GUID::new(
+        GuidPrefix::new(&[prefix; 12]),
+        EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER,
+      )
+    };
+
+    let mut topic_cache = TopicCache::new(
+      "DCPSPublication".to_string(),
+      TypeDesc::new("DiscoveredWriterData".to_string()),
+      &Discovery::builtin_subscriber_qos(),
+    );
+    topic_cache.update_keep_limits(reader_qos);
+
+    let waiting = sedp_writer(1);
+    topic_cache.add_change(&Timestamp::now(), sample(waiting, 2));
+
+    let mut last_read_sn = BTreeMap::new();
+    for prefix in 2..66 {
+      let other = sedp_writer(prefix);
+      topic_cache.add_change(&Timestamp::now(), sample(other, 1));
+      topic_cache.mark_reliably_received_before(other, SequenceNumber::new(2));
+      last_read_sn.insert(other, SequenceNumber::new(1));
+    }
+
+    topic_cache.remove_changes_before(Timestamp::ZERO);
+    topic_cache.add_change(&Timestamp::now(), sample(waiting, 1));
+    topic_cache.mark_reliably_received_before(waiting, SequenceNumber::new(3));
+
+    topic_cache
+      .get_changes_in_range_reliable(&last_read_sn)
+      .filter(|(_, cc)| cc.writer_guid == waiting)
+      .map(|(_, cc)| cc.sequence_number)
+      .collect()
+  }
+
+  #[test]
+  fn sedp_reader_limits_keep_sample_waiting_for_repair() {
+    assert_eq!(
+      read_after_repair(&Discovery::builtin_subscriber_qos()),
+      [SequenceNumber::new(1)]
+    );
+    assert_eq!(
+      read_after_repair(&Discovery::builtin_sedp_reader_qos()),
+      [SequenceNumber::new(1), SequenceNumber::new(2)]
+    );
+  }
 
   #[test]
   fn create_dds_cache_and_topic_cache() {

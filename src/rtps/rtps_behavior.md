@@ -107,6 +107,14 @@ Once participants know about each other, **SEDP** (built-in Publication and
 Subscription writers/readers) exchanges **DataWriter** and **DataReader**
 discovery samples: topic name, type name, QoS, GUID, and optional locators.
 
+**RustDDS cache bound:** the reliable SEDP readers for publications,
+subscriptions, and topics retain up to 4096 samples per built-in topic cache.
+This is deliberately higher than the generic 64-sample fallback: while a
+missing earlier sequence is being repaired, later SEDP samples cannot yet be
+read in order and must not be collected unread. It is a finite burst
+mitigation, not a protocol guarantee; sufficiently more than 4096 newer
+announcements can still evict an unread sample.
+
 ### 3.1 Matching rule (behavioral)
 
 A local **Reader** matches a remote **Writer** (and vice versa) when:
