@@ -104,7 +104,7 @@ ring = { version = "0.17" , optional = true } # Cryptographic primitives
 der = { version = "0.8" , features = ["oid", "derive", "alloc"], optional = true } # ASN.1 DER encoding (re-exports const-oid ObjectIdentifier via `der::asn1`)
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 openssl = { version = "0.10.70", optional = true }
-cryptoki = { version = "0.12", optional = true }
+cryptoki = { version = "0.12.1", optional = true }
 [target.'cfg(unix)'.dependencies]
 # Used to capture the receiving interface of incoming UDP datagrams via
 # recvmsg()/IP_PKTINFO for interface-aware transmit-locator selection.
@@ -120,10 +120,6 @@ test-log = "0.2.20"
 hex-literal = "1.0"
 anyhow = "1.0" # for test cases
 
-# ros_visualizer
-crossterm = "0.29"
-tui = { version = "0.19", default-features = false, features = ['crossterm'] }
-
 # shapes-demo
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.1.6"
@@ -132,11 +128,6 @@ ctrlc = "3.1.6"
 smol = "2.0"
 
 async-io ="2.4" # ddsperf
-
-[target.'cfg(unix)'.dev-dependencies]
-# turle_teleop
-termion = "4.0.2"
-
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = "0.18" # for ddsperf
