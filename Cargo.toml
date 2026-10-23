@@ -67,8 +67,8 @@ build_openssl = ["openssl?/vendored"]
 mio_06 = { package = "mio" , version ="^0.6.23" } 
 mio-extras = "2.0.6"
 
-# Internal reactor (sockets, waker). Not re-exported; the public `mio` name
-# stays mio 0.6. See `pub use mio_06 as mio` in src/lib.rs.
+# Internal reactor (sockets, waker). Re-exported as `rustdds::mio1` only
+# under feature `mio_1`; the public `mio` name stays mio 0.6.
 mio1 = { package = "mio", version = "1.2", features = ["net", "os-poll", "os-ext"] }
 
 mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"], optional = true } 

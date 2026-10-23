@@ -251,6 +251,11 @@ pub use cdr_encoding;
 /// `mio` `Poll` should import `mio` through this re-export, guaranteeing they
 /// build against the exact same `mio` version as RustDDS.
 pub use mio_06 as mio;
+/// Re-export of the `mio` (v1.2) crate, under feature `mio_1`. RustDDS
+/// DataReaders implement its `event::Source` trait. Downstream crates should
+/// import mio 1.2 through this re-export to match the RustDDS version.
+#[cfg(feature = "mio_1")]
+pub use mio1;
 /// Re-export of the `bytes` crate, used in RustDDS's (de)serialization API.
 pub use bytes;
 
