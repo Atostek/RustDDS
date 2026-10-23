@@ -831,6 +831,48 @@ where
   }
 }
 
+#[cfg(feature = "mio_1")]
+impl<D, DA> mio1::event::Source for DataReader<D, DA>
+where
+  D: Keyed,
+  DA: DeserializerAdapter<D>,
+{
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    <SimpleDataReader<D, DA> as mio1::event::Source>::register(
+      &mut self.simple_data_reader,
+      registry,
+      token,
+      interests,
+    )
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    <SimpleDataReader<D, DA> as mio1::event::Source>::reregister(
+      &mut self.simple_data_reader,
+      registry,
+      token,
+      interests,
+    )
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
+    <SimpleDataReader<D, DA> as mio1::event::Source>::deregister(
+      &mut self.simple_data_reader,
+      registry,
+    )
+  }
+}
+
 impl<'a, D, DA> StatusEvented<'a, DataReaderStatus, SimpleDataReaderEventStream<'a, D, DA>>
   for DataReader<D, DA>
 where
@@ -844,6 +886,11 @@ where
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.simple_data_reader.as_status_source()
+  }
+
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.simple_data_reader.as_status_source_mio1()
   }
 
   fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {
@@ -1141,6 +1188,7 @@ mod tests {
     },
     mio_source,
     network::udp_sender::UDPSender,
+    polling::{new_shared_timer, wake_channel, LoopWaker},
     rtps::{
       message_receiver::*,
       reader::{Reader, ReaderIngredients},
@@ -1190,7 +1238,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     let default_id = EntityId::default();
     let reader_guid = GUID::new_with_prefix_and_id(dp.guid_prefix(), default_id);
@@ -1207,12 +1255,13 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1373,7 +1422,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     let default_id = EntityId::default();
     let reader_guid = GUID::new_with_prefix_and_id(dp.guid_prefix(), default_id);
@@ -1390,12 +1439,13 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 

@@ -400,6 +400,11 @@ where
     self.keyed_datawriter.as_status_source()
   }
 
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.keyed_datawriter.as_status_source_mio1()
+  }
+
   fn as_async_status_stream(&'a self) -> StatusReceiverStream<'a, DataWriterStatus> {
     self.keyed_datawriter.as_async_status_stream()
   }

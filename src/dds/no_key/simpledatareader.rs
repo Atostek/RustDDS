@@ -199,6 +199,34 @@ where
   }
 }
 
+#[cfg(feature = "mio_1")]
+impl<D, DA> mio1::event::Source for SimpleDataReader<D, DA>
+where
+  DA: DeserializerAdapter<D>,
+{
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    mio1::event::Source::register(&mut self.keyed_simpledatareader, registry, token, interests)
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    mio1::event::Source::reregister(&mut self.keyed_simpledatareader, registry, token, interests)
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
+    mio1::event::Source::deregister(&mut self.keyed_simpledatareader, registry)
+  }
+}
+
 //use crate::with_key::SimpleDataReaderEventStream;
 
 impl<'a, D, DA> StatusEvented<'a, DataReaderStatus, SimpleDataReaderEventStream<'a, D, DA>>
@@ -214,6 +242,11 @@ where
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.keyed_simpledatareader.as_status_source()
+  }
+
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.keyed_simpledatareader.as_status_source_mio1()
   }
 
   fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {

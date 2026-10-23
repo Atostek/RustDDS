@@ -5,7 +5,6 @@ use std::{
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use mio_extras::channel as mio_channel;
 
 use crate::{
   create_security_error_and_log,
@@ -15,6 +14,7 @@ use crate::{
     with_key::{DataSample, Sample, WriteOptionsBuilder},
     WriteError,
   },
+  polling::WakeSender,
   qos, rpc,
   rtps::constant::{
     DiscoveryNotificationType, SECURE_BUILTIN_READERS_INIT_LIST, SECURE_BUILTIN_WRITERS_INIT_LIST,
@@ -268,7 +268,7 @@ impl SecureDiscovery {
     &mut self,
     ds: &DataSample<SpdpDiscoveredParticipantData>,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
     auth_msg_writer: &no_key::DataWriter<ParticipantStatelessMessage>,
   ) -> NormalDiscoveryPermission {
     match &ds.value {
@@ -292,7 +292,7 @@ impl SecureDiscovery {
     &mut self,
     participant_data: &SpdpDiscoveredParticipantData,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
     auth_msg_writer: &no_key::DataWriter<ParticipantStatelessMessage>,
   ) -> NormalDiscoveryPermission {
     let guid_prefix = participant_data.participant_guid.prefix;
@@ -814,7 +814,7 @@ impl SecureDiscovery {
       spdp_participant_data::Participant_GUID,
     >,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    _discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    _discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
   ) -> NormalDiscoveryPermission {
     // First check that the participant is authenticated (should be at this point)
     let guidp = match ds {
@@ -1295,7 +1295,7 @@ impl SecureDiscovery {
     &mut self,
     participant_data: &SpdpDiscoveredParticipantData,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
     auth_msg_writer: &no_key::DataWriter<ParticipantStatelessMessage>,
   ) -> AuthenticationStatus {
     // Gather some needed items
@@ -1412,7 +1412,7 @@ impl SecureDiscovery {
     participant_guid_prefix: GuidPrefix,
     new_status: AuthenticationStatus,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
   ) {
     let mut db = discovery_db_write(discovery_db);
     db.update_authentication_status(participant_guid_prefix, new_status);
@@ -1579,7 +1579,7 @@ impl SecureDiscovery {
     &mut self,
     message: &ParticipantStatelessMessage,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
     auth_msg_writer: &no_key::DataWriter<ParticipantStatelessMessage>,
   ) {
     if !self.is_stateless_msg_for_local_participant(message) {
@@ -1738,7 +1738,7 @@ impl SecureDiscovery {
     received_message: &ParticipantStatelessMessage,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
     auth_msg_writer: &no_key::DataWriter<ParticipantStatelessMessage>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
   ) {
     let remote_guid_prefix = received_message.generic.source_guid_prefix();
     debug!(
@@ -1838,7 +1838,7 @@ impl SecureDiscovery {
     &mut self,
     received_message: &ParticipantStatelessMessage,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
   ) {
     let remote_guid_prefix = received_message.generic.source_guid_prefix();
     debug!(
@@ -2037,7 +2037,7 @@ impl SecureDiscovery {
     &mut self,
     remote_guid_prefix: GuidPrefix,
     discovery_db: &Arc<RwLock<DiscoveryDB>>,
-    discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+    discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
   ) {
     security_info!("Authenticated successfully Participant {remote_guid_prefix:?}");
 
@@ -2691,7 +2691,7 @@ impl SecureDiscovery {
 }
 
 fn send_discovery_notification(
-  discovery_updated_sender: &mio_channel::SyncSender<DiscoveryNotificationType>,
+  discovery_updated_sender: &WakeSender<DiscoveryNotificationType>,
   dntype: DiscoveryNotificationType,
 ) {
   match discovery_updated_sender.send(dntype) {

@@ -41,7 +41,7 @@ use crate::{
   },
   mio_source,
   network::udp_sender::UDPSender,
-  polling::SharedTimer,
+  polling::{ReadySender, SharedTimer, WakeReceiver},
   rtps::{
     fragment_assembler::FragmentAssembler, message_receiver::MessageReceiverState,
     rtps_writer_proxy::RtpsWriterProxy, timed_event::DpTimerEvent, Message,
@@ -80,9 +80,12 @@ pub(crate) struct ReaderIngredients {
                                                           * cache */
   pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Reader)
   pub qos_policy: QosPolicies,
-  pub data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
+  pub data_reader_command_receiver: WakeReceiver<ReaderCommand>,
   pub(crate) data_reader_waker: Arc<Mutex<Option<Waker>>>,
   pub(crate) poll_event_sender: mio_source::PollEventSender,
+  /// When this reader is a built-in discovery reader, cache changes also wake
+  /// Discovery's mio 1.2 poll with the reader's discovery token.
+  pub(crate) discovery_notify: Option<(ReadySender<mio_06::Token>, mio_06::Token)>,
 
   pub(crate) security_plugins: Option<SecurityPluginsHandle>,
 }
@@ -140,9 +143,10 @@ pub(crate) struct Reader {
   offered_incompatible_qos_count: i32,
 
   pub(crate) timed_event_timer: SharedTimer<DpTimerEvent>,
-  pub(crate) data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
+  pub(crate) data_reader_command_receiver: WakeReceiver<ReaderCommand>,
   data_reader_waker: Arc<Mutex<Option<Waker>>>,
   poll_event_sender: mio_source::PollEventSender,
+  discovery_notify: Option<(ReadySender<mio_06::Token>, mio_06::Token)>,
 
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
@@ -207,6 +211,7 @@ impl Reader {
       data_reader_command_receiver: i.data_reader_command_receiver,
       data_reader_waker: i.data_reader_waker,
       poll_event_sender: i.poll_event_sender,
+      discovery_notify: i.discovery_notify,
       participant_status_sender,
 
       security_plugins: i.security_plugins,
@@ -215,8 +220,9 @@ impl Reader {
   // TODO: check if it's necessary to implement different handlers for discovery
   // and user messages
 
-  /// To know when token represents a reader we should look entity attribute
-  /// kind
+  /// Entity id encoded as a mio token. The internal poll no longer registers
+  /// per-reader tokens; the ready queue carries the id instead.
+  #[allow(dead_code)]
   pub fn entity_token(&self) -> Token {
     self.guid().entity_id.as_token()
   }
@@ -1219,8 +1225,13 @@ impl Reader {
       .take() // Take to nullify the reference
       .map(|w| w.wake_by_ref()); // If Some, call wake_by_ref
 
-    // mio-0.8 notify
+    // mio-0.8 / mio-1.2 notify for a caller-owned poll.
     self.poll_event_sender.send();
+
+    // Discovery's poll cannot register the mio-0.6 notification channel.
+    if let Some((sender, token)) = &self.discovery_notify {
+      sender.notify(*token);
+    }
 
     // mio-0.6 notify
     match self.notification_sender.try_send(()) {
@@ -1465,6 +1476,7 @@ mod tests {
 
   use crate::{
     dds::{qos::policy::Reliability, statusevents::sync_status_channel, typedesc::TypeDesc},
+    polling::{new_shared_timer, wake_channel, LoopWaker},
     structure::{dds_cache::DDSCache, guid::EntityKind},
     QosPolicyBuilder,
   };
@@ -1500,7 +1512,7 @@ mod tests {
 
     // Create reader command channel
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then finally create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1516,11 +1528,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1585,7 +1598,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1601,11 +1614,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1691,7 +1705,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1707,11 +1721,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1800,7 +1815,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1816,11 +1831,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1938,7 +1954,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     let like_stateless = true;
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1954,11 +1970,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 

@@ -27,7 +27,7 @@ use crate::{
   StatusEvented, GUID,
 };
 use super::wrappers::{DAWrapper, NoKeyWrapper};
-#[cfg(feature = "mio_08")]
+#[cfg(any(feature = "mio_08", feature = "mio_1"))]
 use crate::dds::with_key::DataReader as WithKeyDataReader;
 
 /// Simplified type for CDR encoding
@@ -521,6 +521,47 @@ where
   }
 }
 
+#[cfg(feature = "mio_1")]
+impl<D, DA> mio1::event::Source for DataReader<D, DA>
+where
+  DA: DeserializerAdapter<D>,
+{
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    <WithKeyDataReader<NoKeyWrapper<D>, DAWrapper<DA>> as mio1::event::Source>::register(
+      &mut self.keyed_datareader,
+      registry,
+      token,
+      interests,
+    )
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    <WithKeyDataReader<NoKeyWrapper<D>, DAWrapper<DA>> as mio1::event::Source>::reregister(
+      &mut self.keyed_datareader,
+      registry,
+      token,
+      interests,
+    )
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
+    <WithKeyDataReader<NoKeyWrapper<D>, DAWrapper<DA>> as mio1::event::Source>::deregister(
+      &mut self.keyed_datareader,
+      registry,
+    )
+  }
+}
+
 /// WARNING! UNTESTED
 //  TODO: test
 use crate::no_key::SimpleDataReaderEventStream;
@@ -538,6 +579,11 @@ where
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.keyed_datareader.as_status_source()
+  }
+
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.keyed_datareader.as_status_source_mio1()
   }
 
   fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {

@@ -48,7 +48,7 @@ static_assertions::const_assert!(MESSAGE_BUFFER_ALLOCATION_CHUNK > MAX_MESSAGE_S
 /// called.
 #[derive(Debug)]
 pub struct UDPListener {
-  socket: mio_06::net::UdpSocket,
+  socket: mio1::net::UdpSocket,
   receive_buffer: BytesMut,
   multicast_group: Option<Ipv4Addr>,
   has_multicast_join: bool,
@@ -76,7 +76,7 @@ impl UDPListener {
     port: u16,
     reuse_addr: bool,
     recv_buffer_size: usize,
-  ) -> io::Result<mio_06::net::UdpSocket> {
+  ) -> io::Result<mio1::net::UdpSocket> {
     let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
     if recv_buffer_size > 0 {
@@ -156,8 +156,8 @@ impl UDPListener {
       .set_nonblocking(true)
       .map_err(|e| io::Error::other(format!("Failed to set std socket to non blocking: {e}")))?;
 
-    let mio_socket = mio_06::net::UdpSocket::from_socket(std_socket)
-      .map_err(|e| io::Error::other(format!("Unable to create mio socket: {e}")))?;
+    // mio 1.2 takes the already-nonblocking std socket directly.
+    let mio_socket = mio1::net::UdpSocket::from_std(std_socket);
     info!(
       "UDPListener: new socket with address {:?}",
       mio_socket.local_addr()
@@ -265,7 +265,7 @@ impl UDPListener {
     })
   }
 
-  pub fn mio_socket(&mut self) -> &mut mio_06::net::UdpSocket {
+  pub fn mio_socket(&mut self) -> &mut mio1::net::UdpSocket {
     &mut self.socket
   }
 
@@ -310,12 +310,12 @@ impl UDPListener {
 
   /// Drain up to `max_messages` datagrams waiting in the socket, each paired
   /// with its [`PacketOrigin`] (source address + receiving interface, when
-  /// available). Pass `usize::MAX` to read everything currently queued. Used
-  /// by the event loop to cap how much bulk traffic one socket can process
-  /// per poll iteration, so a flood on one socket cannot starve the
-  /// (single-threaded) loop from servicing discovery/control sockets. Relies
-  /// on the listener being registered level-triggered, so undrained data
-  /// re-fires on the next poll.
+  /// available). Pass `usize::MAX` to read everything currently queued.
+  ///
+  /// The reactor registers listeners edge-triggered, so it must pass
+  /// `usize::MAX`: a datagram left unread does not produce another readiness
+  /// event. `Ok(None)` from [`recv_one`](Self::recv_one) (`WouldBlock`) ends
+  /// the drain.
   pub fn messages_bounded(&mut self, max_messages: usize) -> Vec<(Bytes, PacketOrigin)> {
     let mut messages = Vec::with_capacity(4);
 

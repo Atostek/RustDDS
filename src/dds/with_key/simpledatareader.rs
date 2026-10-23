@@ -28,6 +28,7 @@ use crate::{
   },
   discovery::discovery::DiscoveryCommand,
   mio_source::PollEventSource,
+  polling::{BoundSender, WakeSender},
   serialization::CDRDeserializerAdapter,
   structure::{
     cache_change::CacheChange,
@@ -103,12 +104,12 @@ pub struct SimpleDataReader<D: Keyed, DA: DeserializerAdapter<D> = CDRDeserializ
 
   deserializer_type: PhantomData<DA>, // This is to provide use for DA
 
-  discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+  discovery_command: WakeSender<DiscoveryCommand>,
   status_receiver: StatusChannelReceiver<DataReaderStatus>,
 
   #[allow(dead_code)] // TODO: This is currently unused, because we do not implement
   // resetting deadline missed status. Remove attribute when it is supported.
-  reader_command: mio_channel::SyncSender<ReaderCommand>,
+  reader_command: BoundSender<ReaderCommand>,
   data_reader_waker: Arc<Mutex<Option<Waker>>>,
 
   event_source: PollEventSource,
@@ -129,10 +130,9 @@ where
       .send(DiscoveryCommand::RemoveLocalReader { guid: self.my_guid })
     {
       Ok(_) => {}
-      Err(mio_channel::SendError::Disconnected(_)) => {
+      Err(_) => {
         debug!("Failed to send DiscoveryCommand::RemoveLocalReader . Maybe shutting down?");
       }
-      Err(e) => error!("Failed to send DiscoveryCommand::RemoveLocalReader. {e:?}"),
     }
   }
 }
@@ -151,9 +151,9 @@ where
     // Each notification sent to this channel must be try_recv'd
     notification_receiver: mio_channel::Receiver<()>,
     topic_cache: Arc<Mutex<TopicCache>>,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    discovery_command: WakeSender<DiscoveryCommand>,
     status_receiver: StatusChannelReceiver<DataReaderStatus>,
-    reader_command: mio_channel::SyncSender<ReaderCommand>,
+    reader_command: BoundSender<ReaderCommand>,
     data_reader_waker: Arc<Mutex<Option<Waker>>>,
     event_source: PollEventSource,
   ) -> CreateResult<Self> {
@@ -510,6 +510,35 @@ where
   }
 }
 
+#[cfg(feature = "mio_1")]
+impl<D, DA> mio1::event::Source for SimpleDataReader<D, DA>
+where
+  D: Keyed,
+  DA: DeserializerAdapter<D>,
+{
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    self.event_source.register(registry, token, interests)
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    self.event_source.reregister(registry, token, interests)
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
+    self.event_source.deregister(registry)
+  }
+}
+
 impl<'a, D, DA> StatusEvented<'a, DataReaderStatus, SimpleDataReaderEventStream<'a, D, DA>>
   for SimpleDataReader<D, DA>
 where
@@ -523,6 +552,11 @@ where
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.status_receiver.as_status_source()
+  }
+
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.status_receiver.as_status_source_mio1()
   }
 
   fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {

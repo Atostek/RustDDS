@@ -849,6 +849,7 @@ mod tests {
       with_key::simpledatareader::ReaderCommand,
     },
     mio_source,
+    polling::{wake_channel, LoopWaker},
     serialization::CDRSerializerAdapter,
     structure::guid::*,
     test::{
@@ -1092,7 +1093,7 @@ mod tests {
 
     let (status_sender1, _status_receiver1) = sync_status_channel::<DataReaderStatus>(4).unwrap();
     let (_reader_commander1, reader_command_receiver1) =
-      mio_extras::channel::sync_channel::<ReaderCommand>(100);
+      wake_channel::<ReaderCommand>(100, &LoopWaker::new());
 
     let topic_cache =
       dp.dds_cache()
@@ -1112,6 +1113,7 @@ mod tests {
       data_reader_waker: data_reader_waker1,
       poll_event_sender: notification_event_sender1,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     // Add the reader to the database and verify the info is updated
@@ -1142,7 +1144,7 @@ mod tests {
 
     let (status_sender2, _status_receiver2) = sync_status_channel::<DataReaderStatus>(4).unwrap();
     let (_reader_commander2, reader_command_receiver2) =
-      mio_extras::channel::sync_channel::<ReaderCommand>(100);
+      wake_channel::<ReaderCommand>(100, &LoopWaker::new());
 
     let mut guid2 = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
     guid2.prefix = GuidPrefix::new(b"Another fake"); // GUID needs to be different in order to be added
@@ -1159,6 +1161,7 @@ mod tests {
       data_reader_waker: data_reader_waker2,
       poll_event_sender: notification_event_sender2,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     // Add the second reader to the database and verify the info is updated

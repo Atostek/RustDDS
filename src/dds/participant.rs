@@ -38,6 +38,10 @@ use crate::{
     sedp_messages::{DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData},
   },
   network::{constant::*, udp_listener::UDPListener},
+  polling::{
+    ready_channel, wake_channel, wake_channel_unbounded, LoopWaker, ReadySender, WakeReceiver,
+    WakeSender, WakeUnboundedSender,
+  },
   rtps::{
     constant::*,
     dp_event_loop::{DPEventLoop, DomainInfo, EventLoopCommand},
@@ -277,15 +281,20 @@ impl DomainParticipantBuilder {
     // stop.
     let (djh_sender, djh_receiver) = mio_channel::channel();
 
+    // One waker per reactor. Queues created now can enqueue before the loop
+    // installs the waker; the loop drains once after install.
+    let dp_waker = LoopWaker::new();
+    let discovery_waker = LoopWaker::new();
+
     // Channel is used to notify Discovery of (duplicate) SPDP messages from the
     // wire.
-    let (spdp_liveness_sender, spdp_liveness_receiver) = mio_channel::sync_channel(8);
+    let (spdp_liveness_sender, spdp_liveness_receiver) = wake_channel(8, &discovery_waker);
 
     // Discovery thread receives and decodes updates from the wire.
     // It updates data to DiscoveryDB, and sends notifications to dp_event_loop,
     // which owns the Readers and Writers and notifies them also.
     let (discovery_updated_sender, discovery_update_notification_receiver) =
-      mio_channel::sync_channel::<DiscoveryNotificationType>(32);
+      wake_channel::<DiscoveryNotificationType>(32, &dp_waker);
 
     // This channel is used to:
     // * local DataReader and DataWriter notify Discovery on drop() so that
@@ -300,7 +309,12 @@ impl DomainParticipantBuilder {
     // command that does not fit, so Discovery never announces that endpoint.
     // A still larger burst is dropped.
     let (discovery_command_sender, discovery_command_receiver) =
-      mio_channel::sync_channel::<DiscoveryCommand>(1024);
+      wake_channel::<DiscoveryCommand>(1024, &discovery_waker);
+
+    // Built-in discovery readers report new samples here. The token says which
+    // reader. User readers do not use this queue.
+    let (discovery_sample_sender, discovery_sample_receiver) =
+      ready_channel::<mio_06::Token>(&discovery_waker);
 
     // Channel used to report noteworthy events to DomainParticipant.
     // Capacity must be large enough to absorb the SEDP burst when multiple
@@ -330,6 +344,8 @@ impl DomainParticipantBuilder {
       self.socket_send_buffer_size,
       self.only_networks,
       self.same_host_loopback,
+      dp_waker,
+      discovery_sample_sender,
     )?;
 
     // outer DP wrapper
@@ -354,6 +370,8 @@ impl DomainParticipantBuilder {
           spdp_liveness_receiver,
           status_sender,
           security_plugins_handle,
+          discovery_waker,
+          discovery_sample_receiver,
         ) {
           discovery.discovery_event_loop(); // run the event loop
         }
@@ -657,6 +675,11 @@ impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatus
     self
   }
 
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self
+  }
+
   fn as_async_status_stream(&'a self) -> DomainParticipantStatusStream<'a> {
     DomainParticipantStatusStream {
       status_listener: self,
@@ -704,6 +727,46 @@ impl mio_08::event::Source for DomainParticipantStatusListener {
   }
 
   fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    self
+      .dp_disc
+      .lock()
+      .unwrap()
+      .status_channel_receiver_mut()
+      .deregister(registry)
+  }
+}
+
+#[cfg(feature = "mio_1")]
+impl mio1::event::Source for DomainParticipantStatusListener {
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    self
+      .dp_disc
+      .lock()
+      .unwrap()
+      .status_channel_receiver_mut()
+      .register(registry, token, interests)
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    self
+      .dp_disc
+      .lock()
+      .unwrap()
+      .status_channel_receiver_mut()
+      .reregister(registry, token, interests)
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
     self
       .dp_disc
       .lock()
@@ -891,7 +954,7 @@ impl RTPSEntity for DomainParticipantWeak {
 pub(crate) struct DomainParticipantDisc {
   dpi: DomainParticipantInner,
   // Discovery control
-  discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
+  discovery_command_sender: WakeSender<DiscoveryCommand>,
   discovery_join_handle: mio_channel::Receiver<JoinHandle<()>>,
   // This allows deterministic generation of EntityIds for DataReader, DataWriter, etc.
   entity_id_generator: atomic::AtomicU32,
@@ -904,9 +967,9 @@ impl DomainParticipantDisc {
     participant_guid: GUID,
     qos_policies: QosPolicies,
     discovery_join_handle: mio_channel::Receiver<JoinHandle<()>>,
-    discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
-    discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
-    spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
+    discovery_update_notification_receiver: WakeReceiver<DiscoveryNotificationType>,
+    discovery_command_sender: WakeSender<DiscoveryCommand>,
+    spdp_liveness_sender: WakeSender<GuidPrefix>,
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
@@ -914,6 +977,8 @@ impl DomainParticipantDisc {
     socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
     same_host_loopback: bool,
+    dp_waker: LoopWaker,
+    discovery_sample_sender: ReadySender<mio_06::Token>,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -929,6 +994,8 @@ impl DomainParticipantDisc {
       socket_send_buffer_size,
       only_networks,
       same_host_loopback,
+      dp_waker,
+      discovery_sample_sender,
     )?;
 
     Ok(Self {
@@ -1096,17 +1163,23 @@ pub(crate) struct DomainParticipantInner {
   my_qos_policies: QosPolicies,
 
   // Adding Readers
-  sender_add_reader: mio_channel::SyncSender<ReaderIngredients>,
-  sender_remove_reader: mio_channel::SyncSender<GUID>,
+  sender_add_reader: WakeSender<ReaderIngredients>,
+  sender_remove_reader: WakeSender<GUID>,
+  /// Reader-command ready queue. A send records the reader entity id.
+  reader_ready: ReadySender<EntityId>,
+  /// Built-in discovery readers enqueue their poll token here.
+  discovery_sample_sender: ReadySender<mio_06::Token>,
 
   // dp_event_loop control
-  stop_poll_sender: mio_channel::Sender<EventLoopCommand>,
+  stop_poll_sender: WakeUnboundedSender<EventLoopCommand>,
   ev_loop_handle: Option<JoinHandle<()>>, // this is Option, because it needs to be extracted
   // out of the struct (take) in order to .join() on the handle.
 
   // Writers
-  add_writer_sender: mio_channel::SyncSender<WriterIngredients>,
-  remove_writer_sender: mio_channel::SyncSender<GUID>,
+  add_writer_sender: WakeSender<WriterIngredients>,
+  remove_writer_sender: WakeSender<GUID>,
+  /// Writer doorbell ready queue. Ringing records the writer entity id.
+  writer_ready: ReadySender<EntityId>,
 
   dds_cache: Arc<RwLock<DDSCache>>,
   discovery_db: Arc<RwLock<DiscoveryDB>>,
@@ -1153,9 +1226,9 @@ impl DomainParticipantInner {
     domain_id: u16,
     participant_guid: GUID,
     _qos_policies: QosPolicies,
-    discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
-    discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
-    spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
+    discovery_update_notification_receiver: WakeReceiver<DiscoveryNotificationType>,
+    discovery_command_sender: WakeSender<DiscoveryCommand>,
+    spdp_liveness_sender: WakeSender<GuidPrefix>,
     status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
@@ -1163,6 +1236,8 @@ impl DomainParticipantInner {
     socket_send_buffer_size: usize,
     only_networks: Option<Vec<IpAddr>>,
     same_host_loopback: bool,
+    dp_waker: LoopWaker,
+    discovery_sample_sender: ReadySender<mio_06::Token>,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
@@ -1264,15 +1339,16 @@ impl DomainParticipantInner {
       )
       .collect();
 
-    // Adding readers
+    // Adding readers. Capacities match the previous mio-extras channels.
     let (sender_add_reader, receiver_add_reader) =
-      mio_channel::sync_channel::<ReaderIngredients>(100);
-    let (sender_remove_reader, receiver_remove_reader) = mio_channel::sync_channel::<GUID>(4);
+      wake_channel::<ReaderIngredients>(100, &dp_waker);
+    let (sender_remove_reader, receiver_remove_reader) = wake_channel::<GUID>(4, &dp_waker);
 
     // Writers
-    let (add_writer_sender, add_writer_receiver) =
-      mio_channel::sync_channel::<WriterIngredients>(10);
-    let (remove_writer_sender, remove_writer_receiver) = mio_channel::sync_channel::<GUID>(4);
+    let (add_writer_sender, add_writer_receiver) = wake_channel::<WriterIngredients>(10, &dp_waker);
+    let (remove_writer_sender, remove_writer_receiver) = wake_channel::<GUID>(4, &dp_waker);
+    let (reader_ready, reader_ready_rx) = ready_channel(&dp_waker);
+    let (writer_ready, writer_ready_rx) = ready_channel(&dp_waker);
 
     let domain_info = DomainInfo {
       domain_participant_guid: participant_guid,
@@ -1294,7 +1370,7 @@ impl DomainParticipantInner {
       status_sender.clone(),
     )));
 
-    let (stop_poll_sender, stop_poll_receiver) = mio_channel::channel();
+    let (stop_poll_sender, stop_poll_receiver) = wake_channel_unbounded(&dp_waker);
 
     let (ev_ready_tx, ev_ready_rx) = std::sync::mpsc::sync_channel::<CreateResult<()>>(1);
 
@@ -1336,6 +1412,9 @@ impl DomainParticipantInner {
           only_networks_for_ev_loop,
           socket_send_buffer_size,
           same_host_loopback,
+          reader_ready_rx,
+          writer_ready_rx,
+          dp_waker,
         ) {
           Ok(dp_event_loop) => {
             let _ = ev_ready_tx.send(Ok(()));
@@ -1371,10 +1450,13 @@ impl DomainParticipantInner {
       my_qos_policies: _qos_policies,
       sender_add_reader,
       sender_remove_reader,
+      reader_ready,
+      discovery_sample_sender,
       stop_poll_sender,
       ev_loop_handle: Some(ev_loop_handle),
       add_writer_sender,
       remove_writer_sender,
+      writer_ready,
       dds_cache,
       discovery_db,
       discovery_db_event_receiver,
@@ -1407,7 +1489,7 @@ impl DomainParticipantInner {
     &self,
     domain_participant: &DomainParticipantWeak,
     qos: &QosPolicies,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    discovery_command: WakeSender<DiscoveryCommand>,
   ) -> CreateResult<Publisher> {
     Ok(Publisher::new(
       domain_participant.clone(),
@@ -1418,6 +1500,7 @@ impl DomainParticipantInner {
       self.remove_writer_sender.clone(),
       discovery_command,
       self.security_plugins_handle.clone(),
+      self.writer_ready.clone(),
     ))
   }
 
@@ -1425,7 +1508,7 @@ impl DomainParticipantInner {
     &self,
     domain_participant: &DomainParticipantWeak,
     qos: &QosPolicies,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    discovery_command: WakeSender<DiscoveryCommand>,
   ) -> CreateResult<Subscriber> {
     Ok(Subscriber::new(
       domain_participant.clone(),
@@ -1435,6 +1518,8 @@ impl DomainParticipantInner {
       self.sender_remove_reader.clone(),
       discovery_command,
       self.security_plugins_handle.clone(),
+      self.reader_ready.clone(),
+      self.discovery_sample_sender.clone(),
     ))
   }
 

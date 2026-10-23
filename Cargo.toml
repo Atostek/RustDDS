@@ -40,6 +40,13 @@ strip = false
 # NOTE: this feature is NOT enabled by default.
 mio_08 = ["dep:mio_08", "dep:socketpair"]
 
+# Feature "mio_1" exposes integration with the "mio" crate version 1.2:
+# DataReaders/DataWriters implement `mio1::event::Source` so they can be
+# registered directly with a mio-1.2 `Poll`. The internal reactor always uses
+# mio 1.2. This feature is not enabled by default; without it, the public
+# polling API is still mio-0.6 (`Evented`) and async `Stream`.
+mio_1 = ["dep:socketpair"]
+
 # Feature "security" implements the OMG "DDS Security" specification v 1.1
 # It adds a large amount of new code and dependencies.
 security = [
@@ -59,6 +66,10 @@ build_openssl = ["openssl?/vendored"]
 [dependencies]
 mio_06 = { package = "mio" , version ="^0.6.23" } 
 mio-extras = "2.0.6"
+
+# Internal reactor (sockets, waker). Not re-exported; the public `mio` name
+# stays mio 0.6. See `pub use mio_06 as mio` in src/lib.rs.
+mio1 = { package = "mio", version = "1.2", features = ["net", "os-poll", "os-ext"] }
 
 mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"], optional = true } 
 socketpair = { version = "0.19", optional = true }
@@ -141,3 +152,10 @@ libc = "0.2" # for ddsperf CPU/RSS reporting on macOS
 name = "shapes_demo_mio_08"
 path = "examples/shapes_demo_mio_08/main.rs"
 required-features = ["mio_08"]
+
+# Same demo, registered with a mio-1.2 Poll. Requires the optional "mio_1"
+# feature. The default build does not include it.
+[[example]]
+name = "shapes_demo_mio_1"
+path = "examples/shapes_demo_mio_1/main.rs"
+required-features = ["mio_1"]

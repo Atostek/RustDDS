@@ -63,14 +63,15 @@
 //!
 //! # Polling multiple DataReaders
 //!
-//! There are three alternative methods to poll DataReaders (and DataWriters):
-//! mio-0.6, mio-0.8, and async. Use only one of these!
+//! There are four alternative methods to poll DataReaders (and DataWriters):
+//! mio-0.6, optional mio-0.8, optional mio-1.2, and async. Use only one of these!
 //!
 //! ## `mio-0.6`
 //!
 //! RustDDS is designed to used with [mio](mio_06) version 0.6.x. DataReaders
 //! implement [`Evented`](mio_06::event::Evented) so that they can be directly
 //! registered to a [`poll`](mio_06::Poll). See example `shapes_demo`.
+//! This is the default synchronous polling API.
 //!
 //! ## `mio-0.8`
 //!
@@ -78,6 +79,14 @@
 //! `mio_08::event::Source` for registering with mio-0.8. See example
 //! `shapes_demo_mio_08`. This feature is not enabled by default; without it,
 //! use the mio-0.6 (`Evented`) or `async` polling mechanisms below.
+//!
+//! ## `mio-1.2`
+//!
+//! When the optional `mio_1` feature is enabled, RustDDS DataReaders implement
+//! `mio` 1.2's `event::Source` (the `mio1` crate). See example
+//! `shapes_demo_mio_1`. This feature is not enabled by default. The default
+//! build still offers only mio-0.6 and async. The internal reactor always uses
+//! mio 1.2; that is separate from this public registration API.
 //!
 //!
 //! ## `async`

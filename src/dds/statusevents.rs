@@ -46,6 +46,8 @@ where
   fn as_status_evented(&mut self) -> &dyn Evented; // This is for polling with mio-0.6.x
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source; // This is for polling with mio-0.8.x
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source; // This is for polling with mio-1.2
   fn as_async_status_stream(&'a self) -> S;
   fn try_recv_status(&self) -> Option<E>;
 }
@@ -149,6 +151,11 @@ impl<'a, E> StatusEvented<'a, E, StatusReceiverStream<'a, E>> for StatusChannelR
     self
   }
 
+  #[cfg(feature = "mio_1")]
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self
+  }
+
   fn as_async_status_stream(&'a self) -> StatusReceiverStream<'a, E> {
     StatusReceiverStream {
       sync_receiver: self,
@@ -213,6 +220,31 @@ impl<T> event::Source for StatusChannelReceiver<T> {
   }
 
   fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    self.signal_receiver.deregister(registry)
+  }
+}
+
+#[cfg(feature = "mio_1")]
+impl<T> mio1::event::Source for StatusChannelReceiver<T> {
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    self.signal_receiver.register(registry, token, interests)
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    self.signal_receiver.reregister(registry, token, interests)
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
     self.signal_receiver.deregister(registry)
   }
 }
