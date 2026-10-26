@@ -820,6 +820,7 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
+  #[allow(clippy::too_many_arguments)]
   pub(super) fn new(
     domain_participant: DomainParticipantWeak,
     discovery_db: Arc<RwLock<DiscoveryDB>>,
@@ -1064,6 +1065,7 @@ pub struct InnerSubscriber {
 }
 
 impl InnerSubscriber {
+  #[allow(clippy::too_many_arguments)]
   pub(super) fn new(
     domain_participant: DomainParticipantWeak,
     discovery_db: Arc<RwLock<DiscoveryDB>>,
