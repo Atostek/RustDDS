@@ -4,14 +4,13 @@ use std::{
   collections::{BTreeMap, BTreeSet},
   ops::Bound::Included,
   rc::Rc,
-  sync::atomic,
+  sync::{atomic, mpsc::TrySendError},
 };
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use speedy::Endianness;
-use mio_extras::channel::TrySendError;
-use mio_06::Token;
+use mio1::Token;
 
 use crate::{
   dds::{
@@ -1916,7 +1915,7 @@ impl Writer {
   fn send_status(&self, status: DataWriterStatus) {
     self
       .status_sender
-      .try_send(status)
+      .try_send_impl(status)
       .unwrap_or_else(|e| match e {
         // TODO: dead code. `StatusChannelSender::try_send` currently converts a
         // full channel into `Ok(())` (dropping the event), so this arm is never
@@ -1925,9 +1924,6 @@ impl Writer {
         TrySendError::Full(_) => (), // This is normal in case there is no receiver
         TrySendError::Disconnected(_) => {
           debug!("send_status - status receiver is disconnected");
-        }
-        TrySendError::Io(e) => {
-          warn!("send_status - io error {e:?}");
         }
       });
   }

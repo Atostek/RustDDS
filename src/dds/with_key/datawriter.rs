@@ -848,6 +848,7 @@ where
   D: Keyed,
   SA: SerializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn mio_06::Evented {
     self.status_receiver.as_status_evented()
   }
@@ -857,7 +858,6 @@ where
     self.status_receiver.as_status_source()
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self.status_receiver.as_status_source_mio1()
   }

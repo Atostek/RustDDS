@@ -15,7 +15,9 @@ use std::{
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use futures::stream::{FusedStream, Stream};
+#[cfg(feature = "mio_06")]
 use mio_06::Evented;
+#[cfg(feature = "mio_06")]
 use mio_extras::channel as mio_channel;
 #[cfg(feature = "mio_08")]
 use mio_08::{event, Interest, Registry, Token};
@@ -43,10 +45,10 @@ where
   // The lifetime variable 'a marks the lifetime of the async stream object, if
   // such is requested. The stream object typically contains a reference to
   // self, so it is to ensure correct lifetimes.
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn Evented; // This is for polling with mio-0.6.x
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source; // This is for polling with mio-0.8.x
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source; // This is for polling with mio-1.2
   fn as_async_status_stream(&'a self) -> S;
   fn try_recv_status(&self) -> Option<E>;
@@ -56,26 +58,31 @@ where
 // -------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------
 
-// a wrapper(s) for mio_channel augmented with
-// poll channel, so that it can be used together with mio-0.8
-// This is only used so that a mio-0.6 channel can pose as a
-// mio-0.8 event::Source.
+// A bounded standard queue augmented with a poll channel. Mio 1.2 is always
+// supported; a separate mio-extras unit channel keeps the legacy mio 0.6
+// Evented implementation available without making it part of the core queue.
 
 pub(crate) fn sync_status_channel<T>(
   capacity: usize,
 ) -> io::Result<(StatusChannelSender<T>, StatusChannelReceiver<T>)> {
   let (signal_receiver, signal_sender) = make_poll_channel()?;
-  let (actual_sender, actual_receiver) = mio_channel::sync_channel(capacity);
+  let (actual_sender, actual_receiver) = std::sync::mpsc::sync_channel(capacity);
+  #[cfg(feature = "mio_06")]
+  let (legacy_sender, legacy_receiver) = mio_channel::sync_channel(capacity);
   let waker = Arc::new(Mutex::new(None));
   Ok((
     StatusChannelSender {
       actual_sender,
       signal_sender,
+      #[cfg(feature = "mio_06")]
+      legacy_sender,
       waker: Arc::clone(&waker),
     },
     StatusChannelReceiver {
       actual_receiver: Mutex::new(actual_receiver),
       signal_receiver,
+      #[cfg(feature = "mio_06")]
+      legacy_receiver: Mutex::new(legacy_receiver),
       waker,
     },
   ))
@@ -84,29 +91,51 @@ pub(crate) fn sync_status_channel<T>(
 // TODO: try to make this (and the Receiver) private types
 #[derive(Clone)]
 pub struct StatusChannelSender<T> {
-  actual_sender: mio_channel::SyncSender<T>,
+  actual_sender: std::sync::mpsc::SyncSender<T>,
   signal_sender: PollEventSender,
+  #[cfg(feature = "mio_06")]
+  legacy_sender: mio_channel::SyncSender<()>,
   waker: Arc<Mutex<Option<Waker>>>,
 }
 
 pub struct StatusChannelReceiver<T> {
-  actual_receiver: Mutex<mio_channel::Receiver<T>>,
+  actual_receiver: Mutex<std::sync::mpsc::Receiver<T>>,
   signal_receiver: PollEventSource,
+  #[cfg(feature = "mio_06")]
+  legacy_receiver: Mutex<mio_channel::Receiver<()>>,
   waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl<T> StatusChannelSender<T> {
+  #[cfg(feature = "mio_06")]
   /// Best-effort send. If there is no receiver, this will fail silently.
   pub fn try_send(&self, t: T) -> Result<(), mio_channel::TrySendError<T>> {
+    self.try_send_impl(t).map_err(|error| match error {
+      std::sync::mpsc::TrySendError::Full(value) => mio_channel::TrySendError::Full(value),
+      std::sync::mpsc::TrySendError::Disconnected(value) => {
+        mio_channel::TrySendError::Disconnected(value)
+      }
+    })
+  }
+
+  #[cfg(not(feature = "mio_06"))]
+  /// Best-effort send. If there is no receiver, this will fail silently.
+  pub fn try_send(&self, t: T) -> Result<(), std::sync::mpsc::TrySendError<T>> {
+    self.try_send_impl(t)
+  }
+
+  pub(crate) fn try_send_impl(&self, t: T) -> Result<(), std::sync::mpsc::TrySendError<T>> {
     let mut w = self.waker.lock().unwrap(); // lock already at the beginning
     match self.actual_sender.try_send(t) {
       Ok(()) => {
         self.signal_sender.send();
+        #[cfg(feature = "mio_06")]
+        let _ = self.legacy_sender.try_send(());
         w.as_ref().map(|w| w.wake_by_ref());
         *w = None;
         Ok(())
       }
-      Err(mio_channel::TrySendError::Full(_tt)) => {
+      Err(std::sync::mpsc::TrySendError::Full(_tt)) => {
         // Keep this at `trace!`: it is perfectly normal to fail due to a full
         // channel, because no-one is required to be listening to these. In
         // particular the built-in Discovery endpoints never drain their status
@@ -117,6 +146,8 @@ impl<T> StatusChannelSender<T> {
         // It is perfectly normal to fail due to full channel, because
         // no-one is required to be listening to these.
         self.signal_sender.send(); // kick the receiver anyway
+        #[cfg(feature = "mio_06")]
+        let _ = self.legacy_sender.try_send(());
         w.as_ref().map(|w| w.wake_by_ref());
         *w = None;
         // We convert the Err to Ok, bause we do not consider this to be an error.
@@ -133,6 +164,8 @@ impl<T> StatusChannelReceiver<T> {
     // We do not manipulate waker here, because the
     // synchronous and asynchronous receiving are not supposed to be mixed.
     self.signal_receiver.drain();
+    #[cfg(feature = "mio_06")]
+    while self.legacy_receiver.lock().unwrap().try_recv().is_ok() {}
     self.actual_receiver.lock().unwrap().try_recv()
   }
 
@@ -142,6 +175,7 @@ impl<T> StatusChannelReceiver<T> {
 }
 
 impl<'a, E> StatusEvented<'a, E, StatusReceiverStream<'a, E>> for StatusChannelReceiver<E> {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn Evented {
     self
   }
@@ -151,7 +185,6 @@ impl<'a, E> StatusEvented<'a, E, StatusReceiverStream<'a, E>> for StatusChannelR
     self
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self
   }
@@ -168,6 +201,7 @@ impl<'a, E> StatusEvented<'a, E, StatusReceiverStream<'a, E>> for StatusChannelR
   }
 }
 
+#[cfg(feature = "mio_06")]
 impl<E> Evented for StatusChannelReceiver<E> {
   // We just delegate all the operations to notification_receiver, since it
   // already implements Evented
@@ -179,7 +213,7 @@ impl<E> Evented for StatusChannelReceiver<E> {
     opts: mio_06::PollOpt,
   ) -> io::Result<()> {
     self
-      .actual_receiver
+      .legacy_receiver
       .lock()
       .unwrap()
       .register(poll, token, interest, opts)
@@ -193,14 +227,14 @@ impl<E> Evented for StatusChannelReceiver<E> {
     opts: mio_06::PollOpt,
   ) -> io::Result<()> {
     self
-      .actual_receiver
+      .legacy_receiver
       .lock()
       .unwrap()
       .reregister(poll, token, interest, opts)
   }
 
   fn deregister(&self, poll: &mio_06::Poll) -> io::Result<()> {
-    self.actual_receiver.lock().unwrap().deregister(poll)
+    self.legacy_receiver.lock().unwrap().deregister(poll)
   }
 }
 
@@ -224,7 +258,6 @@ impl<T> event::Source for StatusChannelReceiver<T> {
   }
 }
 
-#[cfg(feature = "mio_1")]
 impl<T> mio1::event::Source for StatusChannelReceiver<T> {
   fn register(
     &mut self,

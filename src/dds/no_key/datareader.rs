@@ -17,7 +17,7 @@ use crate::{
     with_key::{
       datareader as datareader_with_key,
       datasample::{DataSample as WithKeyDataSample, Sample},
-      BareDataReaderStream as WithKeyBareDataReaderStream,
+      BareDataReaderStream as WithKeyBareDataReaderStream, DataReader as WithKeyDataReader,
       DataReaderEventStream as WithKeyDataReaderEventStream,
       DataReaderStream as WithKeyDataReaderStream,
     },
@@ -27,8 +27,6 @@ use crate::{
   StatusEvented, GUID,
 };
 use super::wrappers::{DAWrapper, NoKeyWrapper};
-#[cfg(any(feature = "mio_08", feature = "mio_1"))]
-use crate::dds::with_key::DataReader as WithKeyDataReader;
 
 /// Simplified type for CDR encoding
 pub type DataReaderCdr<D> = DataReader<D, CDRDeserializerAdapter<D>>;
@@ -443,6 +441,7 @@ where
 //  TODO: test
 // This is  not part of DDS spec. We implement mio mio_06::Evented so that the
 // application can asynchronously poll DataReader(s).
+#[cfg(feature = "mio_06")]
 impl<D, DA> mio_06::Evented for DataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -521,7 +520,6 @@ where
   }
 }
 
-#[cfg(feature = "mio_1")]
 impl<D, DA> mio1::event::Source for DataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -572,6 +570,7 @@ where
   D: 'static,
   DA: DeserializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn mio_06::Evented {
     self.keyed_datareader.as_status_evented()
   }
@@ -581,7 +580,6 @@ where
     self.keyed_datareader.as_status_source()
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self.keyed_datareader.as_status_source_mio1()
   }

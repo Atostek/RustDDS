@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "rustdds"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-io",

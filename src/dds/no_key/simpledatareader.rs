@@ -133,6 +133,7 @@ where
 
 // This is  not part of DDS spec. We implement mio Eventd so that the
 // application can asynchronously poll DataReader(s).
+#[cfg(feature = "mio_06")]
 impl<D, DA> mio_06::Evented for SimpleDataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -199,7 +200,6 @@ where
   }
 }
 
-#[cfg(feature = "mio_1")]
 impl<D, DA> mio1::event::Source for SimpleDataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -235,6 +235,7 @@ where
   D: 'static,
   DA: DeserializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn mio_06::Evented {
     self.keyed_simpledatareader.as_status_evented()
   }
@@ -244,7 +245,6 @@ where
     self.keyed_simpledatareader.as_status_source()
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self.keyed_simpledatareader.as_status_source_mio1()
   }

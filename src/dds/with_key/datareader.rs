@@ -751,6 +751,7 @@ where
 
 // -------------------
 
+#[cfg(feature = "mio_06")]
 impl<D, DA> mio_06::Evented for DataReader<D, DA>
 where
   D: Keyed,
@@ -831,7 +832,6 @@ where
   }
 }
 
-#[cfg(feature = "mio_1")]
 impl<D, DA> mio1::event::Source for DataReader<D, DA>
 where
   D: Keyed,
@@ -879,6 +879,7 @@ where
   D: Keyed + 'static,
   DA: DeserializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn mio_06::Evented {
     self.simple_data_reader.as_status_evented()
   }
@@ -888,7 +889,6 @@ where
     self.simple_data_reader.as_status_source()
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self.simple_data_reader.as_status_source_mio1()
   }
@@ -1173,7 +1173,6 @@ mod tests {
   use std::rc::Rc;
 
   use bytes::Bytes;
-  use mio_extras::channel as mio_channel;
   use log::info;
   use byteorder::LittleEndian;
 
@@ -1228,7 +1227,8 @@ mod tests {
         .add_new_topic(topic.name(), topic.get_type(), &topic.qos());
 
     // Create a Reader
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1412,7 +1412,8 @@ mod tests {
         .add_new_topic(topic.name(), topic.get_type(), &topic.qos());
 
     // Create a Reader
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));

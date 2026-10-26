@@ -1,13 +1,9 @@
 // PollEventSource and PollEventSender are an event communication channel that
-// carries no data. The receiver is a `Source` for whichever optional mio the
-// caller enabled (`mio_08` and/or `mio_1`), so a DataReader or status channel
-// can be registered with that poll.
+// carries no data. The receiver is always a mio 1.2 `Source`, and also a mio
+// 0.8 `Source` when that optional compatibility feature is enabled.
 //
-// The socketpair bridge is built once per enabled mio. With neither feature the
-// types are no-op stubs: notifications still flow through the async waker and
-// the mio-0.6 `Evented` path. The internal reactors do not use this channel.
+// The internal reactors do not use this channel.
 
-#[cfg(any(feature = "mio_08", feature = "mio_1"))]
 macro_rules! socketpair_bridge {
   ($modname:ident, $mio:ident) => {
     mod $modname {
@@ -142,13 +138,11 @@ macro_rules! socketpair_bridge {
 
 #[cfg(feature = "mio_08")]
 socketpair_bridge!(bridge_08, mio_08);
-#[cfg(feature = "mio_1")]
 socketpair_bridge!(bridge_1, mio1);
 
 pub struct PollEventSource {
   #[cfg(feature = "mio_08")]
   mio08: bridge_08::Source,
-  #[cfg(feature = "mio_1")]
   mio1: bridge_1::Source,
 }
 
@@ -156,26 +150,22 @@ pub struct PollEventSource {
 pub struct PollEventSender {
   #[cfg(feature = "mio_08")]
   mio08: bridge_08::Sender,
-  #[cfg(feature = "mio_1")]
   mio1: bridge_1::Sender,
 }
 
 pub fn make_poll_channel() -> std::io::Result<(PollEventSource, PollEventSender)> {
   #[cfg(feature = "mio_08")]
   let (mio08_source, mio08_sender) = bridge_08::make()?;
-  #[cfg(feature = "mio_1")]
   let (mio1_source, mio1_sender) = bridge_1::make()?;
   Ok((
     PollEventSource {
       #[cfg(feature = "mio_08")]
       mio08: mio08_source,
-      #[cfg(feature = "mio_1")]
       mio1: mio1_source,
     },
     PollEventSender {
       #[cfg(feature = "mio_08")]
       mio08: mio08_sender,
-      #[cfg(feature = "mio_1")]
       mio1: mio1_sender,
     },
   ))
@@ -185,7 +175,6 @@ impl PollEventSender {
   pub fn send(&self) {
     #[cfg(feature = "mio_08")]
     self.mio08.send();
-    #[cfg(feature = "mio_1")]
     self.mio1.send();
   }
 }
@@ -196,7 +185,6 @@ impl PollEventSource {
   pub fn drain(&self) {
     #[cfg(feature = "mio_08")]
     self.mio08.drain();
-    #[cfg(feature = "mio_1")]
     self.mio1.drain();
   }
 }
@@ -226,7 +214,6 @@ impl mio_08::event::Source for PollEventSource {
   }
 }
 
-#[cfg(feature = "mio_1")]
 impl mio1::event::Source for PollEventSource {
   fn register(
     &mut self,
@@ -248,5 +235,79 @@ impl mio1::event::Source for PollEventSource {
 
   fn deregister(&mut self, registry: &mio1::Registry) -> std::io::Result<()> {
     self.mio1.deregister(registry)
+  }
+}
+
+/// Bounded reader-notification queue with optional mio 0.6 readiness.
+#[derive(Clone)]
+pub(crate) struct NotificationSender {
+  sender: std::sync::mpsc::SyncSender<()>,
+  #[cfg(feature = "mio_06")]
+  legacy_sender: mio_extras::channel::SyncSender<()>,
+}
+
+pub(crate) struct NotificationReceiver {
+  receiver: std::sync::mpsc::Receiver<()>,
+  #[cfg(feature = "mio_06")]
+  legacy_receiver: mio_extras::channel::Receiver<()>,
+}
+
+pub(crate) fn notification_channel(capacity: usize) -> (NotificationSender, NotificationReceiver) {
+  let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+  #[cfg(feature = "mio_06")]
+  let (legacy_sender, legacy_receiver) = mio_extras::channel::sync_channel(capacity);
+  (
+    NotificationSender {
+      sender,
+      #[cfg(feature = "mio_06")]
+      legacy_sender,
+    },
+    NotificationReceiver {
+      receiver,
+      #[cfg(feature = "mio_06")]
+      legacy_receiver,
+    },
+  )
+}
+
+impl NotificationSender {
+  pub(crate) fn try_send(&self, value: ()) -> Result<(), std::sync::mpsc::TrySendError<()>> {
+    self.sender.try_send(value)?;
+    #[cfg(feature = "mio_06")]
+    let _ = self.legacy_sender.try_send(());
+    Ok(())
+  }
+}
+
+impl NotificationReceiver {
+  pub(crate) fn try_recv(&self) -> Result<(), std::sync::mpsc::TryRecvError> {
+    self.receiver.try_recv()
+  }
+}
+
+#[cfg(feature = "mio_06")]
+impl mio_06::Evented for NotificationReceiver {
+  fn register(
+    &self,
+    poll: &mio_06::Poll,
+    token: mio_06::Token,
+    interest: mio_06::Ready,
+    opts: mio_06::PollOpt,
+  ) -> std::io::Result<()> {
+    self.legacy_receiver.register(poll, token, interest, opts)
+  }
+
+  fn reregister(
+    &self,
+    poll: &mio_06::Poll,
+    token: mio_06::Token,
+    interest: mio_06::Ready,
+    opts: mio_06::PollOpt,
+  ) -> std::io::Result<()> {
+    self.legacy_receiver.reregister(poll, token, interest, opts)
+  }
+
+  fn deregister(&self, poll: &mio_06::Poll) -> std::io::Result<()> {
+    self.legacy_receiver.deregister(poll)
   }
 }

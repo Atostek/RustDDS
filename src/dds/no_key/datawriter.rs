@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+#[cfg(feature = "mio_06")]
 use mio_06::Evented;
 
 use crate::{
@@ -391,6 +392,7 @@ impl<'a, D, SA> StatusEvented<'a, DataWriterStatus, StatusReceiverStream<'a, Dat
 where
   SA: SerializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn Evented {
     self.keyed_datawriter.as_status_evented()
   }
@@ -400,7 +402,6 @@ where
     self.keyed_datawriter.as_status_source()
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self.keyed_datawriter.as_status_source_mio1()
   }

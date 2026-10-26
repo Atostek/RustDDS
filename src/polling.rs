@@ -334,7 +334,3 @@ pub(crate) fn timeout_until(deadline: Option<Instant>, cap: Duration) -> Duratio
     None => cap,
   }
 }
-
-pub(crate) fn mio1_token(token: mio_06::Token) -> Token {
-  Token(token.0)
-}

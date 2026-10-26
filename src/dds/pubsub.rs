@@ -5,7 +5,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use mio_extras::channel as mio_channel;
 use byteorder::LittleEndian;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
@@ -830,7 +829,7 @@ impl Subscriber {
     discovery_command: WakeSender<DiscoveryCommand>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     reader_ready: ReadySender<EntityId>,
-    discovery_samples: ReadySender<mio_06::Token>,
+    discovery_samples: ReadySender<mio1::Token>,
   ) -> Self {
     Self {
       inner: Arc::new(InnerSubscriber::new(
@@ -1061,7 +1060,7 @@ pub struct InnerSubscriber {
   discovery_command: WakeSender<DiscoveryCommand>,
   security_plugins_handle: Option<SecurityPluginsHandle>,
   reader_ready: ReadySender<EntityId>,
-  discovery_samples: ReadySender<mio_06::Token>,
+  discovery_samples: ReadySender<mio1::Token>,
 }
 
 impl InnerSubscriber {
@@ -1075,7 +1074,7 @@ impl InnerSubscriber {
     discovery_command: WakeSender<DiscoveryCommand>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
     reader_ready: ReadySender<EntityId>,
-    discovery_samples: ReadySender<mio_06::Token>,
+    discovery_samples: ReadySender<mio1::Token>,
   ) -> Self {
     Self {
       domain_participant,
@@ -1127,7 +1126,7 @@ impl InnerSubscriber {
     SA: adapters::with_key::DeserializerAdapter<D>,
   {
     // incoming data notification channel from Reader to DataReader
-    let (send, rec) = mio_channel::sync_channel::<()>(4);
+    let (send, rec) = crate::mio_source::notification_channel(4);
     // status change channel from Reader to DataReader
     let (status_sender, status_receiver) = sync_status_channel::<DataReaderStatus>(4)?;
 

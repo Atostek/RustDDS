@@ -12,7 +12,7 @@ use std::{
   time::{Duration, Instant},
 };
 
-use mio_extras::channel as mio_channel;
+#[cfg(feature = "mio_06")]
 use mio_06::{self, Evented};
 #[cfg(feature = "mio_08")]
 use mio_08::{Interest, Registry};
@@ -279,7 +279,7 @@ impl DomainParticipantBuilder {
     // Discovery join channel is used to just send a join handle into the inner
     // participant, so its .drop() can wait until discovery has had a chance to
     // stop.
-    let (djh_sender, djh_receiver) = mio_channel::channel();
+    let (djh_sender, djh_receiver) = std::sync::mpsc::channel();
 
     // One waker per reactor. Queues created now can enqueue before the loop
     // installs the waker; the loop drains once after install.
@@ -314,7 +314,7 @@ impl DomainParticipantBuilder {
     // Built-in discovery readers report new samples here. The token says which
     // reader. User readers do not use this queue.
     let (discovery_sample_sender, discovery_sample_receiver) =
-      ready_channel::<mio_06::Token>(&discovery_waker);
+      ready_channel::<mio1::Token>(&discovery_waker);
 
     // Channel used to report noteworthy events to DomainParticipant.
     // Capacity must be large enough to absorb the SEDP burst when multiple
@@ -647,7 +647,7 @@ impl DomainParticipant {
     self.dpi.lock().unwrap().new_entity_id(entity_kind)
   }
 
-  pub(crate) fn self_locators(&self) -> HashMap<mio_06::Token, Vec<Locator>> {
+  pub(crate) fn self_locators(&self) -> HashMap<mio1::Token, Vec<Locator>> {
     self.dpi.lock().unwrap().self_locators()
   }
 } // end impl DomainParticipant
@@ -666,6 +666,7 @@ impl DomainParticipantStatusListener {}
 impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatusStream<'a>>
   for DomainParticipantStatusListener
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn Evented {
     self
   }
@@ -675,7 +676,6 @@ impl<'a> StatusEvented<'a, DomainParticipantStatusEvent, DomainParticipantStatus
     self
   }
 
-  #[cfg(feature = "mio_1")]
   fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
     self
   }
@@ -736,7 +736,6 @@ impl mio_08::event::Source for DomainParticipantStatusListener {
   }
 }
 
-#[cfg(feature = "mio_1")]
 impl mio1::event::Source for DomainParticipantStatusListener {
   fn register(
     &mut self,
@@ -776,6 +775,7 @@ impl mio1::event::Source for DomainParticipantStatusListener {
   }
 }
 
+#[cfg(feature = "mio_06")]
 impl mio_06::Evented for DomainParticipantStatusListener {
   // We just delegate all the operations to notification_receiver, since it
   // already implements Evented
@@ -955,7 +955,7 @@ pub(crate) struct DomainParticipantDisc {
   dpi: DomainParticipantInner,
   // Discovery control
   discovery_command_sender: WakeSender<DiscoveryCommand>,
-  discovery_join_handle: mio_channel::Receiver<JoinHandle<()>>,
+  discovery_join_handle: std::sync::mpsc::Receiver<JoinHandle<()>>,
   // This allows deterministic generation of EntityIds for DataReader, DataWriter, etc.
   entity_id_generator: atomic::AtomicU32,
 }
@@ -966,7 +966,7 @@ impl DomainParticipantDisc {
     domain_id: u16,
     participant_guid: GUID,
     qos_policies: QosPolicies,
-    discovery_join_handle: mio_channel::Receiver<JoinHandle<()>>,
+    discovery_join_handle: std::sync::mpsc::Receiver<JoinHandle<()>>,
     discovery_update_notification_receiver: WakeReceiver<DiscoveryNotificationType>,
     discovery_command_sender: WakeSender<DiscoveryCommand>,
     spdp_liveness_sender: WakeSender<GuidPrefix>,
@@ -978,7 +978,7 @@ impl DomainParticipantDisc {
     only_networks: Option<Vec<IpAddr>>,
     same_host_loopback: bool,
     dp_waker: LoopWaker,
-    discovery_sample_sender: ReadySender<mio_06::Token>,
+    discovery_sample_sender: ReadySender<mio1::Token>,
   ) -> CreateResult<Self> {
     let dpi = DomainParticipantInner::new(
       domain_id,
@@ -1105,7 +1105,7 @@ impl DomainParticipantDisc {
       .map_err(|_e| WriteError::WouldBlock { data: () })
   }
 
-  pub(crate) fn self_locators(&self) -> HashMap<mio_06::Token, Vec<Locator>> {
+  pub(crate) fn self_locators(&self) -> HashMap<mio1::Token, Vec<Locator>> {
     self.dpi.self_locators.clone()
   }
 
@@ -1168,7 +1168,7 @@ pub(crate) struct DomainParticipantInner {
   /// Reader-command ready queue. A send records the reader entity id.
   reader_ready: ReadySender<EntityId>,
   /// Built-in discovery readers enqueue their poll token here.
-  discovery_sample_sender: ReadySender<mio_06::Token>,
+  discovery_sample_sender: ReadySender<mio1::Token>,
 
   // dp_event_loop control
   stop_poll_sender: WakeUnboundedSender<EventLoopCommand>,
@@ -1183,13 +1183,13 @@ pub(crate) struct DomainParticipantInner {
 
   dds_cache: Arc<RwLock<DDSCache>>,
   discovery_db: Arc<RwLock<DiscoveryDB>>,
-  discovery_db_event_receiver: mio_channel::Receiver<()>,
+  discovery_db_event_receiver: std::sync::mpsc::Receiver<()>,
 
   // status event receiver
   status_receiver: StatusChannelReceiver<DomainParticipantStatusEvent>,
 
   // RTPS locators describing how to reach this DP
-  self_locators: HashMap<mio_06::Token, Vec<Locator>>,
+  self_locators: HashMap<mio1::Token, Vec<Locator>>,
 
   security_plugins_handle: Option<SecurityPluginsHandle>,
 
@@ -1237,7 +1237,7 @@ impl DomainParticipantInner {
     only_networks: Option<Vec<IpAddr>>,
     same_host_loopback: bool,
     dp_waker: LoopWaker,
-    discovery_sample_sender: ReadySender<mio_06::Token>,
+    discovery_sample_sender: ReadySender<mio1::Token>,
   ) -> CreateResult<Self> {
     #[cfg(not(feature = "security"))]
     let _dummy = _qos_policies; // to make clippy happy
@@ -1326,7 +1326,7 @@ impl DomainParticipantInner {
     listeners.insert(USER_TRAFFIC_LISTENER_TOKEN, user_traffic_listener);
 
     // construct our own Locators
-    let self_locators: HashMap<mio_06::Token, Vec<Locator>> = listeners
+    let self_locators: HashMap<mio1::Token, Vec<Locator>> = listeners
       .iter()
       .map(
         |(t, l)| match l.to_locator_address(only_networks.as_deref()) {
@@ -1361,7 +1361,7 @@ impl DomainParticipantInner {
     let dds_cache_clone = Arc::clone(&dds_cache);
 
     let (discovery_db_event_sender, discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(1);
+      std::sync::mpsc::sync_channel::<()>(1);
 
     // Discovert DB creation
     let discovery_db = Arc::new(RwLock::new(DiscoveryDB::new(
@@ -1590,35 +1590,24 @@ impl DomainParticipantInner {
     name: &str,
     timeout: Duration,
   ) -> CreateResult<Option<Topic>> {
-    use mio_06 as mio;
-
-    let poll = mio::Poll::new()?;
-    let mut events = mio::Events::with_capacity(1);
-    // Should be register before the check and use level trigger to avoid missing
-    // event
-    poll.register(
-      &self.discovery_db_event_receiver,
-      mio_06::Token(0),
-      mio::Ready::readable(),
-      mio::PollOpt::level(),
-    )?;
-
     let find_end = Instant::now() + timeout;
     loop {
       if let Some(topic) = self.find_topic_in_discovery_db(domain_participant_weak, name)? {
         return Ok(Some(topic));
       }
-      let timeout = find_end - Instant::now();
-      poll.poll(&mut events, Some(timeout))?;
 
-      if let Some(_event) = events.iter().next() {
-        if self.discovery_db_event_receiver.try_recv().is_ok() {
-          continue;
-        }
+      let remaining = find_end.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
+        break;
       }
 
-      if Instant::now() > find_end {
-        break;
+      match self.discovery_db_event_receiver.recv_timeout(remaining) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+          return Err(CreateError::Internal {
+            reason: "Discovery database notification channel disconnected.".to_string(),
+          });
+        }
       }
     }
 

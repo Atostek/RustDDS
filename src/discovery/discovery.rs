@@ -5,8 +5,7 @@ use std::{
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use mio1::{Events, Poll};
-use mio_06::Token;
+use mio1::{Events, Poll, Token};
 use pastey::paste; // token pasting macro
 
 use crate::{
@@ -32,8 +31,8 @@ use crate::{
     spdp_participant_data::{Participant_GUID, SpdpDiscoveredParticipantData},
   },
   polling::{
-    mio1_token, new_shared_timer, timeout_until, LoopWaker, ReadyReceiver, SharedTimer,
-    WakeReceiver, WakeSender,
+    new_shared_timer, timeout_until, LoopWaker, ReadyReceiver, SharedTimer, WakeReceiver,
+    WakeSender,
   },
   rtps::constant::*,
   serialization::{pl_cdr_adapters::*, CDRDeserializerAdapter, CDRSerializerAdapter},
@@ -418,7 +417,7 @@ impl Discovery {
         // Per-topic timers are gone; all periodic discovery tasks now share one
         // timer registered under DISCOVERY_TIMER_TOKEN. The former timer token
         // argument is no longer used here.
-        let _: Option<mio_06::Token> = $timeout_and_timer_token_opt;
+        let _: Option<mio1::Token> = $timeout_and_timer_token_opt;
         paste! { $has_key ::[<DiscoveryTopic $repr>] { topic, reader, writer } }
       }}; // macro
     }
@@ -698,7 +697,7 @@ impl Discovery {
   }
 
   pub fn discovery_event_loop(&mut self) {
-    if let Err(e) = self.waker.install(&self.poll, mio1_token(LOOP_WAKE_TOKEN)) {
+    if let Err(e) = self.waker.install(&self.poll, LOOP_WAKE_TOKEN) {
       error!("Discovery failed to install waker: {e}");
       return;
     }

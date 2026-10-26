@@ -1137,7 +1137,6 @@ mod tests {
   use speedy::{Readable, Writable};
   use log::info;
   use serde::{Deserialize, Serialize};
-  use mio_extras::channel as mio_channel;
   use byteorder::LittleEndian;
 
   use crate::{
@@ -1205,7 +1204,8 @@ mod tests {
       EntityId::create_custom_entity_id([0, 0, 0], EntityKind::READER_WITH_KEY_USER_DEFINED);
     let reader_guid = GUID::new_with_prefix_and_id(target_gui_prefix, entity);
 
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));

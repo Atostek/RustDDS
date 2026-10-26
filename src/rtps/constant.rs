@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mio_06::Token;
+use mio1::Token;
 
 use crate::{
   discovery::{

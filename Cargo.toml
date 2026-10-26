@@ -34,18 +34,20 @@ strip = false
 # Feature "mio_08" exposes integration with the "mio" crate version 0.8.x:
 # DataReaders/DataWriters implement `mio_08::event::Source` so they can be
 # registered directly with a mio-0.8 `Poll`. When disabled, RustDDS still
-# supports synchronous polling via mio-0.6 (`Evented`) and asynchronous polling
-# via `futures::Stream`. Disabling this feature drops the `mio` (0.8) and
-# `socketpair` dependencies (and their transitive deps).
+# supports synchronous polling via mio-1.2 and asynchronous polling via
+# `futures::Stream`. Disabling this feature drops the `mio` (0.8) dependency.
 # NOTE: this feature is NOT enabled by default.
-mio_08 = ["dep:mio_08", "dep:socketpair"]
+mio_08 = ["dep:mio_08"]
 
-# Feature "mio_1" exposes integration with the "mio" crate version 1.2:
-# DataReaders/DataWriters implement `mio1::event::Source` so they can be
-# registered directly with a mio-1.2 `Poll`. The internal reactor always uses
-# mio 1.2. This feature is not enabled by default; without it, the public
-# polling API is still mio-0.6 (`Evented`) and async `Stream`.
-mio_1 = ["dep:socketpair"]
+# mio 1.2 is the default public polling API. This no-op feature is retained
+# for downstream crates that previously requested `rustdds/mio_1`.
+mio_1 = []
+
+# Legacy mio 0.6 Evented integration. It remains on by default during the
+# migration, but `--no-default-features` removes mio 0.6 entirely.
+mio_06 = ["dep:mio_06", "dep:mio-extras"]
+
+default = ["mio_06"]
 
 # Feature "security" implements the OMG "DDS Security" specification v 1.1
 # It adds a large amount of new code and dependencies.
@@ -64,15 +66,15 @@ security = [
 build_openssl = ["openssl?/vendored"]
 
 [dependencies]
-mio_06 = { package = "mio" , version ="^0.6.23" } 
-mio-extras = "2.0.6"
+mio_06 = { package = "mio" , version ="^0.6.23", optional = true }
+mio-extras = { version = "2.0.6", optional = true }
 
-# Internal reactor (sockets, waker). Re-exported as `rustdds::mio1` only
-# under feature `mio_1`; the public `mio` name stays mio 0.6.
+# Internal reactor and default public polling API. The legacy public `mio`
+# name remains mio 0.6 whenever feature `mio_06` is enabled.
 mio1 = { package = "mio", version = "1.2", features = ["net", "os-poll", "os-ext"] }
 
 mio_08 = { package = "mio" , version ="0.8.5", features = ["net", "os-poll"], optional = true } 
-socketpair = { version = "0.19", optional = true }
+socketpair = "0.19"
 
 bit-vec = "0.10.1"
 speedy = "0.8.0"
@@ -158,4 +160,8 @@ required-features = ["mio_08"]
 [[example]]
 name = "shapes_demo_mio_1"
 path = "examples/shapes_demo_mio_1/main.rs"
-required-features = ["mio_1"]
+
+[[example]]
+name = "shapes_demo"
+path = "examples/shapes_demo/main.rs"
+required-features = ["mio_06"]

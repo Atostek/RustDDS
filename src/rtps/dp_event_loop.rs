@@ -9,8 +9,7 @@ use std::{
 
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
-use mio1::{Events, Interest, Poll};
-use mio_06::Token;
+use mio1::{Events, Interest, Poll, Token};
 
 use crate::{
   dds::{
@@ -31,8 +30,8 @@ use crate::{
     util::{local_interface_table, localhost_spdp_peer_locators, IfAddr},
   },
   polling::{
-    mio1_token, new_shared_timer, timeout_until, wake_channel, LoopWaker, ReadyReceiver,
-    SharedTimer, WakeReceiver, WakeSender,
+    new_shared_timer, timeout_until, wake_channel, LoopWaker, ReadyReceiver, SharedTimer,
+    WakeReceiver, WakeSender,
   },
   //qos::HasQoSPolicy,
   rtps::{
@@ -188,11 +187,9 @@ impl DPEventLoop {
     let mut udp_listeners = udp_listeners;
     for (token, listener) in &mut udp_listeners {
       try_init!(
-        poll.registry().register(
-          listener.mio_socket(),
-          mio1_token(*token),
-          Interest::READABLE,
-        ),
+        poll
+          .registry()
+          .register(listener.mio_socket(), *token, Interest::READABLE,),
         "Failed to register listener"
       );
     }
@@ -270,10 +267,7 @@ impl DPEventLoop {
     let mut ev_wrapper = self;
     let mut preparing_to_stop = false;
 
-    if let Err(e) = ev_wrapper
-      .waker
-      .install(&ev_wrapper.poll, mio1_token(LOOP_WAKE_TOKEN))
-    {
+    if let Err(e) = ev_wrapper.waker.install(&ev_wrapper.poll, LOOP_WAKE_TOKEN) {
       error!("dp_event_loop failed to install waker: {e}");
       return;
     }
@@ -611,7 +605,7 @@ impl DPEventLoop {
             let mut source = SourceFd(&fd);
             match self.poll.registry().register(
               &mut source,
-              mio1_token(sender_writable_token(sid)),
+              sender_writable_token(sid),
               Interest::WRITABLE,
             ) {
               Ok(()) => {
@@ -1261,8 +1255,6 @@ fn check_are_endpoints_securities_compatible(
 mod tests {
   use std::{sync::Mutex, thread};
 
-  use mio_extras::channel as mio_channel;
-
   use super::*;
   use crate::{
     dds::{
@@ -1305,7 +1297,7 @@ mod tests {
     let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
     let dds_cache_clone = Arc::clone(&dds_cache);
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel(4);
 
     let discovery_db = Arc::new(RwLock::new(DiscoveryDB::new(
       GUID::new_participant_guid(),
@@ -1375,7 +1367,8 @@ mod tests {
       let new_guid = GUID::default();
 
       // Create mechanisms for notifications, statuses & commands
-      let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+      let (notification_sender, _notification_receiver) =
+        crate::mio_source::notification_channel(100);
       let (_notification_event_source, notification_event_sender) =
         mio_source::make_poll_channel().unwrap();
       let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1523,7 +1516,7 @@ mod tests {
   //     //topics.push(topic);
   //     let new_guid = GUID::default();
 
-  //     let (send, _rec) = mio_channel::sync_channel::<()>(100);
+  //     let (send, _rec) = crate::mio_source::notification_channel(100);
   //     let (status_sender, status_receiver_DataReader) =
   //       mio_extras::channel::sync_channel::<DataReaderStatus>(1000);
   //     let (reader_commander, reader_command_receiver) =
