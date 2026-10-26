@@ -76,7 +76,7 @@ pub(crate) struct DiscoveryDB {
   topics: BTreeMap<String, BTreeMap<GUID, (DiscoveredVia, DiscoveredTopicData)>>,
 
   // sender for notifying (potential) waiters in participant.find_topic() call
-  topic_updated_sender: mio_extras::channel::SyncSender<()>,
+  topic_updated_sender: std::sync::mpsc::SyncSender<()>,
 
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 }
@@ -122,7 +122,7 @@ pub(crate) fn discovery_db_write(
 impl DiscoveryDB {
   pub fn new(
     my_guid: GUID,
-    topic_updated_sender: mio_extras::channel::SyncSender<()>,
+    topic_updated_sender: std::sync::mpsc::SyncSender<()>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
   ) -> Self {
     Self {
@@ -838,7 +838,6 @@ mod tests {
   use std::{sync::Mutex, time::Duration as StdDuration};
 
   use byteorder::LittleEndian;
-  use mio_extras::channel as mio_channel;
 
   use super::*;
   use crate::{
@@ -849,6 +848,7 @@ mod tests {
       with_key::simpledatareader::ReaderCommand,
     },
     mio_source,
+    polling::{wake_channel, LoopWaker},
     serialization::CDRSerializerAdapter,
     structure::guid::*,
     test::{
@@ -861,7 +861,7 @@ mod tests {
   #[test]
   fn discdb_participant_operations() {
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel::<()>(4);
     let (status_sender, _status_receiver) = sync_status_channel(16).unwrap();
 
     let mut discoverydb = DiscoveryDB::new(
@@ -888,7 +888,7 @@ mod tests {
   #[test]
   fn discdb_writer_proxies() {
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel::<()>(4);
     let (status_sender, _status_receiver) = sync_status_channel(16).unwrap();
     let _discoverydb = DiscoveryDB::new(
       GUID::new_participant_guid(),
@@ -905,7 +905,7 @@ mod tests {
   #[test]
   fn discdb_subscription_operations() {
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel::<()>(4);
     let (status_sender, _status_receiver) = sync_status_channel(16).unwrap();
 
     let mut discovery_db = DiscoveryDB::new(
@@ -998,7 +998,7 @@ mod tests {
   #[test]
   fn discdb_external_endpoint_snapshots() {
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel::<()>(4);
     let (status_sender, _status_receiver) = sync_status_channel(16).unwrap();
 
     let mut discovery_db = DiscoveryDB::new(
@@ -1066,7 +1066,7 @@ mod tests {
   #[test]
   fn discdb_local_topic_reader() {
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel::<()>(4);
 
     let dp = DomainParticipant::new(test_domain_id(0)).expect("Failed to create participant");
     let topic = dp
@@ -1085,14 +1085,15 @@ mod tests {
     );
 
     // Create reader ingredients
-    let (notification_sender1, _notification_receiver1) = mio_extras::channel::sync_channel(100);
+    let (notification_sender1, _notification_receiver1) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source1, notification_event_sender1) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker1 = Arc::new(Mutex::new(None));
 
     let (status_sender1, _status_receiver1) = sync_status_channel::<DataReaderStatus>(4).unwrap();
     let (_reader_commander1, reader_command_receiver1) =
-      mio_extras::channel::sync_channel::<ReaderCommand>(100);
+      wake_channel::<ReaderCommand>(100, &LoopWaker::new());
 
     let topic_cache =
       dp.dds_cache()
@@ -1112,6 +1113,7 @@ mod tests {
       data_reader_waker: data_reader_waker1,
       poll_event_sender: notification_event_sender1,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     // Add the reader to the database and verify the info is updated
@@ -1135,14 +1137,15 @@ mod tests {
     assert_eq!(discoverydb.get_local_topic_readers(&topic).len(), 1);
 
     // Create second reader ingredients for the same topic
-    let (notification_sender2, _notification_receiver2) = mio_extras::channel::sync_channel(100);
+    let (notification_sender2, _notification_receiver2) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source2, notification_event_sender2) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker2 = Arc::new(Mutex::new(None));
 
     let (status_sender2, _status_receiver2) = sync_status_channel::<DataReaderStatus>(4).unwrap();
     let (_reader_commander2, reader_command_receiver2) =
-      mio_extras::channel::sync_channel::<ReaderCommand>(100);
+      wake_channel::<ReaderCommand>(100, &LoopWaker::new());
 
     let mut guid2 = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
     guid2.prefix = GuidPrefix::new(b"Another fake"); // GUID needs to be different in order to be added
@@ -1159,6 +1162,7 @@ mod tests {
       data_reader_waker: data_reader_waker2,
       poll_event_sender: notification_event_sender2,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     // Add the second reader to the database and verify the info is updated

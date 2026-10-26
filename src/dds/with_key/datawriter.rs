@@ -6,8 +6,6 @@ use std::{
 };
 
 use futures::Future;
-use mio_06::{Ready, SetReadiness};
-use mio_extras::channel::{self as mio_channel, SendError};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
@@ -26,6 +24,7 @@ use crate::{
   },
   discovery::{discovery::DiscoveryCommand, sedp_messages::SubscriptionBuiltinTopicData},
   messages::submessages::elements::serialized_payload::SerializedPayload,
+  polling::{Doorbell, WakeSender},
   rtps::writer_send_buffer::{Admission, WriterSendBuffer},
   serialization::CDRSerializerAdapter,
   structure::{
@@ -199,10 +198,9 @@ pub struct DataWriter<D: Keyed, SA: SerializerAdapter<D> = CDRSerializerAdapter<
   /// Shared, flow-controlled send buffer. Admission allocates the sequence
   /// number and stores the sample only when the reliable window has room.
   send_buffer: WriterSendBuffer,
-  /// mio readiness "doorbell" rung after a successful admission so the event
-  /// loop wakes and transmits the sample.
-  doorbell: SetReadiness,
-  discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+  /// Rung after a successful admission so the event loop wakes and transmits.
+  doorbell: Doorbell,
+  discovery_command: WakeSender<DiscoveryCommand>,
   status_receiver: StatusChannelReceiver<DataWriterStatus>,
 }
 
@@ -223,11 +221,9 @@ where
       Ok(_) => {}
 
       // This is fairly normal at shutdown, as the other end is down already.
-      Err(SendError::Disconnected(_cmd)) => {
+      Err(_) => {
         debug!("Failed to send REMOVE_LOCAL_WRITER DiscoveryCommand: Disconnected.");
       }
-      // other errors must be taken more seriously
-      Err(e) => error!("Failed to send REMOVE_LOCAL_WRITER DiscoveryCommand. {e:?}"),
     }
   }
 }
@@ -244,8 +240,8 @@ where
     qos: QosPolicies,
     guid: GUID,
     send_buffer: WriterSendBuffer,
-    doorbell: SetReadiness,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    doorbell: Doorbell,
+    discovery_command: WakeSender<DiscoveryCommand>,
     status_receiver: StatusChannelReceiver<DataWriterStatus>,
   ) -> CreateResult<Self> {
     if let Some(lv) = qos.liveliness {
@@ -274,12 +270,7 @@ where
 
   // Wake the event loop to transmit a freshly admitted sample.
   fn ring_doorbell(&self) {
-    if let Err(e) = self.doorbell.set_readiness(Ready::readable()) {
-      warn!(
-        "Failed to ring writer doorbell: topic={:?} {e}",
-        self.my_topic.name()
-      );
-    }
+    self.doorbell.ring();
   }
 
   /// Manually refreshes liveliness
@@ -857,6 +848,7 @@ where
   D: Keyed,
   SA: SerializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn mio_06::Evented {
     self.status_receiver.as_status_evented()
   }
@@ -864,6 +856,10 @@ where
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.status_receiver.as_status_source()
+  }
+
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.status_receiver.as_status_source_mio1()
   }
 
   fn as_async_status_stream(&'a self) -> StatusReceiverStream<'a, DataWriterStatus> {

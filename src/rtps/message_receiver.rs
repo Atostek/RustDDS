@@ -2,10 +2,10 @@ use std::{
   cell::RefCell,
   collections::{btree_map::Entry, BTreeMap},
   rc::Rc,
+  sync::mpsc::TrySendError,
 };
 
 use enumflags2::BitFlags;
-use mio_extras::{channel as mio_channel, channel::TrySendError};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use bytes::Bytes;
@@ -13,6 +13,7 @@ use bytes::Bytes;
 use crate::{
   messages::{protocol_version::ProtocolVersion, submessages::submessages::*, vendor_id::VendorId},
   network::udp_listener::PacketOrigin,
+  polling::WakeSender,
   rtps::{reader::Reader, transmit::InterfaceObservations, Message, Submessage, SubmessageBody},
   structure::{
     entity::RTPSEntity,
@@ -111,11 +112,11 @@ pub(crate) struct MessageReceiver {
   pub available_readers: BTreeMap<EntityId, Reader>,
   // GuidPrefix sent in this channel needs to be RTPSMessage source_guid_prefix. Writer needs this
   // to locate RTPSReaderProxy if negative acknack.
-  acknack_sender: mio_channel::SyncSender<(GuidPrefix, AckSubmessage)>,
+  acknack_sender: WakeSender<(GuidPrefix, AckSubmessage)>,
   // We send notification of remote DomainParticipant liveness to Discovery to
   // bypass Reader, DDSCache, DatasampleCache, and DataReader, because these will drop
   // repeated messages with duplicate SequenceNumbers, but Discovery needs to see them.
-  spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
+  spdp_liveness_sender: WakeSender<GuidPrefix>,
   security_plugins: Option<SecurityPluginsHandle>,
 
   // Per-remote-participant record of which local interface / source address we
@@ -145,8 +146,8 @@ pub(crate) struct MessageReceiver {
 impl MessageReceiver {
   pub fn new(
     participant_guid_prefix: GuidPrefix,
-    acknack_sender: mio_channel::SyncSender<(GuidPrefix, AckSubmessage)>,
-    spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
+    acknack_sender: WakeSender<(GuidPrefix, AckSubmessage)>,
+    spdp_liveness_sender: WakeSender<GuidPrefix>,
     security_plugins: Option<SecurityPluginsHandle>,
     interface_observations: Rc<RefCell<InterfaceObservations>>,
   ) -> Self {
@@ -1136,7 +1137,6 @@ mod tests {
   use speedy::{Readable, Writable};
   use log::info;
   use serde::{Deserialize, Serialize};
-  use mio_extras::channel as mio_channel;
   use byteorder::LittleEndian;
 
   use crate::{
@@ -1149,6 +1149,7 @@ mod tests {
     messages::header::Header,
     mio_source,
     network::udp_sender::UDPSender,
+    polling::{new_shared_timer, wake_channel, LoopWaker},
     rtps::reader::ReaderIngredients,
     serialization::from_bytes,
     structure::{dds_cache::DDSCache, guid::EntityKind},
@@ -1187,9 +1188,9 @@ mod tests {
     );
 
     // Create a message receiver
-    let (acknack_sender, _acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(10);
-    let (spdp_liveness_sender, _spdp_liveness_receiver) = mio_channel::sync_channel(8);
+    let waker = LoopWaker::new();
+    let (acknack_sender, _acknack_receiver) = wake_channel(8, &waker);
+    let (spdp_liveness_sender, _spdp_liveness_receiver) = wake_channel(8, &waker);
     let mut message_receiver = MessageReceiver::new(
       target_gui_prefix,
       acknack_sender,
@@ -1203,7 +1204,8 @@ mod tests {
       EntityId::create_custom_entity_id([0, 0, 0], EntityKind::READER_WITH_KEY_USER_DEFINED);
     let reader_guid = GUID::new_with_prefix_and_id(target_gui_prefix, entity);
 
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1213,7 +1215,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     let qos_policy = QosPolicies::qos_none();
 
@@ -1236,12 +1238,13 @@ mod tests {
       data_reader_waker: data_reader_waker.clone(),
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
 
     let mut new_reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1315,9 +1318,9 @@ mod tests {
     ]);
 
     let guid_new = GUID::default();
-    let (acknack_sender, _acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(10);
-    let (spdp_liveness_sender, _spdp_liveness_receiver) = mio_channel::sync_channel(8);
+    let waker = LoopWaker::new();
+    let (acknack_sender, _acknack_receiver) = wake_channel(8, &waker);
+    let (spdp_liveness_sender, _spdp_liveness_receiver) = wake_channel(8, &waker);
     let mut message_receiver = MessageReceiver::new(
       guid_new.prefix,
       acknack_sender,

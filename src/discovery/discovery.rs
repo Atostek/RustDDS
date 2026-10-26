@@ -5,8 +5,7 @@ use std::{
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use mio_06::{Events, Poll, PollOpt, Ready};
-use mio_extras::channel as mio_channel;
+use mio1::{Events, Poll, Token};
 use pastey::paste; // token pasting macro
 
 use crate::{
@@ -31,7 +30,10 @@ use crate::{
     },
     spdp_participant_data::{Participant_GUID, SpdpDiscoveredParticipantData},
   },
-  polling::{new_shared_timer, SharedTimer},
+  polling::{
+    new_shared_timer, timeout_until, LoopWaker, ReadyReceiver, SharedTimer, WakeReceiver,
+    WakeSender,
+  },
   rtps::constant::*,
   serialization::{pl_cdr_adapters::*, CDRDeserializerAdapter, CDRSerializerAdapter},
   structure::{
@@ -214,10 +216,13 @@ pub(crate) struct Discovery {
   // Discovery started sender confirms to application thread that we are running
   discovery_started_sender: std::sync::mpsc::Sender<CreateResult<()>>,
   // notification sender goes to dp_event_loop thread
-  discovery_updated_sender: mio_channel::SyncSender<DiscoveryNotificationType>,
+  discovery_updated_sender: WakeSender<DiscoveryNotificationType>,
   // Discovery gets commands from dp_event_loop from this channel
-  discovery_command_receiver: mio_channel::Receiver<DiscoveryCommand>,
-  spdp_liveness_receiver: mio_channel::Receiver<GuidPrefix>,
+  discovery_command_receiver: WakeReceiver<DiscoveryCommand>,
+  spdp_liveness_receiver: WakeReceiver<GuidPrefix>,
+  /// Built-in reader sample tokens. One waker, so the token is the reason.
+  discovery_samples: ReadyReceiver<Token>,
+  waker: LoopWaker,
 
   liveliness_state: LivelinessState,
 
@@ -306,11 +311,13 @@ impl Discovery {
     domain_participant: DomainParticipantWeak,
     discovery_db: Arc<RwLock<DiscoveryDB>>,
     discovery_started_sender: std::sync::mpsc::Sender<CreateResult<()>>,
-    discovery_updated_sender: mio_channel::SyncSender<DiscoveryNotificationType>,
-    discovery_command_receiver: mio_channel::Receiver<DiscoveryCommand>,
-    spdp_liveness_receiver: mio_channel::Receiver<GuidPrefix>,
+    discovery_updated_sender: WakeSender<DiscoveryNotificationType>,
+    discovery_command_receiver: WakeReceiver<DiscoveryCommand>,
+    spdp_liveness_receiver: WakeReceiver<GuidPrefix>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     security_plugins_opt: Option<SecurityPluginsHandle>,
+    waker: LoopWaker,
+    discovery_samples: ReadyReceiver<Token>,
   ) -> CreateResult<Self> {
     // helper macro to handle initialization failures.
     macro_rules! try_construct {
@@ -332,7 +339,7 @@ impl Discovery {
       };
     }
 
-    let poll = try_construct!(mio_06::Poll::new(), "Failed to allocate discovery poll.");
+    let poll = try_construct!(Poll::new(), "Failed to allocate discovery poll.");
     let discovery_subscriber_qos = Self::builtin_subscriber_qos();
     let discovery_publisher_qos = Self::builtin_publisher_qos();
 
@@ -402,38 +409,18 @@ impl Discovery {
             "Unable to create discovery DataWriter."
           );
         }
-        try_construct!(
-          poll.register(&reader, $reader_token, Ready::readable(), PollOpt::edge()),
-          "Failed to register a discovery reader to poll."
-        );
+        // The reader's data notifications wake this poll through `discovery_samples`
+        // (the reader was created with this token). mio 1.2 cannot register the
+        // mio-0.6 sample channel.
+        let _ = $reader_token;
 
         // Per-topic timers are gone; all periodic discovery tasks now share one
         // timer registered under DISCOVERY_TIMER_TOKEN. The former timer token
         // argument is no longer used here.
-        let _: Option<mio_06::Token> = $timeout_and_timer_token_opt;
+        let _: Option<mio1::Token> = $timeout_and_timer_token_opt;
         paste! { $has_key ::[<DiscoveryTopic $repr>] { topic, reader, writer } }
       }}; // macro
     }
-
-    try_construct!(
-      poll.register(
-        &discovery_command_receiver,
-        DISCOVERY_COMMAND_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register Discovery poll."
-    );
-
-    try_construct!(
-      poll.register(
-        &spdp_liveness_receiver,
-        SPDP_LIVENESS_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register Discovery poll."
-    );
 
     // Participant
     let dcps_participant = construct_topic_and_poll!(
@@ -627,15 +614,6 @@ impl Discovery {
     // seeded with a short initial delay (matching the previous behaviour of
     // their per-topic timers) so the first announcements go out quickly.
     let discovery_timer = new_shared_timer::<DiscoveryTimerEvent>();
-    try_construct!(
-      poll.register(
-        &*discovery_timer.borrow(),
-        DISCOVERY_TIMER_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Unable to register discovery shared timer."
-    );
     {
       let mut t = discovery_timer.borrow_mut();
       t.set_timeout(
@@ -684,6 +662,8 @@ impl Discovery {
       discovery_updated_sender,
       discovery_command_receiver,
       spdp_liveness_receiver,
+      discovery_samples,
+      waker,
       participant_status_sender,
 
       liveliness_state: LivelinessState::new(),
@@ -717,6 +697,10 @@ impl Discovery {
   }
 
   pub fn discovery_event_loop(&mut self) {
+    if let Err(e) = self.waker.install(&self.poll, LOOP_WAKE_TOKEN) {
+      error!("Discovery failed to install waker: {e}");
+      return;
+    }
     self.initialize_participant();
 
     // Send out info about user (=non-built-in) Writers and Readers that we have.
@@ -743,10 +727,11 @@ impl Discovery {
 
     let mut events = Events::with_capacity(32);
     loop {
-      match self
-        .poll
-        .poll(&mut events, Some(std::time::Duration::from_millis(5000)))
-      {
+      let poll_timeout = timeout_until(
+        self.discovery_timer.borrow().next_deadline(),
+        std::time::Duration::from_millis(5000),
+      );
+      match self.poll.poll(&mut events, Some(poll_timeout)) {
         Ok(_) => (),
         Err(e) => {
           error!("Failed in waiting of poll in discovery. {e:?}");
@@ -757,8 +742,19 @@ impl Discovery {
         debug!("Discovery event loop idling.");
       }
 
-      for event in events.iter() {
-        match event.token() {
+      // The waker token only means "drain". Commands, liveness and reader-sample
+      // tokens are queued; deadlines are read from the timer. Handling the
+      // command and liveness tokens every iteration is cheap when the queues
+      // are empty, and it also catches anything enqueued before the waker
+      // was installed.
+      let mut tokens = vec![
+        DISCOVERY_COMMAND_TOKEN,
+        SPDP_LIVENESS_TOKEN,
+        DISCOVERY_TIMER_TOKEN,
+      ];
+      tokens.extend(self.discovery_samples.drain_unique());
+      for token in tokens {
+        match token {
           DISCOVERY_COMMAND_TOKEN => {
             while let Ok(command) = self.discovery_command_receiver.try_recv() {
               match command {
@@ -2161,7 +2157,6 @@ mod tests {
 
   use chrono::Utc;
   use speedy::{Endianness, Writable};
-  use mio_06::Token;
 
   use super::*;
   use crate::{
@@ -2220,17 +2215,17 @@ mod tests {
 
   #[test]
   fn discovery_participant_data_test() {
-    let poll = Poll::new().unwrap();
+    let mut poll = mio1::Poll::new().unwrap();
     let listener_port = spdp_well_known_unicast_port(test_domain_id(12), 0);
 
     let mut udp_listener =
       UDPListener::new_unicast("127.0.0.1", listener_port).expect("udp listener creation");
     poll
+      .registry()
       .register(
         udp_listener.mio_socket(),
-        Token(0),
-        Ready::readable(),
-        PollOpt::edge(),
+        mio1::Token(0),
+        mio1::Interest::READABLE,
       )
       .unwrap();
 
@@ -2245,7 +2240,7 @@ mod tests {
 
     udp_sender.send_to_all(&msg_data, &addresses);
 
-    let mut events = Events::with_capacity(10);
+    let mut events = mio1::Events::with_capacity(10);
     poll
       .poll(&mut events, Some(StdDuration::from_secs(1)))
       .unwrap();
@@ -2285,16 +2280,16 @@ mod tests {
     let _reader =
       subscriber.create_datareader::<ShapeType, CDRDeserializerAdapter<ShapeType>>(&topic, None);
 
-    let poll: Poll = Poll::new().unwrap();
+    let mut poll = mio1::Poll::new().unwrap();
     let listener_port = spdp_well_known_unicast_port(test_domain_id(14), 0);
 
     let mut udp_listener = UDPListener::new_unicast("127.0.0.1", listener_port).unwrap();
     poll
+      .registry()
       .register(
         udp_listener.mio_socket(),
-        Token(0),
-        Ready::readable(),
-        PollOpt::edge(),
+        mio1::Token(0),
+        mio1::Interest::READABLE,
       )
       .unwrap();
 
@@ -2339,7 +2334,7 @@ mod tests {
 
     udp_sender.send_to_all(&msg_data, &addresses);
 
-    let mut events: Events = Events::with_capacity(10);
+    let mut events = mio1::Events::with_capacity(10);
     poll
       .poll(&mut events, Some(StdDuration::from_secs(1)))
       .unwrap();
@@ -2375,14 +2370,14 @@ mod tests {
     let _reader =
       subscriber.create_datareader::<ShapeType, CDRDeserializerAdapter<ShapeType>>(&topic, None);
 
-    let poll = Poll::new().unwrap();
+    let mut poll = mio1::Poll::new().unwrap();
     let mut udp_listener = UDPListener::new_unicast("127.0.0.1", 0).unwrap();
     poll
+      .registry()
       .register(
         udp_listener.mio_socket(),
-        Token(0),
-        Ready::readable(),
-        PollOpt::edge(),
+        mio1::Token(0),
+        mio1::Interest::READABLE,
       )
       .unwrap();
 

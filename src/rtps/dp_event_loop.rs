@@ -9,8 +9,7 @@ use std::{
 
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
-use mio_06::{Event, Events, Poll, PollOpt, Ready, Token};
-use mio_extras::channel as mio_channel;
+use mio1::{Events, Interest, Poll, Token};
 
 use crate::{
   dds::{
@@ -30,7 +29,10 @@ use crate::{
     udp_sender::UDPSender,
     util::{local_interface_table, localhost_spdp_peer_locators, IfAddr},
   },
-  polling::{new_shared_timer, SharedTimer},
+  polling::{
+    new_shared_timer, timeout_until, wake_channel, LoopWaker, ReadyReceiver, SharedTimer,
+    WakeReceiver, WakeSender,
+  },
   //qos::HasQoSPolicy,
   rtps::{
     constant::*,
@@ -60,16 +62,6 @@ use crate::{
 };
 #[cfg(not(feature = "security"))]
 use crate::no_security::security_plugins::SecurityPluginsHandle;
-
-// Upper bound on how many datagrams the event loop drains from a single UDP
-// listener per poll iteration. Bulk user traffic (especially fragmented
-// samples flat-out) can arrive as fast as it is read; without a cap, one
-// listener's `messages()` never reaches WouldBlock and the single-threaded
-// loop is stuck there, starving discovery/control sockets. Capping the drain
-// (with level-triggered listeners so the remainder re-fires) keeps discovery
-// responsive under load, e.g. so a subscriber can still match a publisher's
-// writer while being flooded with data from that not-yet-matched writer.
-const MAX_LISTENER_MESSAGES_PER_POLL: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct DomainInfo {
@@ -102,10 +94,15 @@ pub struct DPEventLoop {
   // Writers
   add_writer_receiver: TokenReceiverPair<WriterIngredients>,
   remove_writer_receiver: TokenReceiverPair<GUID>,
-  stop_poll_receiver: mio_channel::Receiver<EventLoopCommand>,
+  stop_poll_receiver: WakeReceiver<EventLoopCommand>,
   // GuidPrefix sent in this channel needs to be RTPSMessage source_guid_prefix. Writer needs this
   // to locate RTPSReaderProxy if negative acknack.
-  ack_nack_receiver: mio_channel::Receiver<(GuidPrefix, AckSubmessage)>,
+  ack_nack_receiver: WakeReceiver<(GuidPrefix, AckSubmessage)>,
+  /// Entity ids whose command queues or doorbells have been rung. One waker
+  /// serves every queue, so the id is the reason.
+  reader_ready: ReadyReceiver<EntityId>,
+  writer_ready: ReadyReceiver<EntityId>,
+  waker: LoopWaker,
 
   writers: HashMap<EntityId, Writer>,
   udp_sender: Rc<UDPSender>,
@@ -135,8 +132,8 @@ pub struct DPEventLoop {
 
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
-  discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
-  discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
+  discovery_update_notification_receiver: WakeReceiver<DiscoveryNotificationType>,
+  discovery_command_sender: WakeSender<DiscoveryCommand>,
 
   // Same-host loopback feature (participant-builder `same_host_loopback` knob):
   // when true, the SPDP writer announces to the localhost peers and writers may
@@ -158,15 +155,18 @@ impl DPEventLoop {
     remove_reader_receiver: TokenReceiverPair<GUID>,
     add_writer_receiver: TokenReceiverPair<WriterIngredients>,
     remove_writer_receiver: TokenReceiverPair<GUID>,
-    stop_poll_receiver: mio_channel::Receiver<EventLoopCommand>,
-    discovery_update_notification_receiver: mio_channel::Receiver<DiscoveryNotificationType>,
-    discovery_command_sender: mio_channel::SyncSender<DiscoveryCommand>,
-    spdp_liveness_sender: mio_channel::SyncSender<GuidPrefix>,
+    stop_poll_receiver: WakeReceiver<EventLoopCommand>,
+    discovery_update_notification_receiver: WakeReceiver<DiscoveryNotificationType>,
+    discovery_command_sender: WakeSender<DiscoveryCommand>,
+    spdp_liveness_sender: WakeSender<GuidPrefix>,
     participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
     security_plugins_opt: Option<SecurityPluginsHandle>,
     only_networks: Option<Arc<[IpAddr]>>,
     socket_send_buffer_size: usize,
     same_host_loopback: bool,
+    reader_ready: ReadyReceiver<EntityId>,
+    writer_ready: ReadyReceiver<EntityId>,
+    waker: LoopWaker,
   ) -> CreateResult<Self> {
     macro_rules! try_init {
       ($result:expr, $msg:literal) => {
@@ -182,107 +182,28 @@ impl DPEventLoop {
     }
 
     let poll = try_init!(Poll::new(), "Unable to create new poll");
-    // Both ends are this thread, and the channel is drained completely when its
-    // readiness event runs. Until then each of the four listeners can deliver
-    // MAX_LISTENER_MESSAGES_PER_POLL datagrams, and a datagram can carry several
-    // ACKNACKs. 1024 absorbs that burst; a still larger one is discarded.
-    let (acknack_sender, acknack_receiver) =
-      mio_channel::sync_channel::<(GuidPrefix, AckSubmessage)>(1024);
+    // Listeners are edge-triggered. The loop reads each one until WouldBlock,
+    // so a datagram left in the socket cannot sit unreported.
     let mut udp_listeners = udp_listeners;
     for (token, listener) in &mut udp_listeners {
       try_init!(
-        poll.register(
-          listener.mio_socket(),
-          *token,
-          Ready::readable(),
-          PollOpt::level(),
-        ),
+        poll
+          .registry()
+          .register(listener.mio_socket(), *token, Interest::READABLE,),
         "Failed to register listener"
       );
     }
 
-    try_init!(
-      poll.register(
-        &add_reader_receiver.receiver,
-        add_reader_receiver.token,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register reader adder"
-    );
+    // Command queues, doorbells and the timer share `waker` (installed when the
+    // loop starts). The acknack queue is drained on that same wake. Both ends
+    // of it are this thread. 1024 absorbs a burst of ACKNACKs from one poll's
+    // worth of datagrams; a still larger one is discarded.
+    let (acknack_sender, acknack_receiver) =
+      wake_channel::<(GuidPrefix, AckSubmessage)>(1024, &waker);
 
-    try_init!(
-      poll.register(
-        &remove_reader_receiver.receiver,
-        remove_reader_receiver.token,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register reader remover"
-    );
-    try_init!(
-      poll.register(
-        &add_writer_receiver.receiver,
-        add_writer_receiver.token,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register add writer channel"
-    );
-
-    try_init!(
-      poll.register(
-        &remove_writer_receiver.receiver,
-        remove_writer_receiver.token,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register remove writer channel"
-    );
-
-    try_init!(
-      poll.register(
-        &stop_poll_receiver,
-        STOP_POLL_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register stop poll channel"
-    );
-
-    try_init!(
-      poll.register(
-        &acknack_receiver,
-        ACKNACK_MESSAGE_TO_LOCAL_WRITER_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register AckNack submessage sending from MessageReceiver to DPEventLoop"
-    );
-
-    try_init!(
-      poll.register(
-        &discovery_update_notification_receiver,
-        DISCOVERY_UPDATE_NOTIFICATION_TOKEN,
-        Ready::readable(),
-        PollOpt::edge(),
-      ),
-      "Failed to register reader update notification"
-    );
-
-    // The single shared timer for this event loop. Register it once here and
-    // seed the periodic loop tasks. Reader/Writer timeouts are scheduled later
+    // Deadlines live in the loop. Reader/Writer timeouts are scheduled later
     // through cloned handles passed into Reader::new / Writer::new.
     let shared_timer = new_shared_timer::<DpTimerEvent>();
-    try_init!(
-      poll.register(
-        &*shared_timer.borrow(),
-        DPEV_TIMER_TOKEN,
-        Ready::readable(),
-        PollOpt::level(),
-      ),
-      "Failed to register dp_event_loop shared timer"
-    );
     {
       let mut t = shared_timer.borrow_mut();
       t.set_timeout(PREEMPTIVE_ACKNACK_PERIOD, DpTimerEvent::PreemptiveAcknack);
@@ -324,6 +245,9 @@ impl DPEventLoop {
       add_writer_receiver,
       remove_writer_receiver,
       stop_poll_receiver,
+      reader_ready,
+      writer_ready,
+      waker,
       writers: HashMap::new(),
       bulk_ready: BTreeMap::new(),
       writable_armed: BTreeSet::new(),
@@ -339,28 +263,46 @@ impl DPEventLoop {
   pub fn event_loop(self) {
     let mut events = Events::with_capacity(16); // too small capacity just delays events to next poll
 
-    // The shared timer (carrying preemptive-ACKNACK and cache-GC seeds, plus all
-    // per-endpoint timeouts) was created, registered and seeded in `new()`.
     let mut poll_alive = Instant::now();
     let mut ev_wrapper = self;
     let mut preparing_to_stop = false;
 
-    // Endpoint removals are collected here during an event batch and applied
-    // only after the whole batch has been dispatched. See the REMOVE_*_TOKEN
-    // handlers for the reason.
+    if let Err(e) = ev_wrapper.waker.install(&ev_wrapper.poll, LOOP_WAKE_TOKEN) {
+      error!("dp_event_loop failed to install waker: {e}");
+      return;
+    }
+
+    // Endpoint removals are collected during a wake and applied only after
+    // ready-queue commands from that same wake have been dispatched.
     let mut readers_to_remove: Vec<GUID> = Vec::new();
     let mut writers_to_remove: Vec<GUID> = Vec::new();
 
+    // Anything enqueued before the waker existed would not have woken us.
+    if ev_wrapper.drain_queues(
+      &mut readers_to_remove,
+      &mut writers_to_remove,
+      &mut preparing_to_stop,
+    ) {
+      return;
+    }
+    for reader_guid in readers_to_remove.drain(..) {
+      ev_wrapper.remove_local_reader(reader_guid);
+    }
+    for writer_guid in writers_to_remove.drain(..) {
+      ev_wrapper.remove_local_writer(&writer_guid);
+    }
+
     // loop starts here
     loop {
-      // nonblocking-transmit: on platforms without write-readiness registration
-      // we poll queued outbound work with a short timeout; on unix the sender
-      // sockets' writable readiness wakes us, so a long idle timeout is fine.
-      let poll_timeout = if cfg!(unix) || !ev_wrapper.has_pending_outbound() {
+      // The poll wakes for a socket, the shared waker, or the sooner of the next
+      // deadline and the outbound fallback. Non-unix has no write-readiness
+      // registration, so a short cap flushes queued sends.
+      let idle_cap = if cfg!(unix) || !ev_wrapper.has_pending_outbound() {
         Duration::from_millis(2000)
       } else {
         Duration::from_millis(2)
       };
+      let poll_timeout = timeout_until(ev_wrapper.shared_timer.borrow().next_deadline(), idle_cap);
       match ev_wrapper.poll.poll(&mut events, Some(poll_timeout)) {
         Ok(_) => {}
         Err(e) => {
@@ -380,241 +322,206 @@ impl DPEventLoop {
         debug!("dp_event_loop idling.");
       } else {
         for event in events.iter() {
-          match EntityId::from_token(event.token()) {
+          let token = Token(event.token().0);
+          match EntityId::from_token(token) {
             TokenDecode::FixedToken(fixed_token) => match fixed_token {
-              STOP_POLL_TOKEN => {
-                use std::sync::mpsc::TryRecvError;
-                // Read commands from the stop receiver until none left or quitting
-                // It would be nice turn the receiver into an iterator and avoid using the
-                // boolean..
-                let mut try_recv_more = true;
-                while try_recv_more {
-                  match ev_wrapper.stop_poll_receiver.try_recv() {
-                    Ok(EventLoopCommand::PrepareStop) => {
-                      info!("dp_event_loop preparing to stop.");
-                      preparing_to_stop = true;
-                      // There could still be an EventLoopCommand::Stop coming. Keep on receiving.
-                      try_recv_more = true;
-                    }
-                    Ok(EventLoopCommand::Stop) => {
-                      info!("Stopping dp_event_loop");
-                      return;
-                    }
-                    Err(err) => match err {
-                      TryRecvError::Empty => {
-                        try_recv_more = false;
-                      }
-                      TryRecvError::Disconnected => {
-                        error!(
-                          "Application thread has exited abnormally. Stopping RustDDS event loop."
-                        );
-                        return;
-                      }
-                    },
-                  }
-                }
-              }
               DISCOVERY_LISTENER_TOKEN
               | DISCOVERY_MUL_LISTENER_TOKEN
               | USER_TRAFFIC_LISTENER_TOKEN
               | USER_TRAFFIC_MUL_LISTENER_TOKEN => {
-                let udp_messages = ev_wrapper
-                  .udp_listeners
-                  .get_mut(&event.token())
-                  .map_or_else(
-                    || {
-                      error!("No listener with token {:?}", event.token());
-                      vec![]
-                    },
-                    |l| l.messages_bounded(MAX_LISTENER_MESSAGES_PER_POLL),
-                  );
+                // Edge-triggered: read until WouldBlock. A cap would leave
+                // datagrams sitting with no further readiness event.
+                let udp_messages = ev_wrapper.udp_listeners.get_mut(&token).map_or_else(
+                  || {
+                    error!("No listener with token {:?}", token);
+                    vec![]
+                  },
+                  |l| l.messages_bounded(usize::MAX),
+                );
                 for (packet, origin) in udp_messages {
                   ev_wrapper
                     .message_receiver
                     .handle_received_packet(&packet, origin);
                 }
               }
-              ADD_READER_TOKEN | REMOVE_READER_TOKEN => {
-                ev_wrapper.handle_reader_action(&event, &mut readers_to_remove);
+              LOOP_WAKE_TOKEN => {
+                // Queues are drained below, once, for this whole iteration.
               }
-              ADD_WRITER_TOKEN | REMOVE_WRITER_TOKEN => {
-                ev_wrapper.handle_writer_action(&event, &mut writers_to_remove);
-              }
-              ACKNACK_MESSAGE_TO_LOCAL_WRITER_TOKEN => {
-                ev_wrapper.handle_writer_acknack_action(&event);
-              }
-              DISCOVERY_UPDATE_NOTIFICATION_TOKEN => {
-                while let Ok(dnt) = ev_wrapper.discovery_update_notification_receiver.try_recv() {
-                  use DiscoveryNotificationType::*;
-                  match dnt {
-                    WriterUpdated {
-                      discovered_writer_data,
-                    } => ev_wrapper.remote_writer_discovered(&discovered_writer_data),
-
-                    WriterLost { writer_guid } => ev_wrapper.remote_writer_lost(writer_guid),
-
-                    ReaderUpdated {
-                      discovered_reader_data,
-                    } => ev_wrapper.remote_reader_discovered(&discovered_reader_data),
-
-                    ReaderLost { reader_guid } => ev_wrapper.remote_reader_lost(reader_guid),
-
-                    ParticipantUpdated { guid_prefix } => {
-                      ev_wrapper.update_participant(guid_prefix);
-                    }
-
-                    ParticipantLost { guid_prefix } => {
-                      ev_wrapper.remote_participant_lost(guid_prefix);
-                    }
-
-                    AssertTopicLiveliness {
-                      writer_guid,
-                      manual_assertion,
-                    } => {
-                      ev_wrapper
-                        .writers
-                        .get_mut(&writer_guid.entity_id)
-                        .map(|w| w.handle_heartbeat_tick(manual_assertion));
-                    }
-
-                    #[cfg(feature = "security")]
-                    ParticipantAuthenticationStatusChanged { guid_prefix } => {
-                      ev_wrapper.on_remote_participant_authentication_status_changed(guid_prefix);
-                    }
-                  }
-                }
-              }
-              DPEV_TIMER_TOKEN => {
-                // Drain all expired timeouts while holding a single borrow, then
-                // release it before dispatching (handlers re-borrow the timer to
-                // reschedule, so we must not hold the borrow across dispatch).
-                let expired: Vec<DpTimerEvent> = {
-                  let mut timer = ev_wrapper.shared_timer.borrow_mut();
-                  let mut v = Vec::new();
-                  while let Some(e) = timer.poll() {
-                    v.push(e);
-                  }
-                  v
-                };
-                for timed_event in expired {
-                  match timed_event {
-                    DpTimerEvent::PreemptiveAcknack => {
-                      ev_wrapper.message_receiver.send_preemptive_acknacks();
-                      ev_wrapper
-                        .shared_timer
-                        .borrow_mut()
-                        .set_timeout(PREEMPTIVE_ACKNACK_PERIOD, DpTimerEvent::PreemptiveAcknack);
-                    }
-                    DpTimerEvent::CacheGc => {
-                      debug!("Clean DDSCache on timer");
-                      ev_wrapper.dds_cache.write().unwrap().garbage_collect();
-                      ev_wrapper
-                        .shared_timer
-                        .borrow_mut()
-                        .set_timeout(CACHE_CLEAN_PERIOD, DpTimerEvent::CacheGc);
-                    }
-                    DpTimerEvent::Reader { entity_id, event } => {
-                      // A stale timeout for an already-removed reader is harmless.
-                      if let Some(reader) = ev_wrapper.message_receiver.reader_mut(entity_id) {
-                        reader.handle_timed_event(event);
-                      } else if !preparing_to_stop {
-                        trace!("Timed event for unknown reader {entity_id:?}");
-                      }
-                    }
-                    DpTimerEvent::Writer { entity_id, event } => {
-                      // A stale timeout for an already-removed writer is harmless.
-                      if let Some(writer) = ev_wrapper.writers.get_mut(&entity_id) {
-                        writer.handle_timed_event(event);
-                      } else if !preparing_to_stop {
-                        trace!("Timed event for unknown writer {entity_id:?}");
-                      }
-                    }
-                  }
-                }
-              }
-
               fixed_unknown => {
-                // nonblocking-transmit: write readiness on a sender socket.
                 if let Some(sid) = sender_writable_socket_id(fixed_unknown) {
                   ev_wrapper.on_socket_writable(sid);
                 } else {
                   error!(
                     "Unknown event.token {:?} = 0x{:x?} , decoded as {:?}",
-                    event.token(),
-                    event.token().0,
-                    fixed_unknown
+                    token, token.0, fixed_unknown
                   );
                 }
               }
             },
-
-            // Commands/actions
+            // Endpoint commands and doorbells are no longer poll tokens. They
+            // arrive through the ready queues drained below.
             TokenDecode::Entity(eid) => {
-              if eid.kind().is_reader() {
-                ev_wrapper.message_receiver.reader_mut(eid).map_or_else(
-                  || {
-                    // Harmless: Entity tokens exist only for endpoints we have
-                    // registered, so a lookup miss means the reader was already
-                    // removed before this event got dispatched.
-                    debug!("Command event for unknown reader {eid:?}");
-                  },
-                  Reader::process_command,
-                );
-              } else if eid.kind().is_writer() {
-                let (blocked, local_readers) = match ev_wrapper.writers.get_mut(&eid) {
-                  None => {
-                    // Harmless, for the same reason as an unknown reader above.
-                    debug!("Command event for unknown writer {eid:?}");
-                    (BTreeSet::new(), vec![])
-                  }
-                  Some(writer) => {
-                    // The DataWriter admitted new samples into the shared send
-                    // buffer and rang the doorbell; transmit them.
-                    writer.process_pending();
-                    (writer.take_blocked_sockets(), writer.local_readers())
-                  }
-                };
-                // nonblocking-transmit: if the socket(s) congested, enqueue this
-                // writer for a round-robin resume on write readiness.
-                for sid in blocked {
-                  ev_wrapper.mark_writer_willing(sid, eid);
-                }
-                // Notify local (same participant) readers that new data is available in the
-                // cache.
-                ev_wrapper
-                  .message_receiver
-                  .notify_data_to_readers(local_readers);
-              } else {
-                error!("Entity Event for unknown EntityKind {eid:?}");
-              }
+              error!("Unexpected entity poll token {eid:?}");
             }
-
-            // Timed actions used to be routed here via per-endpoint "alt entity"
-            // timer tokens. All timeouts now arrive through the single shared
-            // timer (DPEV_TIMER_TOKEN), so no alt-entity tokens are registered
-            // anymore. This arm should therefore be unreachable.
             TokenDecode::AltEntity(eid) => {
-              error!("Unexpected AltEntity timer event for {eid:?} - all timers are now shared");
+              error!("Unexpected AltEntity poll token {eid:?}");
             }
           }
-        } // for
+        }
+      }
 
-        // Apply the endpoint removals that were deferred during this batch. The
-        // batch may have contained command events for these endpoints, and those
-        // were dispatched above while the endpoints were still present.
-        for reader_guid in readers_to_remove.drain(..) {
-          ev_wrapper.remove_local_reader(reader_guid);
-        }
-        for writer_guid in writers_to_remove.drain(..) {
-          ev_wrapper.remove_local_writer(&writer_guid);
-        }
-      } // if
+      ev_wrapper.drain_timers(preparing_to_stop);
+      if ev_wrapper.drain_queues(
+        &mut readers_to_remove,
+        &mut writers_to_remove,
+        &mut preparing_to_stop,
+      ) {
+        return;
+      }
+      // Removals wait until commands queued in this same wake have run.
+      for reader_guid in readers_to_remove.drain(..) {
+        ev_wrapper.remove_local_reader(reader_guid);
+      }
+      for writer_guid in writers_to_remove.drain(..) {
+        ev_wrapper.remove_local_writer(&writer_guid);
+      }
 
       // nonblocking-transmit: service the per-socket outbound queues and keep
       // write-readiness interest in sync with what is pending.
       ev_wrapper.service_outbound();
     } // loop
   } // fn
+
+  // Returns true when the loop should exit.
+  fn drain_queues(
+    &mut self,
+    readers_to_remove: &mut Vec<GUID>,
+    writers_to_remove: &mut Vec<GUID>,
+    preparing_to_stop: &mut bool,
+  ) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    loop {
+      match self.stop_poll_receiver.try_recv() {
+        Ok(EventLoopCommand::PrepareStop) => {
+          info!("dp_event_loop preparing to stop.");
+          *preparing_to_stop = true;
+        }
+        Ok(EventLoopCommand::Stop) => {
+          info!("Stopping dp_event_loop");
+          return true;
+        }
+        Err(TryRecvError::Empty) => break,
+        Err(TryRecvError::Disconnected) => {
+          error!("Application thread has exited abnormally. Stopping RustDDS event loop.");
+          return true;
+        }
+      }
+    }
+
+    self.handle_reader_action(readers_to_remove);
+    self.handle_writer_action(writers_to_remove);
+    self.handle_writer_acknack_action();
+
+    while let Ok(dnt) = self.discovery_update_notification_receiver.try_recv() {
+      use DiscoveryNotificationType::*;
+      match dnt {
+        WriterUpdated {
+          discovered_writer_data,
+        } => self.remote_writer_discovered(&discovered_writer_data),
+        WriterLost { writer_guid } => self.remote_writer_lost(writer_guid),
+        ReaderUpdated {
+          discovered_reader_data,
+        } => self.remote_reader_discovered(&discovered_reader_data),
+        ReaderLost { reader_guid } => self.remote_reader_lost(reader_guid),
+        ParticipantUpdated { guid_prefix } => self.update_participant(guid_prefix),
+        ParticipantLost { guid_prefix } => self.remote_participant_lost(guid_prefix),
+        AssertTopicLiveliness {
+          writer_guid,
+          manual_assertion,
+        } => {
+          self
+            .writers
+            .get_mut(&writer_guid.entity_id)
+            .map(|w| w.handle_heartbeat_tick(manual_assertion));
+        }
+        #[cfg(feature = "security")]
+        ParticipantAuthenticationStatusChanged { guid_prefix } => {
+          self.on_remote_participant_authentication_status_changed(guid_prefix);
+        }
+      }
+    }
+
+    // Adds have been applied. Ready ids for those endpoints can be handled now,
+    // still before the deferred removals.
+    for eid in self.reader_ready.drain_unique() {
+      self.message_receiver.reader_mut(eid).map_or_else(
+        || debug!("Command event for unknown reader {eid:?}"),
+        Reader::process_command,
+      );
+    }
+    let writer_ids = self.writer_ready.drain_unique();
+    for eid in writer_ids {
+      let (blocked, local_readers) = match self.writers.get_mut(&eid) {
+        None => {
+          debug!("Command event for unknown writer {eid:?}");
+          (BTreeSet::new(), vec![])
+        }
+        Some(writer) => {
+          writer.process_pending();
+          (writer.take_blocked_sockets(), writer.local_readers())
+        }
+      };
+      for sid in blocked {
+        self.mark_writer_willing(sid, eid);
+      }
+      self.message_receiver.notify_data_to_readers(local_readers);
+    }
+    false
+  }
+
+  fn drain_timers(&mut self, preparing_to_stop: bool) {
+    let expired: Vec<DpTimerEvent> = {
+      let mut timer = self.shared_timer.borrow_mut();
+      let mut v = Vec::new();
+      while let Some(e) = timer.poll() {
+        v.push(e);
+      }
+      v
+    };
+    for timed_event in expired {
+      match timed_event {
+        DpTimerEvent::PreemptiveAcknack => {
+          self.message_receiver.send_preemptive_acknacks();
+          self
+            .shared_timer
+            .borrow_mut()
+            .set_timeout(PREEMPTIVE_ACKNACK_PERIOD, DpTimerEvent::PreemptiveAcknack);
+        }
+        DpTimerEvent::CacheGc => {
+          debug!("Clean DDSCache on timer");
+          self.dds_cache.write().unwrap().garbage_collect();
+          self
+            .shared_timer
+            .borrow_mut()
+            .set_timeout(CACHE_CLEAN_PERIOD, DpTimerEvent::CacheGc);
+        }
+        DpTimerEvent::Reader { entity_id, event } => {
+          if let Some(reader) = self.message_receiver.reader_mut(entity_id) {
+            reader.handle_timed_event(event);
+          } else if !preparing_to_stop {
+            trace!("Timed event for unknown reader {entity_id:?}");
+          }
+        }
+        DpTimerEvent::Writer { entity_id, event } => {
+          if let Some(writer) = self.writers.get_mut(&entity_id) {
+            writer.handle_timed_event(event);
+          } else if !preparing_to_stop {
+            trace!("Timed event for unknown writer {entity_id:?}");
+          }
+        }
+      }
+    }
+  }
 
   // --- nonblocking-transmit helpers -----------------------------------------
 
@@ -669,11 +576,24 @@ impl DPEventLoop {
   }
 
   // Arm write-readiness poll interest for sockets that have queued work, and
-  // disarm it for sockets that have drained. Level-triggered, so we keep being
-  // woken while a socket is writable and has pending work.
+  // disarm it for sockets that have drained. mio 1.2 is edge-triggered, so a
+  // socket that is already writable may not notify until it transitions. After
+  // arming we attempt the pending send immediately; WouldBlock waits for the
+  // next edge.
   #[cfg(unix)]
   fn reconcile_writable_interest(&mut self) {
-    use mio_06::unix::EventedFd;
+    let newly_armed = self.sync_writable_interest();
+    for sid in newly_armed {
+      self.on_socket_writable(sid);
+    }
+    // The immediate attempt may have drained the socket. Drop interest if so.
+    let _ = self.sync_writable_interest();
+  }
+
+  #[cfg(unix)]
+  fn sync_writable_interest(&mut self) -> Vec<SocketId> {
+    use mio1::unix::SourceFd;
+    let mut newly_armed = Vec::new();
     let pending_control = self.udp_sender.pending_control_sockets();
     for sid in self.udp_sender.socket_ids() {
       let want =
@@ -682,14 +602,15 @@ impl DPEventLoop {
       match (want, armed) {
         (true, false) => {
           if let Some(fd) = self.udp_sender.socket_raw_fd(sid) {
-            match self.poll.register(
-              &EventedFd(&fd),
+            let mut source = SourceFd(&fd);
+            match self.poll.registry().register(
+              &mut source,
               sender_writable_token(sid),
-              Ready::writable(),
-              PollOpt::level(),
+              Interest::WRITABLE,
             ) {
               Ok(()) => {
                 self.writable_armed.insert(sid);
+                newly_armed.push(sid);
               }
               Err(e) => error!("nonblocking-transmit: failed to arm writable for {sid:?}: {e}"),
             }
@@ -697,13 +618,15 @@ impl DPEventLoop {
         }
         (false, true) => {
           if let Some(fd) = self.udp_sender.socket_raw_fd(sid) {
-            let _ = self.poll.deregister(&EventedFd(&fd));
+            let mut source = SourceFd(&fd);
+            let _ = self.poll.registry().deregister(&mut source);
           }
           self.writable_armed.remove(&sid);
         }
         _ => {}
       }
     }
+    newly_armed
   }
 
   // Fallback for platforms without EventedFd: flush/serve every socket each loop
@@ -724,53 +647,34 @@ impl DPEventLoop {
       .unwrap_or_else(|e| error!("Cannot report participant status: {e:?}"));
   }
 
-  fn handle_reader_action(&mut self, event: &Event, pending_removals: &mut Vec<GUID>) {
-    match event.token() {
-      ADD_READER_TOKEN => {
-        trace!("add reader(s)");
-        while let Ok(new_reader_ing) = self.add_reader_receiver.receiver.try_recv() {
-          // Add the reader locally
-          let guid = new_reader_ing.guid;
-          self.add_local_reader(new_reader_ing);
-          // Inform Discovery about it
-          self.inform_discovery_about_new_local_endpoint(guid);
-        }
-      }
-      REMOVE_READER_TOKEN => {
-        // Only collect here. Dropping a DataReader both signals the removal and
-        // wakes its command channel, so the current event batch may still hold a
-        // command event for this reader. Removing it immediately would turn that
-        // event into a spurious "unknown reader" lookup miss.
-        while let Ok(old_reader_guid) = self.remove_reader_receiver.receiver.try_recv() {
-          pending_removals.push(old_reader_guid);
-        }
-      }
-      _ => {}
+  fn handle_reader_action(&mut self, pending_removals: &mut Vec<GUID>) {
+    while let Ok(new_reader_ing) = self.add_reader_receiver.receiver.try_recv() {
+      trace!("add reader {:?}", new_reader_ing.guid);
+      let guid = new_reader_ing.guid;
+      self.add_local_reader(new_reader_ing);
+      self.inform_discovery_about_new_local_endpoint(guid);
+    }
+    // Only collect removals. A command for this reader may already be in the
+    // ready queue of this same wake. Removing immediately would turn that into
+    // an "unknown reader" miss. The caller applies these after ready-queue
+    // dispatch.
+    while let Ok(old_reader_guid) = self.remove_reader_receiver.receiver.try_recv() {
+      pending_removals.push(old_reader_guid);
     }
   }
 
-  fn handle_writer_action(&mut self, event: &Event, pending_removals: &mut Vec<GUID>) {
-    match event.token() {
-      ADD_WRITER_TOKEN => {
-        while let Ok(new_writer_ingredients) = self.add_writer_receiver.receiver.try_recv() {
-          // Add the writer locally
-          let guid = new_writer_ingredients.guid;
-          self.add_local_writer(new_writer_ingredients);
-          // Inform Discovery about it
-          self.inform_discovery_about_new_local_endpoint(guid);
-        }
-      }
-      REMOVE_WRITER_TOKEN => {
-        // Deferred for the same reason as reader removals above.
-        while let Ok(writer_guid) = self.remove_writer_receiver.receiver.try_recv() {
-          pending_removals.push(writer_guid);
-        }
-      }
-      other => error!("Expected writer action token, got {other:?}"),
+  fn handle_writer_action(&mut self, pending_removals: &mut Vec<GUID>) {
+    while let Ok(new_writer_ingredients) = self.add_writer_receiver.receiver.try_recv() {
+      let guid = new_writer_ingredients.guid;
+      self.add_local_writer(new_writer_ingredients);
+      self.inform_discovery_about_new_local_endpoint(guid);
+    }
+    while let Ok(writer_guid) = self.remove_writer_receiver.receiver.try_recv() {
+      pending_removals.push(writer_guid);
     }
   }
 
-  fn handle_writer_acknack_action(&mut self, _event: &Event) {
+  fn handle_writer_acknack_action(&mut self) {
     while let Ok((acknack_sender_prefix, acknack_submessage)) = self.ack_nack_receiver.try_recv() {
       let writer_guid = GUID::new_with_prefix_and_id(
         self.domain_info.domain_participant_guid.prefix,
@@ -1162,33 +1066,18 @@ impl DPEventLoop {
       self.participant_status_sender.clone(),
     );
 
-    // Non-timed action polling
-    self
-      .poll
-      .register(
-        &new_reader.data_reader_command_receiver,
-        new_reader.entity_token(),
-        Ready::readable(),
-        PollOpt::edge(),
-      )
-      .expect("Reader command channel registration failed!!!");
-
+    // Reader commands share the poll waker. The ready queue records the entity
+    // id, so there is nothing to register under the reader token.
     new_reader.set_requested_deadline_check_timer();
     trace!("Add reader: {new_reader:?}");
     self.message_receiver.add_reader(new_reader);
   }
 
   fn remove_local_reader(&mut self, reader_guid: GUID) {
-    if let Some(old_reader) = self.message_receiver.remove_reader(reader_guid) {
-      // Note: the timer is shared and stays registered for the lifetime of the
-      // loop, so there is nothing per-reader to deregister here. Any timeout
+    if self.message_receiver.remove_reader(reader_guid).is_some() {
+      // The timer is shared and stays with the loop. Reader commands share the
+      // poll waker, so there is no per-reader registration to drop. A timeout
       // already scheduled for this reader is ignored on dispatch (lookup miss).
-      self
-        .poll
-        .deregister(&old_reader.data_reader_command_receiver)
-        .unwrap_or_else(|e| {
-          error!("Cannot deregister data_reader_command_receiver: {e:?}");
-        });
 
       #[cfg(feature = "security")]
       if let Some(plugins_handle) = self.security_plugins_opt.as_ref() {
@@ -1234,28 +1123,15 @@ impl DPEventLoop {
       ));
     }
 
-    self
-      .poll
-      .register(
-        &new_writer.doorbell_registration,
-        new_writer.entity_token(),
-        Ready::readable(),
-        PollOpt::edge(),
-      )
-      .expect("Writer doorbell registration failed!!");
-
+    // The doorbell is a shared ready-queue plus the poll waker, not a
+    // registration under the writer token.
     self.writers.insert(new_writer.guid().entity_id, new_writer);
   }
 
   fn remove_local_writer(&mut self, writer_guid: &GUID) {
-    if let Some(w) = self.writers.remove(&writer_guid.entity_id) {
-      self
-        .poll
-        .deregister(&w.doorbell_registration)
-        .unwrap_or_else(|e| error!("Deregister fail (writer doorbell) {e:?}"));
-      // The timer is shared and stays registered for the loop's lifetime; there
-      // is nothing per-writer to deregister. Stale timeouts are ignored on
-      // dispatch (lookup miss).
+    if self.writers.remove(&writer_guid.entity_id).is_some() {
+      // The timer is shared and stays with the loop. Stale timeouts are ignored
+      // on dispatch (lookup miss).
 
       #[cfg(feature = "security")]
       if let Some(plugins_handle) = self.security_plugins_opt.as_ref() {
@@ -1379,8 +1255,6 @@ fn check_are_endpoints_securities_compatible(
 mod tests {
   use std::{sync::Mutex, thread};
 
-  use mio_extras::channel as mio_channel;
-
   use super::*;
   use crate::{
     dds::{
@@ -1390,6 +1264,7 @@ mod tests {
       with_key::simpledatareader::ReaderCommand,
     },
     mio_source,
+    polling::{ready_channel, wake_channel, wake_channel_unbounded, LoopWaker},
   };
 
   //#[test]
@@ -1402,26 +1277,27 @@ mod tests {
     // anything?
 
     // Create DP communication channels
-    let (sender_add_reader, receiver_add) = mio_channel::channel::<ReaderIngredients>();
-    let (sender_remove_reader, receiver_remove) = mio_channel::channel::<GUID>();
-
-    let (_add_writer_sender, add_writer_receiver) = mio_channel::channel();
-    let (_remove_writer_sender, remove_writer_receiver) = mio_channel::channel();
-
-    let (_stop_poll_sender, stop_poll_receiver) = mio_channel::channel();
-
+    let waker = LoopWaker::new();
+    let (sender_add_reader, receiver_add) = wake_channel::<ReaderIngredients>(8, &waker);
+    let (sender_remove_reader, receiver_remove) = wake_channel::<GUID>(4, &waker);
+    let (_add_writer_sender, add_writer_receiver) = wake_channel::<WriterIngredients>(8, &waker);
+    let (_remove_writer_sender, remove_writer_receiver) = wake_channel::<GUID>(4, &waker);
+    let (stop_poll_sender, stop_poll_receiver) = wake_channel_unbounded(&waker);
     let (_discovery_update_notification_sender, discovery_update_notification_receiver) =
-      mio_channel::channel();
+      wake_channel(8, &waker);
+    let discovery_waker = LoopWaker::new();
     let (discovery_command_sender, _discovery_command_receiver) =
-      mio_channel::sync_channel::<DiscoveryCommand>(64);
-    let (spdp_liveness_sender, _spdp_liveness_receiver) = mio_channel::sync_channel(8);
+      wake_channel::<DiscoveryCommand>(64, &discovery_waker);
+    let (spdp_liveness_sender, _spdp_liveness_receiver) = wake_channel(8, &discovery_waker);
+    let (_reader_ready_tx, reader_ready) = ready_channel(&waker);
+    let (_writer_ready_tx, writer_ready) = ready_channel(&waker);
     let (participant_status_sender, _participant_status_receiver) =
       sync_status_channel(16).unwrap();
 
     let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
     let dds_cache_clone = Arc::clone(&dds_cache);
     let (discovery_db_event_sender, _discovery_db_event_receiver) =
-      mio_channel::sync_channel::<()>(4);
+      std::sync::mpsc::sync_channel(4);
 
     let discovery_db = Arc::new(RwLock::new(DiscoveryDB::new(
       GUID::new_participant_guid(),
@@ -1434,8 +1310,6 @@ mod tests {
       domain_id: 0,
       participant_id: 0,
     };
-
-    let (sender_stop, receiver_stop) = mio_channel::channel::<i32>();
 
     // Start event loop
     let child = thread::spawn(move || {
@@ -1470,17 +1344,11 @@ mod tests {
         None,
         0,
         true,
+        reader_ready,
+        writer_ready,
+        waker,
       )
       .expect("DPEventLoop::new in test");
-      dp_event_loop
-        .poll
-        .register(
-          &receiver_stop,
-          STOP_POLL_TOKEN,
-          Ready::readable(),
-          PollOpt::edge(),
-        )
-        .expect("Failed to register receivers.");
       dp_event_loop.event_loop();
     });
 
@@ -1499,7 +1367,8 @@ mod tests {
       let new_guid = GUID::default();
 
       // Create mechanisms for notifications, statuses & commands
-      let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+      let (notification_sender, _notification_receiver) =
+        crate::mio_source::notification_channel(100);
       let (_notification_event_source, notification_event_sender) =
         mio_source::make_poll_channel().unwrap();
       let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1507,7 +1376,7 @@ mod tests {
       let (status_sender, _status_receiver) = sync_status_channel::<DataReaderStatus>(4).unwrap();
 
       let (_reader_command_sender, reader_command_receiver) =
-        mio_channel::sync_channel::<ReaderCommand>(10);
+        wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
       let new_reader_ing = ReaderIngredients {
         guid: new_guid,
@@ -1521,6 +1390,7 @@ mod tests {
         data_reader_waker: data_reader_waker.clone(),
         poll_event_sender: notification_event_sender,
         security_plugins: None,
+        discovery_notify: None,
       };
 
       reader_guids.push(new_reader_ing.guid);
@@ -1536,7 +1406,7 @@ mod tests {
     std::thread::sleep(Duration::new(0, 100));
 
     info!("\nsending end token\n");
-    sender_stop.send(0).unwrap();
+    stop_poll_sender.send(EventLoopCommand::Stop).unwrap();
     child.join().unwrap();
   }
 
@@ -1646,7 +1516,7 @@ mod tests {
   //     //topics.push(topic);
   //     let new_guid = GUID::default();
 
-  //     let (send, _rec) = mio_channel::sync_channel::<()>(100);
+  //     let (send, _rec) = crate::mio_source::notification_channel(100);
   //     let (status_sender, status_receiver_DataReader) =
   //       mio_extras::channel::sync_channel::<DataReaderStatus>(1000);
   //     let (reader_commander, reader_command_receiver) =

@@ -4,6 +4,7 @@ use std::{
 };
 
 use log::{error, info};
+#[cfg(feature = "mio_06")]
 use mio_06::Evented;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -261,8 +262,10 @@ impl RosParticipantInner {
   */
 }
 
+#[cfg(feature = "mio_06")]
 use mio_06 as mio;
 
+#[cfg(feature = "mio_06")]
 impl Evented for RosParticipant {
   fn register(
     &self,

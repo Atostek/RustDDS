@@ -48,9 +48,9 @@ impl From<CertificateAlgorithm> for String {
     String::from(<&str>::from(value))
   }
 }
-impl TryFrom<&str> for CertificateAlgorithm {
-  type Error = SecurityError;
-  fn try_from(value: &str) -> Result<Self, Self::Error> {
+impl std::str::FromStr for CertificateAlgorithm {
+  type Err = SecurityError;
+  fn from_str(value: &str) -> Result<Self, Self::Err> {
     match value {
       RSA_2048_ALGO_NAME => Ok(CertificateAlgorithm::RSA2048),
       EC_PRIME_ALGO_NAME => Ok(CertificateAlgorithm::ECPrime256v1),
@@ -64,7 +64,7 @@ impl TryFrom<&str> for CertificateAlgorithm {
 impl TryFrom<String> for CertificateAlgorithm {
   type Error = SecurityError;
   fn try_from(value: String) -> Result<Self, Self::Error> {
-    CertificateAlgorithm::try_from(value.as_str())
+    value.parse()
   }
 }
 

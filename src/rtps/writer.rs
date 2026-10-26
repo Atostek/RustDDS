@@ -4,14 +4,13 @@ use std::{
   collections::{BTreeMap, BTreeSet},
   ops::Bound::Included,
   rc::Rc,
-  sync::atomic,
+  sync::{atomic, mpsc::TrySendError},
 };
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use speedy::Endianness;
-use mio_extras::channel::TrySendError;
-use mio_06::{Ready, Registration, SetReadiness, Token};
+use mio1::Token;
 
 use crate::{
   dds::{
@@ -126,13 +125,6 @@ pub(crate) struct WriterIngredients {
   /// Shared, flow-controlled buffer of outgoing samples. The producer end is
   /// held by the `DataWriter`; this clone is the consumer end for the Writer.
   pub send_buffer: WriterSendBuffer,
-  /// mio readiness "doorbell": the `DataWriter` rings it after admitting a
-  /// sample so the event loop wakes and transmits. The Writer keeps the
-  /// `Registration` end alive so it stays registered with the poll.
-  pub doorbell_registration: Registration,
-  /// A clone of the doorbell's `SetReadiness`, used by the Writer to reset the
-  /// readiness to empty before draining, so edge-triggered re-arming works.
-  pub doorbell: SetReadiness,
   pub topic_name: String,
   pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Writer)
   pub qos_policies: QosPolicies,
@@ -188,12 +180,6 @@ pub(crate) struct Writer {
   pub data_max_size_serialized: usize,
 
   my_guid: GUID,
-  /// mio readiness handle the event loop registers under `entity_token()`. The
-  /// `DataWriter` rings the paired `SetReadiness` when it admits a sample.
-  pub(crate) doorbell_registration: Registration,
-  /// Used to reset the doorbell readiness to empty before draining pending
-  /// samples (edge-triggered re-arming).
-  doorbell: SetReadiness,
 
   /// The RTPS ReaderProxy class represents the information an RTPS
   /// StatefulWriter maintains on each matched RTPS Reader
@@ -357,8 +343,6 @@ impl Writer {
       // Conservative fallback for any discovery advertisement of max sample size.
       data_max_size_serialized: FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE,
       my_guid: i.guid,
-      doorbell_registration: i.doorbell_registration,
-      doorbell: i.doorbell,
       readers: BTreeMap::new(),
       matched_readers_count_total: 0,
       requested_incompatible_qos_count: 0,
@@ -383,8 +367,9 @@ impl Writer {
     }
   }
 
-  /// To know when token represents a writer we should look entity attribute
-  /// kind this entity token can be used in DataWriter -> Writer mio::channel.
+  /// Entity id encoded as a mio token. The internal poll no longer registers
+  /// per-writer tokens; the doorbell ready queue carries the id instead.
+  #[allow(dead_code)]
   pub fn entity_token(&self) -> Token {
     self.guid().entity_id.as_token()
   }
@@ -787,11 +772,9 @@ impl Writer {
   }
 
   pub fn process_pending(&mut self) {
-    // Reset the doorbell to empty *before* reading the buffer state, so that any
-    // sample admitted concurrently re-arms the (edge-triggered) doorbell and we
-    // are woken again. The shared buffer's `last_seq` is the source of truth.
-    let _ = self.doorbell.set_readiness(Ready::empty());
-
+    // The doorbell enqueues this writer's id and then wakes. A sample admitted
+    // while we are here pushes another id, so the next wake runs us again. The
+    // shared buffer's `last_seq` is the source of truth.
     loop {
       let last_available = self.send_buffer.last_change_sequence_number();
       if self.last_sent >= last_available {
@@ -1932,7 +1915,7 @@ impl Writer {
   fn send_status(&self, status: DataWriterStatus) {
     self
       .status_sender
-      .try_send(status)
+      .try_send_impl(status)
       .unwrap_or_else(|e| match e {
         // TODO: dead code. `StatusChannelSender::try_send` currently converts a
         // full channel into `Ok(())` (dropping the event), so this arm is never
@@ -1941,9 +1924,6 @@ impl Writer {
         TrySendError::Full(_) => (), // This is normal in case there is no receiver
         TrySendError::Disconnected(_) => {
           debug!("send_status - status receiver is disconnected");
-        }
-        TrySendError::Io(e) => {
-          warn!("send_status - io error {e:?}");
         }
       });
   }
@@ -2789,7 +2769,6 @@ mod tests {
             Admission::Admitted(_)
           ));
         }
-        let (doorbell_registration, doorbell) = Registration::new2();
         let (status_sender, status) = sync_status_channel(4).unwrap();
         let (participant_status_sender, participant_status) = sync_status_channel(16).unwrap();
         let timer = new_shared_timer();
@@ -2797,8 +2776,6 @@ mod tests {
           WriterIngredients {
             guid,
             send_buffer,
-            doorbell_registration,
-            doorbell,
             topic_name: "repair_test".to_string(),
             like_stateless: false,
             qos_policies: writer_qos,

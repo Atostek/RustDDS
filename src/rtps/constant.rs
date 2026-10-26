@@ -1,7 +1,6 @@
 use std::time::Duration;
 
-use mio_06::Token;
-use mio_extras::channel as mio_channel;
+use mio1::Token;
 
 use crate::{
   discovery::{
@@ -9,6 +8,7 @@ use crate::{
     discovery::Discovery,
     sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
   },
+  polling::WakeReceiver,
   rtps::outbound::SocketId,
   structure::guid::{EntityId, EntityKind, GuidPrefix, GUID},
   QosPolicies,
@@ -323,6 +323,12 @@ const PTB: usize = EntityKind::POLL_TOKEN_BASE;
 
 pub const STOP_POLL_TOKEN: Token = Token(PTB);
 
+/// Single waker token for an internal mio 1.2 poll. The event carries no
+/// payload: the sender enqueued the reason before waking, and the loop drains
+/// every queue. Numeric value stays inside the fixed-token range decoded by
+/// `EntityId::from_token`.
+pub const LOOP_WAKE_TOKEN: Token = Token(1 + PTB);
+
 // pub const DISCOVERY_SENDER_TOKEN: Token = Token(1 + PTB);
 // pub const USER_TRAFFIC_SENDER_TOKEN: Token = Token(2 + PTB);
 
@@ -422,7 +428,42 @@ pub fn sender_writable_socket_id(token: Token) -> Option<SocketId> {
 
 pub struct TokenReceiverPair<T> {
   pub token: Token,
-  pub receiver: mio_channel::Receiver<T>,
+  pub receiver: WakeReceiver<T>,
+}
+
+/// Discovery poll token for a built-in reader, if this entity is one. User
+/// readers return `None`: their sample notifications stay on the mio-0.6
+/// channel the caller registers. Discovery's own poll is mio 1.2 and learns
+/// about these readers through the shared waker instead.
+pub fn discovery_reader_data_token(id: EntityId) -> Option<Token> {
+  match id {
+    EntityId::SPDP_BUILTIN_PARTICIPANT_READER => Some(DISCOVERY_PARTICIPANT_DATA_TOKEN),
+    EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_READER => Some(DISCOVERY_READER_DATA_TOKEN),
+    EntityId::SEDP_BUILTIN_PUBLICATIONS_READER => Some(DISCOVERY_WRITER_DATA_TOKEN),
+    EntityId::SEDP_BUILTIN_TOPIC_READER => Some(DISCOVERY_TOPIC_DATA_TOKEN),
+    EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER => Some(DISCOVERY_PARTICIPANT_MESSAGE_TOKEN),
+    #[cfg(feature = "security")]
+    EntityId::SPDP_RELIABLE_BUILTIN_PARTICIPANT_SECURE_READER => {
+      Some(SECURE_DISCOVERY_PARTICIPANT_DATA_TOKEN)
+    }
+    #[cfg(feature = "security")]
+    EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_SECURE_READER => Some(SECURE_DISCOVERY_READER_DATA_TOKEN),
+    #[cfg(feature = "security")]
+    EntityId::SEDP_BUILTIN_PUBLICATIONS_SECURE_READER => Some(SECURE_DISCOVERY_WRITER_DATA_TOKEN),
+    #[cfg(feature = "security")]
+    EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_SECURE_READER => {
+      Some(P2P_SECURE_DISCOVERY_PARTICIPANT_MESSAGE_TOKEN)
+    }
+    #[cfg(feature = "security")]
+    EntityId::P2P_BUILTIN_PARTICIPANT_STATELESS_READER => {
+      Some(P2P_PARTICIPANT_STATELESS_MESSAGE_TOKEN)
+    }
+    #[cfg(feature = "security")]
+    EntityId::P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_READER => {
+      Some(P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_TOKEN)
+    }
+    _ => None,
+  }
 }
 
 #[derive(Debug)]

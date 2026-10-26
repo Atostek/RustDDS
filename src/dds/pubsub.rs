@@ -5,7 +5,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use mio_extras::channel as mio_channel;
 use byteorder::LittleEndian;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
@@ -33,6 +32,7 @@ use crate::{
     discovery::DiscoveryCommand, discovery_db::DiscoveryDB, sedp_messages::DiscoveredWriterData,
   },
   mio_source,
+  polling::{wake_channel, BoundSender, Doorbell, ReadySender, WakeSender},
   rtps::{
     constant::DEFAULT_WRITER_MAX_SAMPLES, reader::ReaderIngredients, writer::WriterIngredients,
     writer_send_buffer::WriterSendBuffer,
@@ -44,7 +44,6 @@ use crate::{
   },
 };
 use super::{
-  helpers::try_send_timeout,
   no_key::wrappers::{DAWrapper, NoKeyWrapper, SAWrapper},
   with_key::simpledatareader::ReaderCommand,
 };
@@ -104,10 +103,11 @@ impl Publisher {
     discovery_db: Arc<RwLock<DiscoveryDB>>,
     qos: QosPolicies,
     default_dw_qos: QosPolicies,
-    add_writer_sender: mio_channel::SyncSender<WriterIngredients>,
-    remove_writer_sender: mio_channel::SyncSender<GUID>,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    add_writer_sender: WakeSender<WriterIngredients>,
+    remove_writer_sender: WakeSender<GUID>,
+    discovery_command: WakeSender<DiscoveryCommand>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    writer_ready: ReadySender<EntityId>,
   ) -> Self {
     Self {
       inner: Arc::new(Mutex::new(InnerPublisher::new(
@@ -118,6 +118,7 @@ impl Publisher {
         add_writer_sender,
         remove_writer_sender,
         discovery_command,
+        writer_ready,
         security_plugins_handle,
       ))),
     }
@@ -426,10 +427,11 @@ struct InnerPublisher {
   discovery_db: Arc<RwLock<DiscoveryDB>>,
   my_qos_policies: QosPolicies,
   default_datawriter_qos: QosPolicies, // used when creating a new DataWriter
-  add_writer_sender: mio_channel::SyncSender<WriterIngredients>,
-  remove_writer_sender: mio_channel::SyncSender<GUID>,
-  discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+  add_writer_sender: WakeSender<WriterIngredients>,
+  remove_writer_sender: WakeSender<GUID>,
+  discovery_command: WakeSender<DiscoveryCommand>,
   security_plugins_handle: Option<SecurityPluginsHandle>,
+  writer_ready: ReadySender<EntityId>,
 }
 
 // public interface for Publisher
@@ -440,9 +442,10 @@ impl InnerPublisher {
     discovery_db: Arc<RwLock<DiscoveryDB>>,
     qos: QosPolicies,
     default_dw_qos: QosPolicies,
-    add_writer_sender: mio_channel::SyncSender<WriterIngredients>,
-    remove_writer_sender: mio_channel::SyncSender<GUID>,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    add_writer_sender: WakeSender<WriterIngredients>,
+    remove_writer_sender: WakeSender<GUID>,
+    discovery_command: WakeSender<DiscoveryCommand>,
+    writer_ready: ReadySender<EntityId>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
   ) -> Self {
     // We generate an arbitrary but unique id to distinguish Publishers from each
@@ -460,6 +463,7 @@ impl InnerPublisher {
       remove_writer_sender,
       discovery_command,
       security_plugins_handle,
+      writer_ready,
     }
   }
 
@@ -552,10 +556,8 @@ impl InnerPublisher {
       backlog_limit,
       max_retain,
     );
-    // mio readiness "doorbell": the DataWriter rings `doorbell` after admitting a
-    // sample; the event loop registers `doorbell_registration` under the writer's
-    // entity token and wakes to transmit.
-    let (doorbell_registration, doorbell) = mio_06::Registration::new2();
+    // Doorbell: enqueue this writer's entity id and wake the participant poll.
+    let doorbell = Doorbell::new(guid.entity_id, self.writer_ready.clone());
 
     #[cfg(feature = "security")]
     if let Some(sec_handle) = self.security_plugins_handle.as_ref() {
@@ -694,8 +696,6 @@ impl InnerPublisher {
     let new_writer = WriterIngredients {
       guid,
       send_buffer,
-      doorbell_registration,
-      doorbell,
       topic_name: topic.name(),
       like_stateless: writer_like_stateless,
       qos_policies: writer_qos,
@@ -760,7 +760,9 @@ impl InnerPublisher {
   }
 
   pub(crate) fn remove_writer(&self, guid: GUID) {
-    try_send_timeout(&self.remove_writer_sender, guid, None)
+    self
+      .remove_writer_sender
+      .try_send_timeout(guid, std::time::Duration::from_millis(20))
       .unwrap_or_else(|e| error!("Cannot remove Writer {guid:?} : {e:?}"));
   }
 
@@ -817,14 +819,17 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
+  #[allow(clippy::too_many_arguments)]
   pub(super) fn new(
     domain_participant: DomainParticipantWeak,
     discovery_db: Arc<RwLock<DiscoveryDB>>,
     qos: QosPolicies,
-    sender_add_reader: mio_channel::SyncSender<ReaderIngredients>,
-    sender_remove_reader: mio_channel::SyncSender<GUID>,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    sender_add_reader: WakeSender<ReaderIngredients>,
+    sender_remove_reader: WakeSender<GUID>,
+    discovery_command: WakeSender<DiscoveryCommand>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    reader_ready: ReadySender<EntityId>,
+    discovery_samples: ReadySender<mio1::Token>,
   ) -> Self {
     Self {
       inner: Arc::new(InnerSubscriber::new(
@@ -835,6 +840,8 @@ impl Subscriber {
         sender_remove_reader,
         discovery_command,
         security_plugins_handle,
+        reader_ready,
+        discovery_samples,
       )),
     }
   }
@@ -1048,21 +1055,26 @@ pub struct InnerSubscriber {
   domain_participant: DomainParticipantWeak,
   discovery_db: Arc<RwLock<DiscoveryDB>>,
   qos: QosPolicies,
-  sender_add_reader: mio_channel::SyncSender<ReaderIngredients>,
-  sender_remove_reader: mio_channel::SyncSender<GUID>,
-  discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+  sender_add_reader: WakeSender<ReaderIngredients>,
+  sender_remove_reader: WakeSender<GUID>,
+  discovery_command: WakeSender<DiscoveryCommand>,
   security_plugins_handle: Option<SecurityPluginsHandle>,
+  reader_ready: ReadySender<EntityId>,
+  discovery_samples: ReadySender<mio1::Token>,
 }
 
 impl InnerSubscriber {
+  #[allow(clippy::too_many_arguments)]
   pub(super) fn new(
     domain_participant: DomainParticipantWeak,
     discovery_db: Arc<RwLock<DiscoveryDB>>,
     qos: QosPolicies,
-    sender_add_reader: mio_channel::SyncSender<ReaderIngredients>,
-    sender_remove_reader: mio_channel::SyncSender<GUID>,
-    discovery_command: mio_channel::SyncSender<DiscoveryCommand>,
+    sender_add_reader: WakeSender<ReaderIngredients>,
+    sender_remove_reader: WakeSender<GUID>,
+    discovery_command: WakeSender<DiscoveryCommand>,
     security_plugins_handle: Option<SecurityPluginsHandle>,
+    reader_ready: ReadySender<EntityId>,
+    discovery_samples: ReadySender<mio1::Token>,
   ) -> Self {
     Self {
       domain_participant,
@@ -1072,6 +1084,8 @@ impl InnerSubscriber {
       sender_remove_reader,
       discovery_command,
       security_plugins_handle,
+      reader_ready,
+      discovery_samples,
     }
   }
 
@@ -1112,13 +1126,17 @@ impl InnerSubscriber {
     SA: adapters::with_key::DeserializerAdapter<D>,
   {
     // incoming data notification channel from Reader to DataReader
-    let (send, rec) = mio_channel::sync_channel::<()>(4);
+    let (send, rec) = crate::mio_source::notification_channel(4);
     // status change channel from Reader to DataReader
     let (status_sender, status_receiver) = sync_status_channel::<DataReaderStatus>(4)?;
 
-    // reader command channel from Datareader to Reader
-    let (reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(0);
+    // reader command channel from Datareader to Reader.
+    // Capacity 0 is a rendezvous, matching the previous mio-extras channel: the
+    // sender and the event loop meet at send/receive so a waker handoff cannot
+    // race a missed notification. The ready queue records which reader to drain.
+    // The receiver is built here; the sender is bound to the entity id below.
+    let (reader_command_tx, reader_command_receiver) =
+      wake_channel::<ReaderCommand>(0, &self.reader_ready.waker());
     // The buffer length is zero, i.e. sender and receiver must rendezvous at
     // send/receive. This is needed to synchronize sending of wakers from
     // DataReader to Reader. If the capacity is increased, then some data
@@ -1133,6 +1151,10 @@ impl InnerSubscriber {
 
     let entity_id =
       self.unwrap_or_new_entity_id(entity_id_opt, EntityKind::READER_WITH_KEY_USER_DEFINED)?;
+    let reader_command_sender =
+      BoundSender::new(reader_command_tx, self.reader_ready.clone(), entity_id);
+    let discovery_notify = crate::rtps::constant::discovery_reader_data_token(entity_id)
+      .map(|token| (self.discovery_samples.clone(), token));
 
     let dp = match self.participant() {
       Some(dp) => dp,
@@ -1218,6 +1240,7 @@ impl InnerSubscriber {
       data_reader_waker: data_reader_waker.clone(),
       poll_event_sender,
       security_plugins: self.security_plugins_handle.clone(),
+      discovery_notify,
     };
 
     // Construct security info if needed
@@ -1387,7 +1410,9 @@ impl InnerSubscriber {
   }
 
   pub(crate) fn remove_reader(&self, guid: GUID) {
-    try_send_timeout(&self.sender_remove_reader, guid, None)
+    self
+      .sender_remove_reader
+      .try_send_timeout(guid, std::time::Duration::from_millis(20))
       .unwrap_or_else(|e| error!("Cannot remove Reader {guid:?} : {e:?}"));
   }
 

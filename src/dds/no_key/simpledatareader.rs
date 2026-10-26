@@ -133,6 +133,7 @@ where
 
 // This is  not part of DDS spec. We implement mio Eventd so that the
 // application can asynchronously poll DataReader(s).
+#[cfg(feature = "mio_06")]
 impl<D, DA> mio_06::Evented for SimpleDataReader<D, DA>
 where
   DA: DeserializerAdapter<D>,
@@ -199,6 +200,33 @@ where
   }
 }
 
+impl<D, DA> mio1::event::Source for SimpleDataReader<D, DA>
+where
+  DA: DeserializerAdapter<D>,
+{
+  fn register(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    mio1::event::Source::register(&mut self.keyed_simpledatareader, registry, token, interests)
+  }
+
+  fn reregister(
+    &mut self,
+    registry: &mio1::Registry,
+    token: mio1::Token,
+    interests: mio1::Interest,
+  ) -> io::Result<()> {
+    mio1::event::Source::reregister(&mut self.keyed_simpledatareader, registry, token, interests)
+  }
+
+  fn deregister(&mut self, registry: &mio1::Registry) -> io::Result<()> {
+    mio1::event::Source::deregister(&mut self.keyed_simpledatareader, registry)
+  }
+}
+
 //use crate::with_key::SimpleDataReaderEventStream;
 
 impl<'a, D, DA> StatusEvented<'a, DataReaderStatus, SimpleDataReaderEventStream<'a, D, DA>>
@@ -207,6 +235,7 @@ where
   D: 'static,
   DA: DeserializerAdapter<D>,
 {
+  #[cfg(feature = "mio_06")]
   fn as_status_evented(&mut self) -> &dyn mio_06::Evented {
     self.keyed_simpledatareader.as_status_evented()
   }
@@ -214,6 +243,10 @@ where
   #[cfg(feature = "mio_08")]
   fn as_status_source(&mut self) -> &mut dyn mio_08::event::Source {
     self.keyed_simpledatareader.as_status_source()
+  }
+
+  fn as_status_source_mio1(&mut self) -> &mut dyn mio1::event::Source {
+    self.keyed_simpledatareader.as_status_source_mio1()
   }
 
   fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {

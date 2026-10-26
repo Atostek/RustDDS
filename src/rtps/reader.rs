@@ -7,8 +7,7 @@ use std::{
   time::Duration as StdDuration,
 };
 
-use mio_06::Token;
-use mio_extras::channel as mio_channel;
+use mio1::Token;
 use log::{debug, error, info, trace, warn};
 use enumflags2::BitFlags;
 use speedy::Endianness;
@@ -41,7 +40,7 @@ use crate::{
   },
   mio_source,
   network::udp_sender::UDPSender,
-  polling::SharedTimer,
+  polling::{ReadySender, SharedTimer, WakeReceiver},
   rtps::{
     fragment_assembler::FragmentAssembler, message_receiver::MessageReceiverState,
     rtps_writer_proxy::RtpsWriterProxy, timed_event::DpTimerEvent, Message,
@@ -73,16 +72,19 @@ pub(crate) enum TimedEvent {
 // These can be sent between threads, whereas a Reader cannot.
 pub(crate) struct ReaderIngredients {
   pub guid: GUID,
-  pub notification_sender: mio_channel::SyncSender<()>,
+  pub notification_sender: crate::mio_source::NotificationSender,
   pub status_sender: StatusChannelSender<DataReaderStatus>,
   pub topic_name: String,
   pub(crate) topic_cache_handle: Arc<Mutex<TopicCache>>, /* A handle to the topic cache in DDS
                                                           * cache */
   pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Reader)
   pub qos_policy: QosPolicies,
-  pub data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
+  pub data_reader_command_receiver: WakeReceiver<ReaderCommand>,
   pub(crate) data_reader_waker: Arc<Mutex<Option<Waker>>>,
   pub(crate) poll_event_sender: mio_source::PollEventSender,
+  /// When this reader is a built-in discovery reader, cache changes also wake
+  /// Discovery's mio 1.2 poll with the reader's discovery token.
+  pub(crate) discovery_notify: Option<(ReadySender<mio1::Token>, mio1::Token)>,
 
   pub(crate) security_plugins: Option<SecurityPluginsHandle>,
 }
@@ -100,7 +102,7 @@ impl fmt::Debug for ReaderIngredients {
 
 pub(crate) struct Reader {
   // Should the instant be sent?
-  notification_sender: mio_channel::SyncSender<()>,
+  notification_sender: crate::mio_source::NotificationSender,
   status_sender: StatusChannelSender<DataReaderStatus>,
   udp_sender: Rc<UDPSender>,
 
@@ -140,9 +142,10 @@ pub(crate) struct Reader {
   offered_incompatible_qos_count: i32,
 
   pub(crate) timed_event_timer: SharedTimer<DpTimerEvent>,
-  pub(crate) data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
+  pub(crate) data_reader_command_receiver: WakeReceiver<ReaderCommand>,
   data_reader_waker: Arc<Mutex<Option<Waker>>>,
   poll_event_sender: mio_source::PollEventSender,
+  discovery_notify: Option<(ReadySender<mio1::Token>, mio1::Token)>,
 
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
@@ -207,6 +210,7 @@ impl Reader {
       data_reader_command_receiver: i.data_reader_command_receiver,
       data_reader_waker: i.data_reader_waker,
       poll_event_sender: i.poll_event_sender,
+      discovery_notify: i.discovery_notify,
       participant_status_sender,
 
       security_plugins: i.security_plugins,
@@ -215,8 +219,9 @@ impl Reader {
   // TODO: check if it's necessary to implement different handlers for discovery
   // and user messages
 
-  /// To know when token represents a reader we should look entity attribute
-  /// kind
+  /// Entity id encoded as a mio token. The internal poll no longer registers
+  /// per-reader tokens; the ready queue carries the id instead.
+  #[allow(dead_code)]
   pub fn entity_token(&self) -> Token {
     self.guid().entity_id.as_token()
   }
@@ -244,9 +249,9 @@ impl Reader {
   }
 
   pub fn send_status_change(&self, change: DataReaderStatus) {
-    match self.status_sender.try_send(change) {
+    match self.status_sender.try_send_impl(change) {
       Ok(()) => (), // expected result
-      Err(mio_channel::TrySendError::Full(_)) => {
+      Err(std::sync::mpsc::TrySendError::Full(_)) => {
         // TODO: dead code. `StatusChannelSender::try_send` currently converts a
         // full channel into `Ok(())` (dropping the event), so this arm is never
         // reached. Kept because the handling is correct if `try_send` is ever
@@ -255,15 +260,12 @@ impl Reader {
         // It is perfectly normal to fail due to full channel, because
         // no-one is required to be listening to these.
       }
-      Err(mio_channel::TrySendError::Disconnected(_)) => {
+      Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
         // If we get here, our DataReader has died. The Reader should now dispose
         // itself. Or possibly it has lost the receiver object, which is sort of
         // sloppy, but does not necessarily mean the end of the world.
         // TODO: Implement Reader disposal.
         info!("send_status_change - cannot send status, DataReader Disconnected.");
-      }
-      Err(mio_channel::TrySendError::Io(e)) => {
-        error!("send_status_change - cannot send status: {e:?}");
       }
     }
   }
@@ -1219,20 +1221,22 @@ impl Reader {
       .take() // Take to nullify the reference
       .map(|w| w.wake_by_ref()); // If Some, call wake_by_ref
 
-    // mio-0.8 notify
+    // mio-0.8 / mio-1.2 notify for a caller-owned poll.
     self.poll_event_sender.send();
+
+    // Discovery's poll cannot register the mio-0.6 notification channel.
+    if let Some((sender, token)) = &self.discovery_notify {
+      sender.notify(*token);
+    }
 
     // mio-0.6 notify
     match self.notification_sender.try_send(()) {
       Ok(()) => (),
-      Err(mio_channel::TrySendError::Full(_)) => (),
+      Err(std::sync::mpsc::TrySendError::Full(_)) => (),
       // This is harmless. There is a notification in already.
-      Err(mio_channel::TrySendError::Disconnected(_)) => {
+      Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
         // If we get here, our DataReader has died. The Reader should now
         // dispose itself. TODO: Implement Reader disposal.
-      }
-      Err(mio_channel::TrySendError::Io(_)) => {
-        // TODO: What does this mean? Can we ever get here?
       }
     }
   }
@@ -1465,6 +1469,7 @@ mod tests {
 
   use crate::{
     dds::{qos::policy::Reliability, statusevents::sync_status_channel, typedesc::TypeDesc},
+    polling::{new_shared_timer, wake_channel, LoopWaker},
     structure::{dds_cache::DDSCache, guid::EntityKind},
     QosPolicyBuilder,
   };
@@ -1486,7 +1491,7 @@ mod tests {
 
     // Create notification mechanisms
     // mio-0.6 channel:
-    let (notification_sender, notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, notification_receiver) = crate::mio_source::notification_channel(100);
     // mio-0.8 event source and sender:
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
@@ -1500,7 +1505,7 @@ mod tests {
 
     // Create reader command channel
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then finally create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1516,11 +1521,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1575,7 +1581,8 @@ mod tests {
     );
 
     // Create mechanisms for notifications, statuses & commands
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1585,7 +1592,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1601,11 +1608,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1681,7 +1689,8 @@ mod tests {
     );
 
     // Create mechanisms for notifications, statuses & commands
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1691,7 +1700,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1707,11 +1716,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1790,7 +1800,8 @@ mod tests {
     );
 
     // Create mechanisms for notifications, statuses & commands
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1800,7 +1811,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1816,11 +1827,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 
@@ -1928,7 +1940,8 @@ mod tests {
     );
 
     // Create mechanisms for notifications, statuses & commands
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
     let (_notification_event_source, notification_event_sender) =
       mio_source::make_poll_channel().unwrap();
     let data_reader_waker = Arc::new(Mutex::new(None));
@@ -1938,7 +1951,7 @@ mod tests {
       sync_status_channel(16).unwrap();
 
     let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
 
     let like_stateless = true;
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
@@ -1954,11 +1967,12 @@ mod tests {
       data_reader_waker,
       poll_event_sender: notification_event_sender,
       security_plugins: None,
+      discovery_notify: None,
     };
     let mut reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new(0).unwrap()),
-      crate::polling::new_shared_timer(),
+      new_shared_timer(),
       participant_status_sender,
     );
 

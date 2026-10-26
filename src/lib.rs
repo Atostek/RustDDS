@@ -63,21 +63,27 @@
 //!
 //! # Polling multiple DataReaders
 //!
-//! There are three alternative methods to poll DataReaders (and DataWriters):
-//! mio-0.6, mio-0.8, and async. Use only one of these!
+//! There are four alternative methods to poll DataReaders (and DataWriters):
+//! mio-1.2, legacy mio-0.6, optional mio-0.8, and async. Use only one of these!
+//!
+//! ## `mio-1.2`
+//!
+//! RustDDS DataReaders implement mio 1.2's `event::Source` trait by default.
+//! Import the matching version as [`mio1`] and register readers directly with
+//! its `Poll`; see example `shapes_demo_mio_1`.
 //!
 //! ## `mio-0.6`
 //!
-//! RustDDS is designed to used with [mio](mio_06) version 0.6.x. DataReaders
-//! implement [`Evented`](mio_06::event::Evented) so that they can be directly
-//! registered to a [`poll`](mio_06::Poll). See example `shapes_demo`.
+//! The default `mio_06` compatibility feature retains the mio 0.6
+//! [`Evented`](mio::Evented) integration and the `mio` re-export. Disable
+//! default features to remove mio 0.6 entirely. See example `shapes_demo`.
 //!
 //! ## `mio-0.8`
 //!
 //! When the optional `mio_08` feature is enabled, RustDDS DataReaders implement
 //! `mio_08::event::Source` for registering with mio-0.8. See example
 //! `shapes_demo_mio_08`. This feature is not enabled by default; without it,
-//! use the mio-0.6 (`Evented`) or `async` polling mechanisms below.
+//! use mio 1.2, legacy mio 0.6, or async polling.
 //!
 //!
 //! ## `async`
@@ -241,7 +247,12 @@ pub use cdr_encoding;
 /// Downstream crates (e.g. `ros2-client`) that register RustDDS entities with a
 /// `mio` `Poll` should import `mio` through this re-export, guaranteeing they
 /// build against the exact same `mio` version as RustDDS.
+#[cfg(feature = "mio_06")]
 pub use mio_06 as mio;
+/// Re-export of the `mio` (v1.2) crate. RustDDS
+/// DataReaders implement its `event::Source` trait. Downstream crates should
+/// import mio 1.2 through this re-export to match the RustDDS version.
+pub use mio1;
 /// Re-export of the `bytes` crate, used in RustDDS's (de)serialization API.
 pub use bytes;
 

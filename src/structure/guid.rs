@@ -3,7 +3,7 @@ use std::{fmt, hash::Hash, ops::RangeBounds};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use serde::{Deserialize, Serialize};
 use cdr_encoding_size::*;
-use mio_06::Token;
+use mio1::Token;
 use log::warn;
 use static_assertions as sa;
 

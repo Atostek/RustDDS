@@ -1,59 +1,336 @@
-// Currently, just helpers for mio library
-
-// TODO: Expand this to become an iternal API for polling operations:
-// * sockets (send/recv)
-// * timers
-// * inter-thread channels
+// Internal polling primitives for the two reactors (dp_event_loop and Discovery).
 //
-// Then we cold implement them either on top of mio-0.6, mio-0.8 or something
-// else
+// Sockets are registered with mio 1.2. Everything that is not a socket — command
+// queues, writer doorbells, reader commands, discovery sample readiness — shares
+// one `Waker` per poll. `wake()` is coalesced, so the token only means "drain
+// the queues": the sender enqueues the payload (or entity id) and then wakes.
+// Timers are an in-loop deadline map. The poll timeout is the sooner of the next
+// deadline and the loop's idle cap. Nothing here is registered as a mio 0.6
+// `Evented` source; user-visible sample and status channels stay mio-extras.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+  collections::BTreeMap,
+  sync::{mpsc, Arc, OnceLock},
+  time::{Duration, Instant},
+};
 
-use mio_extras::{timer, timer::Timer};
+use mio1::{Poll, Token, Waker};
 
-// A timer handle that can be shared (cloned) among the endpoints/tasks that run
-// on a single event-loop thread. The event loop owns the underlying `Timer`
-// and registers it with the `Poll` exactly once, while endpoints schedule
-// timeouts on the same timer through their cloned handle. This is sound because
-// an event loop and all the endpoints it drives run on the same thread (the
-// loop is `!Send`), so no synchronization is required.
-//
-// Sharing a single timer this way avoids the previous design where every
-// endpoint (and periodic task) owned a separate `mio_extras` `Timer`, each of
-// which spawns its own background OS thread.
-pub(crate) type SharedTimer<E> = Rc<RefCell<Timer<E>>>;
+use crate::structure::guid::EntityId;
 
-// Constructor for a shared timer. Because a single shared timer now holds all
-// the in-flight timeouts for an entire event loop (every Reader, Writer and
-// periodic task), its `capacity` (the hard cap on simultaneously scheduled
-// timeouts) must be sized generously.
-//
-// (The default `mio_extras` timer has 256 wheel slots and capacity 65536, which
-// uses a lot of memory; we pick smaller but still generous values. Each timer
-// also spawns its own background OS thread, which is exactly why we now share
-// one timer per event loop instead of one per endpoint.)
+/// One waker for one `Poll`. Share clones freely. `wake` before [`install`](Self::install)
+/// is a no-op; the event loop drains its queues once after installing so anything
+/// enqueued earlier is still observed.
+#[derive(Clone)]
+pub(crate) struct LoopWaker {
+  slot: Arc<OnceLock<Waker>>,
+}
+
+impl LoopWaker {
+  pub(crate) fn new() -> Self {
+    Self {
+      slot: Arc::new(OnceLock::new()),
+    }
+  }
+
+  /// Register the single waker of `poll` under `token`. Debug builds assert this
+  /// happens once: mio 1.2 allows only one `Waker` per `Poll`.
+  pub(crate) fn install(&self, poll: &Poll, token: Token) -> std::io::Result<()> {
+    let waker = Waker::new(poll.registry(), token)?;
+    if self.slot.set(waker).is_err() {
+      debug_assert!(false, "LoopWaker::install called twice for one poll");
+    }
+    Ok(())
+  }
+
+  pub(crate) fn wake(&self) {
+    if let Some(waker) = self.slot.get() {
+      if let Err(e) = waker.wake() {
+        log::debug!("LoopWaker::wake: {e}");
+      }
+    }
+  }
+}
+
+/// Bounded queue whose send wakes `waker`'s poll.
+pub(crate) struct WakeSender<T> {
+  tx: mpsc::SyncSender<T>,
+  waker: LoopWaker,
+}
+
+impl<T> Clone for WakeSender<T> {
+  fn clone(&self) -> Self {
+    Self {
+      tx: self.tx.clone(),
+      waker: self.waker.clone(),
+    }
+  }
+}
+
+impl<T> WakeSender<T> {
+  pub(crate) fn try_send(&self, value: T) -> Result<(), mpsc::TrySendError<T>> {
+    match self.tx.try_send(value) {
+      Ok(()) => {
+        self.waker.wake();
+        Ok(())
+      }
+      Err(e) => Err(e),
+    }
+  }
+
+  pub(crate) fn send(&self, value: T) -> Result<(), mpsc::SendError<T>> {
+    match self.tx.send(value) {
+      Ok(()) => {
+        self.waker.wake();
+        Ok(())
+      }
+      Err(e) => Err(e),
+    }
+  }
+
+  /// Retry a full bounded send for a short time. Wakes the poll on success.
+  pub(crate) fn try_send_timeout(
+    &self,
+    value: T,
+    timeout: Duration,
+  ) -> Result<(), mpsc::TrySendError<T>> {
+    let mut value = value;
+    match self.try_send(value) {
+      Ok(()) => Ok(()),
+      Err(mpsc::TrySendError::Disconnected(v)) => Err(mpsc::TrySendError::Disconnected(v)),
+      Err(mpsc::TrySendError::Full(v)) => {
+        value = v;
+        let start = Instant::now();
+        let mut delay = Duration::from_micros(1);
+        while start.elapsed() < timeout {
+          std::thread::sleep(delay);
+          match self.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(v)) => {
+              value = v;
+              delay = (delay * 2).min(Duration::from_millis(2));
+            }
+            Err(other) => return Err(other),
+          }
+        }
+        Err(mpsc::TrySendError::Full(value))
+      }
+    }
+  }
+}
+
+pub(crate) struct WakeReceiver<T> {
+  rx: mpsc::Receiver<T>,
+}
+
+impl<T> WakeReceiver<T> {
+  pub(crate) fn try_recv(&self) -> Result<T, mpsc::TryRecvError> {
+    self.rx.try_recv()
+  }
+}
+
+pub(crate) fn wake_channel<T>(
+  capacity: usize,
+  waker: &LoopWaker,
+) -> (WakeSender<T>, WakeReceiver<T>) {
+  let (tx, rx) = mpsc::sync_channel(capacity);
+  (
+    WakeSender {
+      tx,
+      waker: waker.clone(),
+    },
+    WakeReceiver { rx },
+  )
+}
+
+/// Unbounded queue whose send wakes `waker`'s poll. Used for stop commands.
+#[derive(Clone)]
+pub(crate) struct WakeUnboundedSender<T> {
+  tx: mpsc::Sender<T>,
+  waker: LoopWaker,
+}
+
+impl<T> WakeUnboundedSender<T> {
+  pub(crate) fn send(&self, value: T) -> Result<(), mpsc::SendError<T>> {
+    match self.tx.send(value) {
+      Ok(()) => {
+        self.waker.wake();
+        Ok(())
+      }
+      Err(e) => Err(e),
+    }
+  }
+}
+
+pub(crate) fn wake_channel_unbounded<T>(
+  waker: &LoopWaker,
+) -> (WakeUnboundedSender<T>, WakeReceiver<T>) {
+  let (tx, rx) = mpsc::channel();
+  (
+    WakeUnboundedSender {
+      tx,
+      waker: waker.clone(),
+    },
+    WakeReceiver { rx },
+  )
+}
+
+/// Unbounded "something became ready" queue. The payload is the reason (an
+/// entity id or a discovery token). Duplicate reasons in one drain are collapsed.
+#[derive(Clone)]
+pub(crate) struct ReadySender<T> {
+  tx: mpsc::Sender<T>,
+  waker: LoopWaker,
+}
+
+impl<T> ReadySender<T> {
+  pub(crate) fn waker(&self) -> LoopWaker {
+    self.waker.clone()
+  }
+
+  pub(crate) fn notify(&self, value: T) {
+    if self.tx.send(value).is_ok() {
+      self.waker.wake();
+    }
+  }
+}
+
+pub(crate) struct ReadyReceiver<T> {
+  rx: mpsc::Receiver<T>,
+}
+
+impl<T: Eq> ReadyReceiver<T> {
+  /// Drain every queued reason, keeping the first occurrence of each.
+  pub(crate) fn drain_unique(&self) -> Vec<T> {
+    let mut out = Vec::new();
+    while let Ok(value) = self.rx.try_recv() {
+      if !out.contains(&value) {
+        out.push(value);
+      }
+    }
+    out
+  }
+}
+
+pub(crate) fn ready_channel<T>(waker: &LoopWaker) -> (ReadySender<T>, ReadyReceiver<T>) {
+  let (tx, rx) = mpsc::channel();
+  (
+    ReadySender {
+      tx,
+      waker: waker.clone(),
+    },
+    ReadyReceiver { rx },
+  )
+}
+
+/// Bounded command queue plus a shared ready-queue of entity ids. A successful
+/// send records `entity_id` so the event loop, which has only one waker, knows
+/// which endpoint to drain.
+/// Reader commands are not sent today (`ResetRequestedDeadlineStatus` is
+/// unimplemented). The sender stays so a future send still wakes the right
+/// reader.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct BoundSender<T> {
+  tx: WakeSender<T>,
+  ready: ReadySender<EntityId>,
+  entity_id: EntityId,
+}
+
+#[allow(dead_code)]
+impl<T> BoundSender<T> {
+  pub(crate) fn new(tx: WakeSender<T>, ready: ReadySender<EntityId>, entity_id: EntityId) -> Self {
+    Self {
+      tx,
+      ready,
+      entity_id,
+    }
+  }
+
+  pub(crate) fn try_send(&self, value: T) -> Result<(), mpsc::TrySendError<T>> {
+    self.tx.try_send(value)?;
+    self.ready.notify(self.entity_id);
+    Ok(())
+  }
+}
+
+/// Writer doorbell. Ringing enqueues the writer's entity id and wakes the
+/// participant poll. Replaces the mio 0.6 `Registration` previously registered
+/// under the writer token.
+#[derive(Clone)]
+pub(crate) struct Doorbell {
+  entity_id: EntityId,
+  ready: ReadySender<EntityId>,
+}
+
+impl Doorbell {
+  pub(crate) fn new(entity_id: EntityId, ready: ReadySender<EntityId>) -> Self {
+    Self { entity_id, ready }
+  }
+
+  pub(crate) fn ring(&self) {
+    self.ready.notify(self.entity_id);
+  }
+}
+
+/// In-loop deadlines. Not registered with `Poll`. `set_timeout` / `poll` keep
+/// the call pattern readers, writers, and tests already use. Deadlines are
+/// absolute `Instant`s, so there is no timer-wheel tick to round them up.
+pub(crate) struct Timer<E> {
+  next_id: u64,
+  deadlines: BTreeMap<(Instant, u64), E>,
+}
+
+impl<E> Timer<E> {
+  pub(crate) fn new() -> Self {
+    Self {
+      next_id: 0,
+      deadlines: BTreeMap::new(),
+    }
+  }
+
+  pub(crate) fn set_timeout(&mut self, delay: Duration, event: E) {
+    let when = Instant::now()
+      .checked_add(delay)
+      .unwrap_or_else(Instant::now);
+    let id = self.next_id;
+    self.next_id = self.next_id.wrapping_add(1);
+    self.deadlines.insert((when, id), event);
+  }
+
+  /// The earliest event whose deadline has passed, if any.
+  pub(crate) fn poll(&mut self) -> Option<E> {
+    let key = *self.deadlines.keys().next()?;
+    if key.0 <= Instant::now() {
+      self.deadlines.remove(&key)
+    } else {
+      None
+    }
+  }
+
+  pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    self.deadlines.keys().next().map(|(when, _)| *when)
+  }
+}
+
+pub(crate) type SharedTimer<E> = std::rc::Rc<std::cell::RefCell<Timer<E>>>;
+
 pub(crate) fn new_shared_timer<E>() -> SharedTimer<E> {
-  // tick_duration: the timer-wheel resolution. `mio_extras` rounds every
-  // scheduled timeout UP to at least one tick, so its 100 ms default silently
-  // inflates all sub-100 ms timeouts. Several reliability timeouts are meant to
-  // be much shorter than that (reliable repair reschedules itself at
-  // `deadline/5`, ~200 µs by default, and DATAFRAG repair continues at 1 ms).
-  // With a 100 ms tick those fire ~100 ms late, so recovering the reliable
-  // startup backlog (samples written during the ~0.5 s discovery window, before
-  // the reader matched) crawls at ~1 batch per tick and takes seconds. A 1 ms
-  // tick keeps those timeouts prompt while still being coarse enough to be
-  // cheap. The timer thread parks until the next real deadline, so a finer tick
-  // does not increase idle wakeups.
-  //
-  // num_slots: number of timer wheel slots. capacity: maximum number of
-  // timeouts that may be in flight at once. Longer timeouts (periodic
-  // heartbeat, cache cleaning, discovery) simply wrap the wheel and remain
-  // correct via absolute-tick comparison.
-  let inner = timer::Builder::default()
-    .tick_duration(std::time::Duration::from_millis(1))
-    .num_slots(1024)
-    .capacity(8192)
-    .build();
-  Rc::new(RefCell::new(inner))
+  std::rc::Rc::new(std::cell::RefCell::new(Timer::new()))
+}
+
+/// Poll timeout: the sooner of `deadline` and `cap`. A deadline already due
+/// yields a zero timeout so the loop drains it immediately.
+pub(crate) fn timeout_until(deadline: Option<Instant>, cap: Duration) -> Duration {
+  match deadline {
+    Some(when) => {
+      let now = Instant::now();
+      if when <= now {
+        Duration::ZERO
+      } else {
+        (when - now).min(cap)
+      }
+    }
+    None => cap,
+  }
 }
