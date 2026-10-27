@@ -18,8 +18,11 @@ pub const PREEMPTIVE_ACKNACK_PERIOD: Duration = Duration::from_secs(5);
 
 pub const CACHE_CLEAN_PERIOD: Duration = Duration::from_secs(4);
 
-// RTPS spec Section 8.4.7.1.1  "Default Timing-Related Values"
-pub const NACK_RESPONSE_DELAY: Duration = Duration::from_millis(200);
+// RTPS spec Section 8.4.7.1.1 "Default Timing-Related Values" suggests 200 ms,
+// but a Reliable reader withholds every newer sample until the missing one is
+// repaired, and a KEEP_LAST reader may then drop the oldest of them before the
+// application reads them. Fast DDS uses 5 ms, Connext 0.
+pub const NACK_RESPONSE_DELAY: Duration = Duration::from_millis(5);
 pub const NACK_SUPPRESSION_DURATION: Duration = Duration::from_millis(0);
 
 // Time between two repair rounds (SendRepairData, SendRepairFrags) for one

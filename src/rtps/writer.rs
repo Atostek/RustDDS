@@ -1268,6 +1268,32 @@ impl Writer {
               &mut std::iter::once(reader_proxy),
             );
           }
+
+          // An ACKNACK that requests nothing although the reader has not acknowledged
+          // everything means the reader does not know what we have, typically a
+          // preemptive ACKNACK from a reader that matched us after our HEARTBEAT.
+          // Answer now instead of at the next heartbeat period.
+          if an.reader_sn_state.iter().next().is_none() && reader_proxy.all_acked_before <= last_seq
+          {
+            let hb_message = MessageBuilder::new()
+              .ts_msg(self.endianness, Some(Timestamp::now()))
+              .heartbeat_msg(
+                self.entity_id(),
+                self.send_buffer.first_change_sequence_number(),
+                last_seq,
+                self.next_heartbeat_count(),
+                self.endianness,
+                reader_guid.entity_id,
+                false, // final_flag: request ACKNACK
+                false, // liveliness_flag
+              )
+              .add_header_and_build(self.my_guid.prefix);
+            self.send_control_to_readers(
+              DeliveryMode::Unicast,
+              hb_message,
+              &mut std::iter::once(reader_proxy),
+            );
+          }
         }
       } // AckNack
       AckSubmessage::NackFrag(ref nackfrag) => {
@@ -2927,6 +2953,7 @@ mod tests {
     #[test]
     fn acknack_schedules_repair_after_nack_response_delay() {
       for mut f in [Fixture::sedp(5, 8), Fixture::user(5, 8, None)] {
+        f.writer.nack_response_delay = StdDuration::from_millis(200);
         f.ack_nack(1..=5, 1);
         assert_eq!(f.unsent(), 5, "repaired on the ACKNACK");
         assert!(f.reader_proxy().repair_mode);

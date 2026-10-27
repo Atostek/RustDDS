@@ -415,6 +415,17 @@ impl Reader {
             "Matched new remote writer on topic={:?} writer={:?}",
             self.topic_name, writer
           );
+
+          // The writer may have matched us earlier and sent its HEARTBEAT before we
+          // knew it, so that HEARTBEAT was discarded. Without a request the next
+          // one comes only after the writer's heartbeat period, and a Reliable
+          // reader withholds all samples received in the meantime.
+          if self.reliability != policy::Reliability::BestEffort {
+            if let Some(mut writer_proxy) = self.matched_writers.remove(&writer) {
+              self.send_preemptive_acknack_to(&mut writer_proxy);
+              self.matched_writers.insert(writer, writer_proxy);
+            }
+          }
         }
       }
       Some(bad_policy_id) => {
@@ -1389,40 +1400,43 @@ impl Reader {
       return;
     }
 
-    let flags = BitFlags::<ACKNACK_Flags>::from_flag(ACKNACK_Flags::Endianness);
-    // Do not set final flag --> we are requesting immediate heartbeat from writers.
-
     // Detach the writer proxy set. This is a way to avoid multiple &mut self
     let mut writer_proxies = std::mem::take(&mut self.matched_writers);
 
-    let reader_id = self.entity_id();
     for (_, writer_proxy) in writer_proxies
       .iter_mut()
       .filter(|(_, p)| p.no_changes_received())
     {
-      let acknack_count = writer_proxy.next_ack_nack_sequence_number();
-      let RtpsWriterProxy {
-        remote_writer_guid,
-        unicast_locator_list,
-        ..
-      } = writer_proxy;
-      self.send_acknack_to(
-        flags,
-        AckNack {
-          reader_id,
-          writer_id: remote_writer_guid.entity_id,
-          reader_sn_state: SequenceNumberSet::new_empty(SequenceNumber::new(1)),
-          count: acknack_count,
-        },
-        InfoDestination {
-          guid_prefix: remote_writer_guid.prefix,
-        },
-        unicast_locator_list,
-        *remote_writer_guid,
-      );
+      self.send_preemptive_acknack_to(writer_proxy);
     }
     // put writer proxies back
     self.matched_writers = writer_proxies;
+  }
+
+  // An ACKNACK without the final flag requests an immediate HEARTBEAT from the
+  // writer.
+  fn send_preemptive_acknack_to(&self, writer_proxy: &mut RtpsWriterProxy) {
+    let flags = BitFlags::<ACKNACK_Flags>::from_flag(ACKNACK_Flags::Endianness);
+    let acknack_count = writer_proxy.next_ack_nack_sequence_number();
+    let RtpsWriterProxy {
+      remote_writer_guid,
+      unicast_locator_list,
+      ..
+    } = writer_proxy;
+    self.send_acknack_to(
+      flags,
+      AckNack {
+        reader_id: self.entity_id(),
+        writer_id: remote_writer_guid.entity_id,
+        reader_sn_state: SequenceNumberSet::new_empty(SequenceNumber::new(1)),
+        count: acknack_count,
+      },
+      InfoDestination {
+        guid_prefix: remote_writer_guid.prefix,
+      },
+      unicast_locator_list,
+      *remote_writer_guid,
+    );
   }
 
   pub fn topic_name(&self) -> &String {
@@ -1777,12 +1791,12 @@ mod tests {
     };
     assert!(reader.handle_heartbeat_msg(&hb_2, false, &mr_state)); // Should send an ack_nack
 
-    // 7. Count of acknack sent should be 2
-    // The count is verified from the writer proxy
+    // 7. Count of acknack sent should be 3: the preemptive one on match and the
+    // two above. The count is verified from the writer proxy
     let writer_proxy = reader
       .matched_writer(writer_guid)
       .expect("Did not find a matched writer");
-    assert_eq!(writer_proxy.sent_ack_nack_count, 2);
+    assert_eq!(writer_proxy.sent_ack_nack_count, 3);
   }
 
   #[test]

@@ -101,12 +101,16 @@ where
     receive_timestamp: Timestamp,
     write_options: WriteOptions,
   ) {
-    // Defense in depth: the topic cache already hands us strictly monotonic (hence
-    // unique) receive timestamps, but if two ever collide here, probe forward by
-    // one tick to a free key instead of panicking or dropping the sample.
+    // Samples are keyed, and KEEP_LAST evicts, in the order they are added here,
+    // not by raw receive time. A Reliable reader hands over samples in
+    // sequence-number order, but a repaired sample is received after newer ones
+    // that waited for it; keyed by receive time, the newest sample would look
+    // oldest and be evicted first. Keys must also be unique.
     let mut receive_timestamp = receive_timestamp;
-    while self.datasamples.contains_key(&receive_timestamp) {
-      receive_timestamp = Timestamp::from_ticks(receive_timestamp.to_ticks().wrapping_add(1));
+    if let Some((&latest, _)) = self.datasamples.last_key_value() {
+      if receive_timestamp <= latest {
+        receive_timestamp = Timestamp::from_ticks(latest.to_ticks().wrapping_add(1));
+      }
     }
 
     let instance_key = match &new_sample {
