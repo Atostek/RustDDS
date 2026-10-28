@@ -468,6 +468,9 @@ impl Reader {
   pub fn remove_writer_proxy(&mut self, writer_guid: GUID) {
     if self.matched_writers.contains_key(&writer_guid) {
       self.matched_writers.remove(&writer_guid);
+      self
+        .acquire_the_topic_cache_guard()
+        .forget_reliable_writer(writer_guid);
       #[cfg(feature = "security")]
       if let Some(security_plugins_handle) = &self.security_plugins {
         security_plugins_handle
@@ -1135,9 +1138,10 @@ impl Reader {
     }
 
     // Get the topic cache and mark progress
-    let marker_moved = self
-      .acquire_the_topic_cache_guard()
-      .mark_reliably_received_before(writer_guid, all_ackable_before);
+    let marker_moved = self.reliability != policy::Reliability::BestEffort
+      && self
+        .acquire_the_topic_cache_guard()
+        .mark_reliably_received_before(writer_guid, all_ackable_before);
 
     // Receiving a GAP could make a Reliable stream.
     // E.g. we had #2, but were missing #1. Now GAP says that #1 does not exist.
@@ -1211,8 +1215,10 @@ impl Reader {
     let mut tc = self.acquire_the_topic_cache_guard();
 
     tc.add_change(&receive_timestamp, cache_change);
-    // Mark seqnums as received if not behaving statelessly
-    if !self.like_stateless {
+    // Mark seqnums as received if not behaving statelessly. Only a Reliable
+    // reader waits for missing samples; a BestEffort marker would stay behind a
+    // lost sample for good, and the topic cache would retain everything after it.
+    if !self.like_stateless && self.reliability != policy::Reliability::BestEffort {
       self.matched_writer(writer_guid).map(|wp| {
         tc.mark_reliably_received_before(writer_guid, wp.all_ackable_before());
         // Here we do not need to notify waiting DataReader, because

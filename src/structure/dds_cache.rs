@@ -217,6 +217,28 @@ impl TopicCache {
     prev_sn.unwrap_or(SequenceNumber::new(1)) < sn
   }
 
+  // The Writer is gone, so samples it never completed are no longer awaited.
+  pub fn forget_reliable_writer(&mut self, writer: GUID) {
+    self.received_reliably_before.remove(&writer);
+  }
+
+  // Receive timestamp of the oldest change that a Reliable DataReader cannot yet
+  // take, because an earlier sample from the same Writer is still missing.
+  fn oldest_withheld_change(&self) -> Option<Timestamp> {
+    self
+      .received_reliably_before
+      .iter()
+      .filter_map(|(writer, marker)| {
+        self
+          .sequence_numbers
+          .get(writer)?
+          .range(marker..)
+          .next()
+          .map(|(_, ts)| *ts)
+      })
+      .min()
+  }
+
   pub fn get_change(&self, instant: &Timestamp) -> Option<&CacheChange> {
     self.changes.get(instant)
   }
@@ -431,6 +453,11 @@ impl TopicCache {
       ),
     };
 
+    // Samples withheld from a Reliable DataReader have not been delivered yet, so
+    // they are kept even beyond `max_keep_samples`. They are released once the
+    // missing sample is repaired, or declared irrelevant by GAP or HEARTBEAT.
+    let oldest_withheld = self.oldest_withheld_change();
+
     let oldest_timestamp_to_retain_opt: Option<Timestamp> = self
       .changes
       .keys()
@@ -438,8 +465,9 @@ impl TopicCache {
       .skip_while(|(i, ts)|
         // Skip samples to be removed. Force "must" count, and then remove until
         // either limit timestamp or "may" count stops us
-        *i < must_remove_count
-        || (**ts < remove_before && *i < may_remove_count))
+        oldest_withheld.is_none_or(|w| **ts < w)
+        && (*i < must_remove_count
+        || (**ts < remove_before && *i < may_remove_count)))
       .map(|(_, ts)| ts) // un-enumerate
       .next() // the next element would be the first to retain
       .copied();
