@@ -19,6 +19,7 @@ use crate::{
     typedesc::TypeDesc,
     CreateError, CreateResult,
   },
+  rtps::constant::MAX_WITHHELD_BYTES_PER_TOPIC,
   structure::{sequence_number::SequenceNumber, time::Timestamp},
   GUID,
 };
@@ -211,10 +212,33 @@ impl TopicCache {
   }
 
   // Returns true if the "reliably_received_before"-marker was actually moved
-  // forward and false if not.
+  // forward and false if not. The marker never moves backwards: the cache may
+  // have given up on a missing sample that the Reader is still waiting for.
   pub fn mark_reliably_received_before(&mut self, writer: GUID, sn: SequenceNumber) -> bool {
-    let prev_sn = self.received_reliably_before.insert(writer, sn);
-    prev_sn.unwrap_or(SequenceNumber::new(1)) < sn
+    let prev_sn = self.reliable_before(writer);
+    // The entry must exist even at the initial value: withheld samples are
+    // protected only for Writers that have one.
+    let marker = self.received_reliably_before.entry(writer).or_default();
+    *marker = max(*marker, sn);
+    self.advance_marker_over_present(writer);
+    prev_sn < self.reliable_before(writer)
+  }
+
+  // Samples present without a break right at the marker have nothing missing
+  // before them, so move the marker past them. This matters after giving up on
+  // a missing sample, when the Reader still reports it as missing.
+  fn advance_marker_over_present(&mut self, writer: GUID) {
+    let Some(marker) = self.received_reliably_before.get_mut(&writer) else {
+      return;
+    };
+    if let Some(sn_map) = self.sequence_numbers.get(&writer) {
+      for sn in sn_map.range(*marker..).map(|(sn, _)| *sn) {
+        if sn != *marker {
+          break;
+        }
+        *marker = sn.plus_1();
+      }
+    }
   }
 
   // The Writer is gone, so samples it never completed are no longer awaited.
@@ -222,9 +246,10 @@ impl TopicCache {
     self.received_reliably_before.remove(&writer);
   }
 
-  // Receive timestamp of the oldest change that a Reliable DataReader cannot yet
-  // take, because an earlier sample from the same Writer is still missing.
-  fn oldest_withheld_change(&self) -> Option<Timestamp> {
+  // The oldest change that a Reliable DataReader cannot yet take, because an
+  // earlier sample from the same Writer is still missing: its receive timestamp,
+  // Writer and SequenceNumber.
+  fn oldest_withheld_change(&self) -> Option<(Timestamp, GUID, SequenceNumber)> {
     self
       .received_reliably_before
       .iter()
@@ -234,9 +259,41 @@ impl TopicCache {
           .get(writer)?
           .range(marker..)
           .next()
-          .map(|(_, ts)| *ts)
+          .map(|(sn, ts)| (*ts, *writer, *sn))
       })
       .min()
+  }
+
+  // Payload bytes retained from the oldest withheld change onwards.
+  fn withheld_bytes(&self, from: Timestamp) -> usize {
+    self
+      .changes
+      .range(from..)
+      .map(|(_, cc)| cc.data_value.payload_size())
+      .sum()
+  }
+
+  // Over MAX_WITHHELD_BYTES_PER_TOPIC, give up on missing samples, oldest first,
+  // and hand over the samples after them. Returns true if anything was given up.
+  fn give_up_withheld_over_limit(&mut self) -> bool {
+    // Under the sample count limit nothing is retained just for being withheld.
+    if self.changes.len() <= self.max_keep_samples as usize {
+      return false;
+    }
+    let mut gave_up = false;
+    while let Some((oldest, writer, first_present)) = self.oldest_withheld_change() {
+      if self.withheld_bytes(oldest) <= MAX_WITHHELD_BYTES_PER_TOPIC {
+        break;
+      }
+      debug!(
+        "Topic {:?}: giving up on samples from {:?} missing before {:?}",
+        self.topic_name, writer, first_present
+      );
+      self.received_reliably_before.insert(writer, first_present);
+      self.advance_marker_over_present(writer);
+      gave_up = true;
+    }
+    gave_up
   }
 
   pub fn get_change(&self, instant: &Timestamp) -> Option<&CacheChange> {
@@ -455,38 +512,43 @@ impl TopicCache {
 
     // Samples withheld from a Reliable DataReader have not been delivered yet, so
     // they are kept even beyond `max_keep_samples`. They are released once the
-    // missing sample is repaired, or declared irrelevant by GAP or HEARTBEAT.
-    let oldest_withheld = self.oldest_withheld_change();
+    // missing sample is repaired, or declared irrelevant by GAP or HEARTBEAT, or
+    // when they exceed MAX_WITHHELD_BYTES_PER_TOPIC and we give up on the missing
+    // sample. Samples released by giving up are not evicted in the same pass, so
+    // the Reader gets a chance to take them.
+    if !self.give_up_withheld_over_limit() {
+      let oldest_withheld = self.oldest_withheld_change().map(|(ts, _, _)| ts);
 
-    let oldest_timestamp_to_retain_opt: Option<Timestamp> = self
-      .changes
-      .keys()
-      .enumerate()
-      .skip_while(|(i, ts)|
-        // Skip samples to be removed. Force "must" count, and then remove until
-        // either limit timestamp or "may" count stops us
-        oldest_withheld.is_none_or(|w| **ts < w)
-        && (*i < must_remove_count
-        || (**ts < remove_before && *i < may_remove_count)))
-      .map(|(_, ts)| ts) // un-enumerate
-      .next() // the next element would be the first to retain
-      .copied();
+      let oldest_timestamp_to_retain_opt: Option<Timestamp> = self
+        .changes
+        .keys()
+        .enumerate()
+        .skip_while(|(i, ts)|
+          // Skip samples to be removed. Force "must" count, and then remove until
+          // either limit timestamp or "may" count stops us
+          oldest_withheld.is_none_or(|w| **ts < w)
+          && (*i < must_remove_count
+          || (**ts < remove_before && *i < may_remove_count)))
+        .map(|(_, ts)| ts) // un-enumerate
+        .next() // the next element would be the first to retain
+        .copied();
 
-    // In case `.next()` is `None`, then we just decided to to discard everything,
-    // or, as a special case, the cache was empty to begin with, but the end
-    // result is the same.
+      // In case `.next()` is `None`, then we just decided to to discard everything,
+      // or, as a special case, the cache was empty to begin with, but the end
+      // result is the same.
 
-    let to_retain = if let Some(split_key) = oldest_timestamp_to_retain_opt {
-      // split_off: Returns everything after the given key, including the key.
-      self.changes.split_off(&split_key)
-    } else {
-      BTreeMap::new()
-    };
+      let to_retain = if let Some(split_key) = oldest_timestamp_to_retain_opt {
+        // split_off: Returns everything after the given key, including the key.
+        self.changes.split_off(&split_key)
+      } else {
+        BTreeMap::new()
+      };
 
-    let to_remove = std::mem::replace(&mut self.changes, to_retain);
+      let to_remove = std::mem::replace(&mut self.changes, to_retain);
 
-    // update also SequenceNumber map
-    to_remove.values().for_each(|r| self.remove_sn(r));
+      // update also SequenceNumber map
+      to_remove.values().for_each(|r| self.remove_sn(r));
+    }
 
     // Now, reallocate old cache changes
     let reallocate_timeout = crate::Duration::from_secs(5);
@@ -571,16 +633,20 @@ mod tests {
   use super::{DDSCache, TopicCache};
   use crate::{
     dds::{
-      ddsdata::DDSData, qos::QosPolicies, typedesc::TypeDesc, with_key::datawriter::WriteOptions,
+      ddsdata::DDSData,
+      qos::{policy::History, QosPolicies, QosPolicyBuilder},
+      typedesc::TypeDesc,
+      with_key::datawriter::WriteOptions,
     },
     discovery::discovery::Discovery,
     messages::submessages::elements::serialized_payload::SerializedPayload,
     structure::{
       cache_change::CacheChange,
-      guid::{EntityId, GuidPrefix, GUID},
+      guid::{EntityId, EntityKind, GuidPrefix, GUID},
       sequence_number::SequenceNumber,
       time::Timestamp,
     },
+    RepresentationIdentifier,
   };
 
   // A reliable DataReader reads each remote writer's samples in sequence
@@ -641,6 +707,101 @@ mod tests {
       read_after_repair(&Discovery::builtin_sedp_reader_qos()),
       [SequenceNumber::new(1), SequenceNumber::new(2)]
     );
+  }
+
+  fn keep_all_topic_cache() -> TopicCache {
+    TopicCache::new(
+      "Square".to_string(),
+      TypeDesc::new("ShapeType".to_string()),
+      &QosPolicyBuilder::new().history(History::KeepAll).build(),
+    )
+  }
+
+  fn user_writer() -> GUID {
+    GUID::new(
+      GuidPrefix::new(&[7; 12]),
+      EntityId::new([0, 0, 1], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+    )
+  }
+
+  // Adds a sample like a Reliable Reader that is still missing sample 1.
+  fn add_after_missing_first(topic_cache: &mut TopicCache, writer: GUID, sn: i64, size: usize) {
+    topic_cache.add_change(
+      &Timestamp::now(),
+      CacheChange::new(
+        writer,
+        SequenceNumber::new(sn),
+        WriteOptions::default(),
+        DDSData::new(SerializedPayload::new(
+          RepresentationIdentifier::CDR_LE,
+          vec![0; size],
+        )),
+      ),
+    );
+    topic_cache.mark_reliably_received_before(writer, SequenceNumber::new(1));
+  }
+
+  #[test]
+  fn reliably_received_marker_does_not_move_backwards() {
+    let mut topic_cache = keep_all_topic_cache();
+    let writer = user_writer();
+    assert!(topic_cache.mark_reliably_received_before(writer, SequenceNumber::new(10)));
+    assert!(!topic_cache.mark_reliably_received_before(writer, SequenceNumber::new(5)));
+    assert_eq!(topic_cache.reliable_before(writer), SequenceNumber::new(10));
+  }
+
+  // E.g. Fast DDS sends its first HEARTBEAT 3 s after matching, so a late joiner
+  // waits that long for the samples before its first one.
+  #[test]
+  fn small_withheld_samples_are_kept() {
+    let mut topic_cache = keep_all_topic_cache();
+    let writer = user_writer();
+    for sn in 2..=91 {
+      add_after_missing_first(&mut topic_cache, writer, sn, 100);
+    }
+    topic_cache.remove_changes_before(Timestamp::ZERO);
+    assert_eq!(topic_cache.changes.len(), 90);
+    assert_eq!(topic_cache.reliable_before(writer), SequenceNumber::new(1));
+  }
+
+  #[test]
+  fn large_withheld_samples_are_given_up_and_handed_over() {
+    let mut topic_cache = keep_all_topic_cache();
+    let writer = user_writer();
+    let size = 256 * 1024;
+    let max_keep = topic_cache.max_keep_samples as i64;
+
+    // Up to the sample count limit, everything is kept anyway.
+    for sn in 2..=max_keep + 1 {
+      add_after_missing_first(&mut topic_cache, writer, sn, size);
+    }
+    assert_eq!(topic_cache.reliable_before(writer), SequenceNumber::new(1));
+
+    // Beyond it, over MAX_WITHHELD_BYTES_PER_TOPIC, the next collection gives up
+    // on sample 1 and hands over everything after it, without evicting it in the
+    // same pass.
+    add_after_missing_first(&mut topic_cache, writer, max_keep + 2, size);
+    assert_eq!(topic_cache.reliable_before(writer), SequenceNumber::new(1));
+    topic_cache.remove_changes_before(Timestamp::ZERO);
+    assert_eq!(
+      topic_cache.reliable_before(writer),
+      SequenceNumber::new(max_keep + 3)
+    );
+    let handed_over: Vec<_> = topic_cache
+      .get_changes_in_range_reliable(&BTreeMap::new())
+      .map(|(_, cc)| i64::from(cc.sequence_number))
+      .collect();
+    assert_eq!(handed_over, (2..=max_keep + 2).collect::<Vec<_>>());
+
+    // Later samples are handed over as they arrive, and the cache stays bounded.
+    for sn in max_keep + 3..=200 {
+      add_after_missing_first(&mut topic_cache, writer, sn, size);
+    }
+    assert_eq!(
+      topic_cache.reliable_before(writer),
+      SequenceNumber::new(201)
+    );
+    assert!(topic_cache.changes.len() <= topic_cache.max_keep_samples as usize + 1);
   }
 
   #[test]

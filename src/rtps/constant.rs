@@ -76,6 +76,12 @@ pub const MAX_UNSENT_CHANGES_PER_READER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 // bounded.
 pub const MAX_TRACKED_CHANGES_PER_WRITER: usize = DEFAULT_WRITER_MAX_SAMPLES;
 
+// Most payload bytes a TopicCache retains for samples withheld from Reliable
+// DataReaders while an earlier sample from the same Writer is missing. Beyond
+// this, the oldest missing sample is given up as lost, and the samples after it
+// are handed over.
+pub const MAX_WITHHELD_BYTES_PER_TOPIC: usize = 16 * 1024 * 1024;
+
 // Default / fallback UDP-payload budget (RTPS header + submessages) used to
 // size datagrams built by the writer's DATA-coalescing and DATAFRAG packing
 // paths when the per-peer path MTU is unknown (peer behind a router, IPv6, or
