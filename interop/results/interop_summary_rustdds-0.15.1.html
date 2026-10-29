@@ -31,7 +31,7 @@ tr.notrun td { color: #888; font-style: italic; }
 Chosen implementation: <strong>rustdds-0.15.1</strong><br>
 dds-rtps test suite version: <strong>v0.1-alpha-147-gee81bfb (recorded at run time)</strong><br>
 Test platform: <code>Linux 6.8.0-117-generic #117-Ubuntu SMP PREEMPT_DYNAMIC Tue May  5 19:26:24 UTC 2026 x86_64 GNU/Linux</code><br>
-Generated: 2026-10-27 19:11:12
+Generated: 2026-10-28 18:56:37
 </div>
 <p>Each cell shows <strong>passed / unsupported / failed</strong> test cases. <em>Unsupported</em> means the program under test reported the feature as unsupported (<code>PUB_/SUB_UNSUPPORTED_FEATURE</code>); <em>failed</em> is any other mismatch. Both test directions (chosen vendor as Publisher and as Subscriber) are summed per peer.</p>
 <p class="note">The self row (chosen vendor vs itself) has about half as many test cases as the other rows: reversing the publisher and subscriber roles when both endpoints are the same implementation is redundant, so that pairing is run in one direction only.</p>
@@ -89,12 +89,12 @@ Generated: 2026-10-27 19:11:12
 <td><span class="pass">0</span> / <span class="unsup">6</span> / <span class="fail">0</span></td>
 <td><span class="pass">36</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">2</span> / <span class="unsup">2</span> / <span class="fail">0</span></td>
-<td><span class="pass">2</span> / <span class="unsup">0</span> / <span class="fail">4</span></td>
+<td><span class="pass">3</span> / <span class="unsup">0</span> / <span class="fail">3</span></td>
 <td><span class="pass">2</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">16</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">22</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">26</span> / <span class="fail">0</span></td>
-<td class="total"><span class="pass">108</span> / <span class="unsup">61</span> / <span class="fail">9</span></td>
+<td class="total"><span class="pass">109</span> / <span class="unsup">61</span> / <span class="fail">8</span></td>
 </tr>
 <tr>
 <td class="peer">dust_dds-0.15.0</td>
@@ -140,7 +140,7 @@ Generated: 2026-10-27 19:11:12
 <td class="peer">eprosima_fastdds-3.6.1</td>
 <td><span class="pass">6</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">4</span> / <span class="unsup">4</span> / <span class="fail">0</span></td>
-<td><span class="pass">10</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">12</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">4</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">10</span> / <span class="unsup">0</span> / <span class="fail">4</span></td>
 <td><span class="pass">8</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
@@ -154,7 +154,7 @@ Generated: 2026-10-27 19:11:12
 <td><span class="pass">16</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">22</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">26</span> / <span class="fail">0</span></td>
-<td class="total"><span class="pass">104</span> / <span class="unsup">63</span> / <span class="fail">11</span></td>
+<td class="total"><span class="pass">106</span> / <span class="unsup">63</span> / <span class="fail">9</span></td>
 </tr>
 <tr>
 <td class="peer">hdds-1.3.0</td>
@@ -170,11 +170,11 @@ Generated: 2026-10-27 19:11:12
 <td><span class="pass">36</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">2</span> / <span class="unsup">2</span> / <span class="fail">0</span></td>
 <td><span class="pass">3</span> / <span class="unsup">0</span> / <span class="fail">3</span></td>
-<td><span class="pass">1</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">2</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">14</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
 <td><span class="pass">0</span> / <span class="unsup">22</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">26</span> / <span class="fail">0</span></td>
-<td class="total"><span class="pass">108</span> / <span class="unsup">61</span> / <span class="fail">9</span></td>
+<td class="total"><span class="pass">109</span> / <span class="unsup">61</span> / <span class="fail">8</span></td>
 </tr>
 <tr>
 <td class="peer">intercom_dds-4.3.1</td>
@@ -238,40 +238,40 @@ Generated: 2026-10-27 19:11:12
 </tr>
 <tr>
 <td class="peer">zzdds-0.1.1</td>
-<td><span class="pass">6</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
-<td><span class="pass">4</span> / <span class="unsup">4</span> / <span class="fail">0</span></td>
-<td><span class="pass">10</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
-<td><span class="pass">3</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
-<td><span class="pass">9</span> / <span class="unsup">0</span> / <span class="fail">5</span></td>
-<td><span class="pass">8</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
-<td><span class="pass">3</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">5</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">3</span> / <span class="unsup">4</span> / <span class="fail">1</span></td>
+<td><span class="pass">11</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">2</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">10</span> / <span class="unsup">0</span> / <span class="fail">4</span></td>
+<td><span class="pass">6</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">4</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">2</span> / <span class="unsup">1</span> / <span class="fail">1</span></td>
 <td><span class="pass">0</span> / <span class="unsup">6</span> / <span class="fail">0</span></td>
-<td><span class="pass">34</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">33</span> / <span class="unsup">0</span> / <span class="fail">3</span></td>
 <td><span class="pass">2</span> / <span class="unsup">2</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">0</span> / <span class="fail">6</span></td>
 <td><span class="pass">2</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
-<td><span class="pass">16</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
+<td><span class="pass">15</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
 <td><span class="pass">0</span> / <span class="unsup">22</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">26</span> / <span class="fail">0</span></td>
-<td class="total"><span class="pass">99</span> / <span class="unsup">61</span> / <span class="fail">18</span></td>
+<td class="total"><span class="pass">95</span> / <span class="unsup">61</span> / <span class="fail">22</span></td>
 </tr>
 <tr class="total">
 <td class="peer">Total</td>
-<td><span class="pass">57</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
-<td><span class="pass">37</span> / <span class="unsup">39</span> / <span class="fail">0</span></td>
-<td><span class="pass">110</span> / <span class="unsup">0</span> / <span class="fail">4</span></td>
-<td><span class="pass">35</span> / <span class="unsup">0</span> / <span class="fail">3</span></td>
-<td><span class="pass">98</span> / <span class="unsup">0</span> / <span class="fail">35</span></td>
-<td><span class="pass">76</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
-<td><span class="pass">37</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">56</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">36</span> / <span class="unsup">39</span> / <span class="fail">1</span></td>
+<td><span class="pass">113</span> / <span class="unsup">0</span> / <span class="fail">1</span></td>
+<td><span class="pass">34</span> / <span class="unsup">0</span> / <span class="fail">4</span></td>
+<td><span class="pass">99</span> / <span class="unsup">0</span> / <span class="fail">34</span></td>
+<td><span class="pass">74</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">38</span> / <span class="unsup">0</span> / <span class="fail">0</span></td>
 <td><span class="pass">16</span> / <span class="unsup">11</span> / <span class="fail">11</span></td>
 <td><span class="pass">0</span> / <span class="unsup">57</span> / <span class="fail">0</span></td>
-<td><span class="pass">340</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">339</span> / <span class="unsup">0</span> / <span class="fail">3</span></td>
 <td><span class="pass">9</span> / <span class="unsup">22</span> / <span class="fail">7</span></td>
-<td><span class="pass">18</span> / <span class="unsup">0</span> / <span class="fail">39</span></td>
-<td><span class="pass">16</span> / <span class="unsup">0</span> / <span class="fail">3</span></td>
-<td><span class="pass">134</span> / <span class="unsup">0</span> / <span class="fail">18</span></td>
+<td><span class="pass">19</span> / <span class="unsup">0</span> / <span class="fail">38</span></td>
+<td><span class="pass">17</span> / <span class="unsup">0</span> / <span class="fail">2</span></td>
+<td><span class="pass">133</span> / <span class="unsup">0</span> / <span class="fail">19</span></td>
 <td><span class="pass">0</span> / <span class="unsup">209</span> / <span class="fail">0</span></td>
 <td><span class="pass">0</span> / <span class="unsup">247</span> / <span class="fail">0</span></td>
 <td><span class="pass">983</span> / <span class="unsup">585</span> / <span class="fail">123</span></td>
