@@ -733,6 +733,8 @@ impl Discovery {
       );
       match self.poll.poll(&mut events, Some(poll_timeout)) {
         Ok(_) => (),
+        // A signal arrived (e.g. SIGCONT after SIGSTOP, a profiler or a debugger).
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
         Err(e) => {
           error!("Failed in waiting of poll in discovery. {e:?}");
           return;
