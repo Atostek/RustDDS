@@ -1020,7 +1020,12 @@ impl Reader {
             let mut missing_frags = this.missing_frags_for(writer_guid, sn);
             let first_missing = missing_frags.next();
             if let Some(first) = first_missing {
-              let missing_frags_set = iter::once(first).chain(missing_frags).collect(); // "undo" the .next() above
+              // "undo" the .next() above. Limit the set to maximum that can be sent in
+              // nackfrag submessage.
+              let missing_frags_set = iter::once(first)
+                .chain(missing_frags)
+                .take_while(|f| *f < first + FragmentNumber::new(256))
+                .collect();
               let nf = NackFrag {
                 reader_id,
                 writer_id: writer_proxy.remote_writer_guid.entity_id,
