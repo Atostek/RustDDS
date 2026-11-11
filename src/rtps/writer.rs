@@ -30,7 +30,7 @@ use crate::{
     constant::{
       DEFAULT_WRITER_MAX_SAMPLES, FALLBACK_MAX_AGGREGATED_DATAGRAM_SIZE, FRAGMENT_SIZE,
       HEARTBEAT_PERIOD_FAST, HEARTBEAT_PERIOD_SLOW, HEARTBEAT_SUBMESSAGE_SERIALIZED_SIZE,
-      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION, REPAIR_BATCH_MAX_BYTES,
+      NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION, PUSH_BATCH_MAX_BYTES, REPAIR_BATCH_MAX_BYTES,
       REPAIR_INTERVAL_DEFAULT, REPAIR_INTERVAL_MAX, REPAIR_INTERVAL_MIN,
     },
     outbound::{SocketId, TrafficClass},
@@ -85,8 +85,11 @@ pub(crate) enum SampleCursor {
 /// consecutive unfragmented multicast-to-all samples into a single datagram.
 pub(crate) enum BatchOutcome {
   /// The aggregated datagram was accepted by every socket. `last_seq` is the
-  /// highest sequence number included in the batch.
-  Sent { last_seq: SequenceNumber },
+  /// highest sequence number included in the batch, `bytes` the datagram size.
+  Sent {
+    last_seq: SequenceNumber,
+    bytes: usize,
+  },
   /// A socket returned WouldBlock and back-pressure applies (reliable, or a
   /// best-effort sample that opted in to blocking). The whole datagram is
   /// all-or-nothing: `last_sent` is left unchanged so the batch is rebuilt and
@@ -94,8 +97,11 @@ pub(crate) enum BatchOutcome {
   Blocked { blocked: BTreeSet<SocketId> },
   /// A socket returned WouldBlock for a best-effort batch that must not block;
   /// the whole datagram is dropped and we advance past it. `last_seq` is the
-  /// highest sequence number in the dropped batch.
-  Dropped { last_seq: SequenceNumber },
+  /// highest sequence number in the dropped batch, `bytes` the datagram size.
+  Dropped {
+    last_seq: SequenceNumber,
+    bytes: usize,
+  },
 }
 
 /// nonblocking-transmit: outcome of a resumable bulk send of one cache change.
@@ -763,6 +769,7 @@ impl Writer {
       );
     }
 
+    let bytes = builder.len_serialized();
     let message = builder.add_header_and_build(self.my_guid.prefix);
     let blocked = self.send_message_to_readers(
       DeliveryMode::Multicast,
@@ -772,22 +779,31 @@ impl Writer {
     );
 
     if blocked.is_empty() {
-      Some(BatchOutcome::Sent { last_seq })
+      Some(BatchOutcome::Sent { last_seq, bytes })
     } else if may_block {
       Some(BatchOutcome::Blocked { blocked })
     } else {
-      Some(BatchOutcome::Dropped { last_seq })
+      Some(BatchOutcome::Dropped { last_seq, bytes })
     }
   }
 
-  pub fn process_pending(&mut self) {
+  /// Sends unsent samples, up to `PUSH_BATCH_MAX_BYTES` per call.
+  ///
+  /// Returns `true` if it stopped at that budget with samples still unsent and
+  /// no socket blocked. The caller must then call again soon, because nothing
+  /// else will trigger it.
+  pub fn process_pending(&mut self) -> bool {
     // The doorbell enqueues this writer's id and then wakes. A sample admitted
     // while we are here pushes another id, so the next wake runs us again. The
     // shared buffer's `last_seq` is the source of truth.
+    let mut round_bytes = 0;
     loop {
       let last_available = self.send_buffer.last_change_sequence_number();
       if self.last_sent >= last_available {
-        break;
+        return false;
+      }
+      if round_bytes >= PUSH_BATCH_MAX_BYTES {
+        return true;
       }
       let sequence_number = self.last_sent.plus_1();
 
@@ -803,7 +819,9 @@ impl Writer {
         && self.security_plugins.is_none()
       {
         match self.try_send_aggregated_batch(sequence_number, last_available) {
-          Some(BatchOutcome::Sent { last_seq }) | Some(BatchOutcome::Dropped { last_seq }) => {
+          Some(
+            BatchOutcome::Sent { last_seq, bytes } | BatchOutcome::Dropped { last_seq, bytes },
+          ) => {
             // Coalesced samples are multicast-to-all, so per-reader `unsent`
             // bookkeeping is a no-op (notify + mark_sent cancel out); just
             // advance the frontier. Leaves `unsent_changes` empty on the push
@@ -811,13 +829,14 @@ impl Writer {
             self.last_sent = last_seq;
             self.sample_cursor = SampleCursor::Fresh;
             self.send_buffer.set_sent_frontier(last_seq);
+            round_bytes += bytes;
             continue;
           }
           Some(BatchOutcome::Blocked { blocked }) => {
             // All-or-nothing: do not advance `last_sent`; the event loop resumes
             // us on write readiness and the batch is rebuilt from `sequence_number`.
             self.blocked_sockets.extend(blocked);
-            return;
+            return false;
           }
           None => { /* first sample not aggregatable; use the per-sample path */ }
         }
@@ -835,6 +854,7 @@ impl Writer {
         continue;
       };
       let write_options = cc.write_options.clone();
+      round_bytes += cc.data_value.payload_size();
 
       // Notify reader proxies once per sample (only when starting it fresh).
       if self.sample_cursor == SampleCursor::Fresh && !self.like_stateless {
@@ -907,7 +927,7 @@ impl Writer {
               // application follows from `sent_frontier` not advancing.
               self.sample_cursor = cursor;
               self.blocked_sockets.extend(blocked);
-              return;
+              return false;
             }
             // Drop: advance past this sample without recording blocked sockets,
             // so no write-readiness back-pressure is applied. The unsent
@@ -3114,6 +3134,21 @@ mod tests {
       f.writer.udp_sender.flush_control(SocketId::Unicast);
       assert_eq!(f.repair_round(), 5);
       assert!(!f.reader_proxy().repair_mode);
+    }
+
+    // A push stops once PUSH_BATCH_MAX_BYTES have gone out, reports that
+    // samples remain, and the next call continues where it stopped.
+    #[test]
+    fn push_is_byte_limited_and_continues() {
+      let sample_len = PUSH_BATCH_MAX_BYTES / 2 + 1;
+      let mut f = Fixture::user(5, sample_len, None);
+      for sent in [2, 4] {
+        assert!(f.writer.process_pending());
+        assert_eq!(f.writer.last_sent, SequenceNumber::new(sent));
+      }
+      assert!(!f.writer.process_pending());
+      assert_eq!(f.writer.last_sent, SequenceNumber::new(5));
+      assert!(!f.writer.process_pending());
     }
   }
 }
