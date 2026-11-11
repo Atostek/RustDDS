@@ -114,6 +114,9 @@ pub struct DPEventLoop {
   // (see src/rtps/nonblocking_transmit_design.md)
   bulk_ready: BTreeMap<SocketId, VecDeque<EntityId>>,
   writable_armed: BTreeSet<SocketId>,
+  // Writers whose last `process_pending` stopped at its byte budget with
+  // samples still unsent. Run again on the next loop iteration.
+  unfinished_pushes: Vec<EntityId>,
 
   // Interface-aware transmit: per-remote observed receive interfaces/addresses,
   // shared (intra-thread) with the MessageReceiver that populates it.
@@ -251,6 +254,7 @@ impl DPEventLoop {
       writers: HashMap::new(),
       bulk_ready: BTreeMap::new(),
       writable_armed: BTreeSet::new(),
+      unfinished_pushes: Vec::new(),
       shared_timer,
       ack_nack_receiver: acknack_receiver,
       discovery_update_notification_receiver,
@@ -302,7 +306,11 @@ impl DPEventLoop {
       } else {
         Duration::from_millis(2)
       };
-      let poll_timeout = timeout_until(ev_wrapper.shared_timer.borrow().next_deadline(), idle_cap);
+      let poll_timeout = if ev_wrapper.unfinished_pushes.is_empty() {
+        timeout_until(ev_wrapper.shared_timer.borrow().next_deadline(), idle_cap)
+      } else {
+        Duration::ZERO
+      };
       match ev_wrapper.poll.poll(&mut events, Some(poll_timeout)) {
         Ok(_) => {}
         // A signal arrived (e.g. SIGCONT after SIGSTOP, a profiler or a debugger).
@@ -461,7 +469,12 @@ impl DPEventLoop {
         Reader::process_command,
       );
     }
-    let writer_ids = self.writer_ready.drain_unique();
+    let mut writer_ids = self.writer_ready.drain_unique();
+    for eid in std::mem::take(&mut self.unfinished_pushes) {
+      if !writer_ids.contains(&eid) {
+        writer_ids.push(eid);
+      }
+    }
     for eid in writer_ids {
       let (blocked, local_readers) = match self.writers.get_mut(&eid) {
         None => {
@@ -469,7 +482,9 @@ impl DPEventLoop {
           (BTreeSet::new(), vec![])
         }
         Some(writer) => {
-          writer.process_pending();
+          if writer.process_pending() && !self.unfinished_pushes.contains(&eid) {
+            self.unfinished_pushes.push(eid);
+          }
           (writer.take_blocked_sockets(), writer.local_readers())
         }
       };
@@ -553,7 +568,9 @@ impl DPEventLoop {
     while let Some(eid) = self.bulk_ready.get_mut(&sid).and_then(VecDeque::pop_front) {
       let blocked = match self.writers.get_mut(&eid) {
         Some(writer) => {
-          writer.process_pending();
+          if writer.process_pending() && !self.unfinished_pushes.contains(&eid) {
+            self.unfinished_pushes.push(eid);
+          }
           writer.take_blocked_sockets()
         }
         None => BTreeSet::new(),

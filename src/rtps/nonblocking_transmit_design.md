@@ -135,8 +135,14 @@ queue) only once the cursor reaches the final fragment.
 
 ### 5.2 Fairness and control interleaving
 
-Each writer emits only a **bounded batch of fragments per turn**, then yields so
-the socket's control queue is re-drained and the next willing writer runs. Since
+Each writer emits only a **bounded batch per turn** (`PUSH_BATCH_MAX_BYTES` of
+new samples, at least one sample), then yields so
+the socket's control queue is re-drained and the next willing writer runs. A
+writer that yielded with samples still unsent is run again on the next event
+loop iteration, which polls without waiting meanwhile. This matters even where a
+socket never returns `WouldBlock` (loopback drops on the receiver instead): an
+unbounded push would keep the loop from ACKNACKs, other writers and the stop
+command for as long as the application keeps writing. Since
 control is drained first on every writable cycle, HEARTBEATs and reader ACKNACKs
 are never starved -- even while a multi-thousand-fragment sample streams out, and
 even across several concurrently-sending large writers.

@@ -39,6 +39,19 @@ pub const REPAIR_INTERVAL_MAX: Duration = Duration::from_millis(100);
 // one reader. A round always sends at least one sample, even a larger one.
 pub const REPAIR_BATCH_MAX_BYTES: usize = 8192;
 
+// Byte budget for sending new samples in one `Writer::process_pending` call.
+// When it is used up and samples are still unsent, the call returns and the
+// event loop calls it again on its next iteration, after handling other
+// events. The budget is checked between samples, so a call always sends at
+// least one sample, however large.
+//
+// Without this limit a call sends until the socket returns WouldBlock. On
+// loopback that practically never happens (the kernel drops at the full
+// receiver instead), so while the application writes faster than the readers
+// keep up, the event loop stays in one call. It then handles no ACKNACKs, no
+// other writers and no Stop, and dropping the DomainParticipant blocks.
+pub const PUSH_BATCH_MAX_BYTES: usize = 256 * 1024;
+
 // Periodic HEARTBEAT period for reliable Writers. The period is adaptive: while
 // some matched reader is behind (has unacknowledged samples), heartbeats are
 // sent at the FAST period to prompt prompt repair (some peers rely on a
