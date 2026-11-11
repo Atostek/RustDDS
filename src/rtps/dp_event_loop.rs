@@ -305,6 +305,8 @@ impl DPEventLoop {
       let poll_timeout = timeout_until(ev_wrapper.shared_timer.borrow().next_deadline(), idle_cap);
       match ev_wrapper.poll.poll(&mut events, Some(poll_timeout)) {
         Ok(_) => {}
+        // A signal arrived (e.g. SIGCONT after SIGSTOP, a profiler or a debugger).
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
         Err(e) => {
           error!("dp_event_loop poll failed: {e:?}");
           break;
