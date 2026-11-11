@@ -29,6 +29,10 @@ pub(crate) struct IfAddr {
   pub is_loopback: bool,
   /// Whether the interface is multicast-capable.
   pub is_multicast: bool,
+  /// Whether the interface can currently pass traffic (Unix `IFF_RUNNING`:
+  /// administratively up *and* has carrier). E.g. a container bridge without
+  /// members or an unplugged NIC keeps its address but is not running.
+  pub is_running: bool,
   /// IPv4 subnet mask for `ip` (only populated for IPv4 addresses). Used to
   /// decide whether a peer is on the same subnet (i.e. reachable in one hop).
   pub netmask: Option<Ipv4Addr>,
@@ -49,6 +53,12 @@ pub(crate) struct IfAddr {
 /// the existing locator/multicast/ifindex helpers keep working unchanged, while
 /// the new fields (`netmask`, `mtu`) enable per-peer path-MTU resolution.
 ///
+/// The result is sorted by interface index and address. `netdev` returns the
+/// interfaces in random (`HashMap`) order, which would make the order of our
+/// announced locators differ between processes and runs. That matters because
+/// some implementations use only the first few locators (Fast DDS keeps 4 by
+/// default).
+///
 /// This is infallible in practice (netdev returns an empty list rather than an
 /// error), but the signature is kept as `io::Result` for API compatibility with
 /// the previous per-platform implementations.
@@ -59,6 +69,7 @@ fn enumerate_interfaces() -> io::Result<Vec<IfAddr>> {
     let index = iface.index;
     let is_loopback = iface.is_loopback();
     let is_multicast = iface.is_multicast();
+    let is_running = iface.is_running();
     let mtu = iface.mtu;
 
     for net in &iface.ipv4 {
@@ -67,6 +78,7 @@ fn enumerate_interfaces() -> io::Result<Vec<IfAddr>> {
         index,
         is_loopback,
         is_multicast,
+        is_running,
         netmask: Some(net.netmask()),
         mtu,
       });
@@ -77,6 +89,7 @@ fn enumerate_interfaces() -> io::Result<Vec<IfAddr>> {
         index,
         is_loopback,
         is_multicast,
+        is_running,
         // IPv4-only subnet matching for now; IPv6 peers fall back to default.
         netmask: None,
         mtu,
@@ -84,6 +97,7 @@ fn enumerate_interfaces() -> io::Result<Vec<IfAddr>> {
     }
   }
 
+  result.sort_by_key(|ifa| (ifa.index, ifa.ip));
   Ok(result)
 }
 
@@ -215,7 +229,15 @@ fn get_local_unicast_locators_inner(
     // loopback -- would try to send there and get EAFNOSUPPORT per datagram.
     // Link-local IPv6 is doubly useless, as a `Locator` carries no scope id.
     .filter(|ifa| ifa.ip.is_ipv4())
-    .filter(|ifa| only_networks.is_none_or(|nets| nets.contains(&ifa.ip)))
+    // Do not announce addresses of interfaces that cannot pass traffic, such
+    // as an idle `docker0`. Peers cannot reach us there, and implementations
+    // that use only the first few locators may drop the reachable ones.
+    // Loopback is kept for same-host peers, and an explicit `only_networks`
+    // selection is honored as is.
+    .filter(|ifa| match only_networks {
+      Some(nets) => nets.contains(&ifa.ip),
+      None => ifa.is_running || ifa.is_loopback,
+    })
     .map(|ifa| Locator::from(SocketAddr::new(ifa.ip, port)))
     .collect()
 }
@@ -308,6 +330,7 @@ mod tests {
       index,
       is_loopback,
       is_multicast,
+      is_running: true,
       netmask: None,
       mtu: None,
     }
@@ -326,6 +349,7 @@ mod tests {
       index: 1,
       is_loopback,
       is_multicast: !is_loopback,
+      is_running: true,
       netmask: Some(Ipv4Addr::from(mask)),
       mtu: Some(mtu),
     }
@@ -440,6 +464,31 @@ mod tests {
     assert_eq!(
       filtered,
       vec![Locator::from(SocketAddr::new(v4(192, 168, 0, 10), 7412))]
+    );
+  }
+
+  #[test]
+  fn unicast_locators_exclude_non_running_interfaces() {
+    let lo = iface(IpAddr::V4(Ipv4Addr::LOCALHOST), 1, true, false);
+    let eth0 = iface(v4(192, 168, 0, 10), 2, false, true);
+    let docker0 = IfAddr {
+      is_running: false,
+      ..iface(v4(172, 17, 0, 1), 3, false, true)
+    };
+    let ifaces = [lo, eth0, docker0];
+    let locator = |ip| Locator::from(SocketAddr::new(ip, 7412));
+
+    assert_eq!(
+      get_local_unicast_locators_inner(&ifaces, 7412, None),
+      vec![
+        locator(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        locator(v4(192, 168, 0, 10))
+      ]
+    );
+    // An explicit selection is honored even if the interface is not running.
+    assert_eq!(
+      get_local_unicast_locators_inner(&ifaces, 7412, Some(&[v4(172, 17, 0, 1)])),
+      vec![locator(v4(172, 17, 0, 1))]
     );
   }
 
