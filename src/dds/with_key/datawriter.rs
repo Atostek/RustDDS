@@ -144,6 +144,16 @@ impl WriteOptions {
   pub fn best_effort_may_block(&self) -> bool {
     self.best_effort_may_block
   }
+
+  /// These options with `source_timestamp` set by `now` if the caller gave
+  /// none. Used when a sample is admitted, so that every sample is sent with
+  /// an INFO_TS (see `WriterSendBuffer::insert_locked`).
+  pub(crate) fn with_source_timestamp_or(mut self, now: impl FnOnce() -> Timestamp) -> Self {
+    if self.source_timestamp.is_none() {
+      self.source_timestamp = Some(now());
+    }
+    self
+  }
 }
 
 impl From<Option<Timestamp>> for WriteOptions {

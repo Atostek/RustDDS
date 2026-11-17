@@ -601,8 +601,17 @@ impl Writer {
     } else {
       0
     };
+    // The DATA goes out after an INFO_TS (the send buffer gives every sample a
+    // source timestamp) and, when sent to one reader, an INFO_DST.
+    let dst_reserve = if target_reader_opt.is_some() {
+      SUBMESSAGE_INFO_DST_SIZE
+    } else {
+      0
+    };
     budget
       .saturating_sub(hb_reserve)
+      .saturating_sub(SUBMESSAGE_INFO_TS_SIZE)
+      .saturating_sub(dst_reserve)
       .saturating_sub(DATA_SUBMESSAGE_OVERHEAD)
   }
 
@@ -2246,6 +2255,12 @@ const DATA_SUBMESSAGE_OVERHEAD: usize = 48;
 // An invalidating INFO_TS is a bare submessage header.
 const SUBMESSAGE_INFO_TS_INVALIDATE_SIZE: usize = 4;
 
+// INFO_TS with a timestamp: submessage header (4) + Time (8).
+const SUBMESSAGE_INFO_TS_SIZE: usize = 12;
+
+// INFO_DST: submessage header (4) + GuidPrefix (12).
+const SUBMESSAGE_INFO_DST_SIZE: usize = 16;
+
 // Serialized overhead of one DATAFRAG submessage excluding its payload:
 // submessage header (4) + extraFlags (2) + octetsToInlineQos (2) + readerId (4)
 // + writerId (4) + writerSN (8) + fragmentStartingNum (4) +
@@ -2963,6 +2978,58 @@ mod tests {
         );
         assert_eq!(f.repair_round(), 5);
         assert!(!f.reader_proxy().repair_mode);
+      }
+    }
+
+    // The largest payload sent to one reader as a single DATA fits that
+    // reader's datagram budget, RTPS header included, together with the
+    // INFO_TS, INFO_DST and HEARTBEAT that go out in the same datagram. One
+    // byte more is fragmented.
+    #[test]
+    fn largest_unfragmented_directed_data_fits_the_datagram_budget() {
+      let f = Fixture::user(0, 0, None);
+      let reader = f.reader_proxy();
+      let max_payload = f.writer.max_unfragmented_serialized_payload(Some(reader));
+      // The packing code holds whole messages, header included, to this.
+      let limit = reader.max_datagram_payload();
+      let encapsulation = DDSData::new(SerializedPayload::new(
+        RepresentationIdentifier::CDR_LE,
+        vec![],
+      ))
+      .payload_size();
+
+      for (sn, payload_size) in [(1, max_payload), (2, max_payload + 1)] {
+        let data = DDSData::new(SerializedPayload::new(
+          RepresentationIdentifier::CDR_LE,
+          vec![0; payload_size - encapsulation],
+        ));
+        assert_eq!(data.payload_size(), payload_size);
+        assert!(matches!(
+          f.writer.send_buffer.admit_blocking(
+            WriteOptions::default(),
+            data,
+            Some(StdDuration::ZERO)
+          ),
+          Admission::Admitted(_)
+        ));
+        let cc = f
+          .writer
+          .send_buffer
+          .get_by_sn(SequenceNumber::new(sn))
+          .expect("admitted sample");
+        let messages =
+          FragmentationIter::new_resume(&f.writer, &cc, Some(reader), true, SampleCursor::Fresh);
+        assert_eq!(messages.fragmentation_needed(), payload_size > max_payload);
+        for (_, message) in messages {
+          let len = message
+            .write_to_vec_fast(f.writer.endianness)
+            .expect("serializes")
+            .len();
+          assert!(
+            len <= limit,
+            "{len}-byte datagram for a {payload_size}-byte payload, limit {limit}"
+          );
+        }
       }
     }
 
