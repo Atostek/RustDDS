@@ -10,11 +10,12 @@ permissions: read-all
 jobs:
 
   test-on-macos:
-    # We run tests on macos-14 instead of macos-latest, because Apple has changed policies
-    # so that listening to multicast requires "Local Network Permission".
-    # It is still unclear how to work around that in a GitHub runner.
-    runs-on: macos-14
+    # Since macOS 15 a process needs "Local Network Permission" to send
+    # multicast, and a GitHub runner cannot grant it: as the runner user the
+    # multicast test fails with "No route to host". Run as root, all tests pass.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -- --test-threads=1
+      - run: cargo test --no-run
+      - run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -- --test-threads=1
