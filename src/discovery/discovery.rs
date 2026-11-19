@@ -703,6 +703,20 @@ impl Discovery {
     }
     self.initialize_participant();
 
+    // Announce this participant before any of its endpoints. A remote
+    // participant drops SEDP from a participant it has not discovered yet, so
+    // endpoints announced before the first SPDP would reach it only in a later
+    // reliable repair round, after it has requested them. Endpoint commands are
+    // handled in the loop below, so this SPDP goes out first. The periodic
+    // announce seeded in `new` still follows.
+    match self.domain_participant.clone().upgrade() {
+      Some(dp) => self.spdp_publish(&dp),
+      None => {
+        error!("DomainParticipant doesn't exist anymore, exiting Discovery.");
+        return;
+      }
+    }
+
     // Send out info about user (=non-built-in) Writers and Readers that we have.
     // We are just initializing local participant, so likely there are none yet,
     // but better make sure.
@@ -1059,6 +1073,24 @@ impl Discovery {
     let was_new = discovery_db_write(&self.discovery_db).update_participant(participant_data);
     let guid_prefix = participant_data.participant_guid.prefix;
 
+    // Answer a new remote participant at once, before the notification below
+    // lets the event loop send it our SEDP: it drops SEDP from a participant
+    // it does not know yet, and would get our endpoints only in a later
+    // reliable repair round.
+    //
+    // RTPS spec v2.5 Section "8.5.3.1 General Approach" [to SPDP] says
+    // "Implementations can minimize any start-up delays by sending an additional
+    // SPDPdiscoveredParticipantData in response to receiving this data-object from
+    // a previously unknown Participant, but this behavior is optional."
+    //
+    // But not to reply to self, because we know that we exist.
+    // TODO: Maybe add some rate-limiting to this to avoid packet storms.
+    if was_new && guid_prefix != self.domain_participant.guid().prefix {
+      if let Some(dp) = self.domain_participant.clone().upgrade() {
+        self.spdp_publish(&dp);
+      }
+    }
+
     // Send notification to dp_event_loop. It will update local reader/writer
     // proxies as the SpdpDiscoveredParticipantData contains a bitmap of the
     // available built-in endpoints.
@@ -1069,23 +1101,6 @@ impl Discovery {
       self.send_participant_status(DomainParticipantStatusEvent::ParticipantDiscovered {
         dpd: participant_data.into(),
       });
-
-      // Send a quick response to make discovery faster.
-      //
-      // RTPS spec v2.5 Section "8.5.3.1 General Approach" [to SPDP] says
-      // "Implementations can minimize any start-up delays by sending an additional
-      // SPDPdiscoveredParticipantData in response to receiving this data-object from
-      // a previously unknown Participant, but this behavior is optional."
-      //
-      // But not to reply to self, because we know that we exist.
-      // TODO: Maybe add some rate-limiting to this to avoid packet storms.
-      if guid_prefix != self.domain_participant.guid().prefix {
-        // One-shot quick SPDP response on the shared timer (does not reschedule).
-        self.discovery_timer.borrow_mut().set_timeout(
-          StdDuration::from_millis(10),
-          DiscoveryTimerEvent::SendParticipantInfo { reschedule: false },
-        );
-      }
 
       // This may be a rediscovery of a previously seen participant that
       // was temporarily lost due to network outage. Process the SEDP samples

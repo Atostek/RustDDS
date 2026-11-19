@@ -79,6 +79,10 @@ pub(crate) struct RtpsReaderProxy {
   // sends one ACKNACK to each of our locators; the copies carry the same count.
   pub last_acknack_count: Option<i32>,
   pub last_nackfrag_count: Option<i32>,
+
+  /// The Reader has sent this Writer an ACKNACK, so it has matched the Writer
+  /// on its side as well (`RemoteReaderConfirmed` was reported).
+  pub confirmed: bool,
   qos: QosPolicies,
   frags_requested: BTreeMap<SequenceNumber, BitVec>,
 
@@ -115,6 +119,7 @@ impl RtpsReaderProxy {
       repair_frags_scheduled: false,
       last_acknack_count: None,
       last_nackfrag_count: None,
+      confirmed: false,
       qos,
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
@@ -244,6 +249,7 @@ impl RtpsReaderProxy {
       repair_frags_scheduled: false,
       last_acknack_count: None,
       last_nackfrag_count: None,
+      confirmed: false,
       qos: reader.qos_policy.clone(),
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
@@ -322,6 +328,7 @@ impl RtpsReaderProxy {
       repair_frags_scheduled: false,
       last_acknack_count: None,
       last_nackfrag_count: None,
+      confirmed: false,
       qos: discovered_reader_data.subscription_topic_data.qos(),
       frags_requested: BTreeMap::new(),
       send_route: SendRoute::default(),
