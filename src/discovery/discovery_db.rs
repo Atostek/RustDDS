@@ -23,6 +23,7 @@ use crate::{
     duration::Duration,
     entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
+    locator::Locator,
   },
 };
 use super::{
@@ -64,6 +65,10 @@ pub(crate) struct DiscoveryDB {
   // remote readers and writers (via discovery)
   external_topic_readers: BTreeMap<GUID, DiscoveredReaderData>,
   external_topic_writers: BTreeMap<GUID, DiscoveredWriterData>,
+  // Which locator lists of those are not what the reader or writer announced,
+  // but the default locators of its participant. See update_subscription().
+  // Only endpoints with such a list have an entry.
+  default_locators_used: BTreeMap<GUID, DefaultLocatorsUsed>,
 
   // The "attic": remote readers and writers whose participant is not in
   // participant_proxies. Endpoints belong to a discovered participant (RTPS
@@ -76,6 +81,8 @@ pub(crate) struct DiscoveryDB {
   // participant is discovered (again), restore_endpoints_from_attic() enters
   // them and returns them for matching. A dispose of the participant, or of
   // the endpoint, drops them.
+  // The attic has the locators that the endpoints announced, without default
+  // locators of the participant: it may return with other ones.
   external_topic_readers_attic: BTreeMap<GUID, DiscoveredReaderData>,
   external_topic_writers_attic: BTreeMap<GUID, DiscoveredWriterData>,
 
@@ -88,6 +95,14 @@ pub(crate) struct DiscoveryDB {
   topic_updated_sender: std::sync::mpsc::SyncSender<()>,
 
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
+}
+
+// Whether a remote reader or writer announced no unicast locators, or no
+// multicast locators, so that it has the default ones of its participant
+#[derive(Clone, Copy)]
+struct DefaultLocatorsUsed {
+  unicast: bool,
+  multicast: bool,
 }
 
 // How did we discover this topic
@@ -152,6 +167,7 @@ impl DiscoveryDB {
       local_topic_readers: BTreeMap::new(),
       external_topic_readers: BTreeMap::new(),
       external_topic_writers: BTreeMap::new(),
+      default_locators_used: BTreeMap::new(),
       external_topic_readers_attic: BTreeMap::new(),
       external_topic_writers_attic: BTreeMap::new(),
       topics: BTreeMap::new(),
@@ -259,7 +275,32 @@ impl DiscoveryDB {
         &mut self.external_topic_writers,
         &mut self.external_topic_writers_attic,
       );
+      // The default locators of this participant stay behind. If it returns,
+      // its endpoints get the ones it announces then.
+      for (guid, used) in self.default_locators_used.range(guid_prefix.range()) {
+        let locator_lists = match (
+          self.external_topic_readers_attic.get_mut(guid),
+          self.external_topic_writers_attic.get_mut(guid),
+        ) {
+          (Some(reader), _) => (
+            &mut reader.reader_proxy.unicast_locator_list,
+            &mut reader.reader_proxy.multicast_locator_list,
+          ),
+          (None, Some(writer)) => (
+            &mut writer.writer_proxy.unicast_locator_list,
+            &mut writer.writer_proxy.multicast_locator_list,
+          ),
+          (None, None) => continue,
+        };
+        if used.unicast {
+          locator_lists.0.clear();
+        }
+        if used.multicast {
+          locator_lists.1.clear();
+        }
+      }
     }
+    remove_by_guid_prefix(guid_prefix, &mut self.default_locators_used);
   }
 
   pub fn find_participant_proxy(
@@ -285,6 +326,7 @@ impl DiscoveryDB {
   pub fn remove_topic_reader(&mut self, guid: GUID) {
     info!("remove_topic_reader {guid:?}");
     self.external_topic_readers.remove(&guid);
+    self.default_locators_used.remove(&guid);
     self.external_topic_readers_attic.remove(&guid);
   }
 
@@ -313,6 +355,7 @@ impl DiscoveryDB {
 
   pub fn remove_topic_writer(&mut self, guid: GUID) {
     self.external_topic_writers.remove(&guid);
+    self.default_locators_used.remove(&guid);
     self.external_topic_writers_attic.remove(&guid);
   }
 
@@ -465,6 +508,11 @@ impl DiscoveryDB {
     };
     // Newer data than any in the attic
     self.external_topic_readers_attic.remove(&guid);
+    self.note_default_locators_used(
+      guid,
+      &data.reader_proxy.unicast_locator_list,
+      &data.reader_proxy.multicast_locator_list,
+    );
 
     // Build enriched data with participant's default locators filled in, so that
     // later lookups via readers_on_topic() return usable locator information.
@@ -523,6 +571,11 @@ impl DiscoveryDB {
     };
     // Newer data than any in the attic
     self.external_topic_writers_attic.remove(&guid);
+    self.note_default_locators_used(
+      guid,
+      &data.writer_proxy.unicast_locator_list,
+      &data.writer_proxy.multicast_locator_list,
+    );
 
     // Build enriched data with participant's default locators filled in, so that
     // later lookups via writers_on_topic() return usable locator information.
@@ -547,6 +600,26 @@ impl DiscoveryDB {
     );
 
     Some(enriched)
+  }
+
+  // Remembers which locator lists of a remote reader or writer, as announced,
+  // are empty, so that the endpoint gets the default locators of its
+  // participant.
+  fn note_default_locators_used(
+    &mut self,
+    guid: GUID,
+    announced_unicast: &[Locator],
+    announced_multicast: &[Locator],
+  ) {
+    let used = DefaultLocatorsUsed {
+      unicast: announced_unicast.is_empty(),
+      multicast: announced_multicast.is_empty(),
+    };
+    if used.unicast || used.multicast {
+      self.default_locators_used.insert(guid, used);
+    } else {
+      self.default_locators_used.remove(&guid);
+    }
   }
 
   // The readers and writers of this participant that are in the attic. Call
@@ -1067,6 +1140,94 @@ mod tests {
       "the writer of the returned participant was not handed out for matching"
     );
     assert!(reader_known(&db, &reader) && writer_known(&db, &writer));
+  }
+
+  // A reader or writer that announces no locators is reached at the default
+  // locators of its participant. A participant that returns after a timeout
+  // may announce new ones, e.g. because its address changed. Its endpoints
+  // are then reached there, and no longer at the old locators.
+  #[test]
+  fn discdb_endpoints_of_a_returning_participant_use_its_new_default_locators() {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let locator = |host: u8, port: u16| {
+      Locator::from(SocketAddr::new(Ipv4Addr::new(192, 0, 2, host).into(), port))
+    };
+    let multicast = |group: u8| {
+      Locator::from(SocketAddr::new(
+        Ipv4Addr::new(239, 255, 0, group).into(),
+        7401,
+      ))
+    };
+    let participant_at = |prefix, host: u8, group: u8| {
+      let mut data = participant_data(prefix);
+      data.default_unicast_locators = vec![locator(host, 7411)];
+      data.default_multicast_locators = vec![multicast(group)];
+      data
+    };
+
+    let mut db = empty_db();
+    let prefix = GuidPrefix::new(b"moving_partc");
+    // The reader announces no locators. The writer announces a unicast locator
+    // of its own, and no multicast locators.
+    let reader = reader_of(prefix);
+    let mut writer = writer_of(prefix);
+    let writers_own = locator(77, 7477);
+    writer.writer_proxy.unicast_locator_list = vec![writers_own];
+
+    db.update_participant(&participant_at(prefix, 1, 1));
+    let entered_reader = db.update_subscription(&reader).unwrap();
+    let entered_writer = db.update_publication(&writer).unwrap();
+    assert_eq!(
+      (
+        &entered_reader.reader_proxy.unicast_locator_list,
+        &entered_reader.reader_proxy.multicast_locator_list,
+        &entered_writer.writer_proxy.unicast_locator_list,
+        &entered_writer.writer_proxy.multicast_locator_list,
+      ),
+      (
+        &vec![locator(1, 7411)],
+        &vec![multicast(1)],
+        &vec![writers_own],
+        &vec![multicast(1)],
+      )
+    );
+
+    db.remove_participant(prefix, false); // false = timed out
+    db.update_participant(&participant_at(prefix, 2, 2));
+    let (readers, writers) = db.restore_endpoints_from_attic(prefix);
+
+    let reader_locators: Vec<_> = readers
+      .iter()
+      .chain(db.get_all_external_topic_readers())
+      .map(|r| {
+        (
+          r.reader_proxy.unicast_locator_list.clone(),
+          r.reader_proxy.multicast_locator_list.clone(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      reader_locators,
+      vec![(vec![locator(2, 7411)], vec![multicast(2)]); 2],
+      "the reader kept the default locators its participant had before it timed out"
+    );
+    let writer_locators: Vec<_> = writers
+      .iter()
+      .chain(db.get_all_external_topic_writers())
+      .map(|w| {
+        (
+          w.writer_proxy.unicast_locator_list.clone(),
+          w.writer_proxy.multicast_locator_list.clone(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      writer_locators,
+      vec![(vec![writers_own], vec![multicast(2)]); 2],
+      "the writer lost its own unicast locator, or kept the default multicast locators its \
+       participant had before it timed out"
+    );
   }
 
   // An endpoint that is disposed over SEDP while its participant is timed out
