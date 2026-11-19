@@ -611,6 +611,25 @@ pub struct PublicationMatchedStatus {
   pub current: CountWithChange,
 }
 
+/// The SUBSCRIPTION_MATCHED status of a DataReader: how many DataWriters it is
+/// matched with, that is, receives samples from.
+///
+/// Returned by `DataReader::get_subscription_matched_status`. Each
+/// `count_change()` is the change since the status was last read from the same
+/// DataReader.
+///
+/// See the tables of Section 2.2.4.1 in DDS Specification v1.4. Its
+/// `last_publication_handle` is not included: the
+/// [`DataReaderStatus::SubscriptionMatched`] status event names the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionMatchedStatus {
+  /// How many matches with a DataWriter there have been since the DataReader
+  /// was created. This never decreases.
+  pub total: CountWithChange,
+  /// How many DataWriters the DataReader is matched with now.
+  pub current: CountWithChange,
+}
+
 /// How many remote endpoints a DataWriter or DataReader is matched with: the
 /// counts of the PUBLICATION_MATCHED and SUBSCRIPTION_MATCHED statuses.
 ///

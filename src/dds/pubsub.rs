@@ -1133,6 +1133,8 @@ impl InnerSubscriber {
     let (send, rec) = crate::mio_source::notification_channel(4);
     // status change channel from Reader to DataReader
     let (status_sender, status_receiver) = sync_status_channel::<DataReaderStatus>(4)?;
+    // The Reader's matched-writer counts, for `get_subscription_matched_status`.
+    let matched_counts = Arc::new(MatchedCounts::default());
 
     // reader command channel from Datareader to Reader.
     // Capacity 0 is a rendezvous, matching the previous mio-extras channel: the
@@ -1236,6 +1238,7 @@ impl InnerSubscriber {
       guid: reader_guid,
       notification_sender: send,
       status_sender,
+      matched_counts: Arc::clone(&matched_counts),
       topic_name: topic.name(),
       topic_cache_handle: topic_cache_handle.clone(),
       like_stateless: reader_like_stateless,
@@ -1318,6 +1321,7 @@ impl InnerSubscriber {
       topic_cache_handle,
       self.discovery_command.clone(),
       status_receiver,
+      matched_counts,
       reader_command_sender,
       data_reader_waker,
       poll_event_source,

@@ -1,4 +1,5 @@
-//! `DataWriter::get_publication_matched_status` between two participants.
+//! `DataWriter::get_publication_matched_status` and
+//! `DataReader::get_subscription_matched_status` between two participants.
 use std::time::{Duration, Instant};
 
 use rustdds::{policy, DomainParticipant, QosPolicyBuilder, TopicKind};
@@ -69,7 +70,7 @@ fn matched_status_follows_the_remote_endpoint() {
     .create_datareader_no_key_cdr::<Ping>(&topic_b, None)
     .unwrap();
 
-  // The writer reports the reader, with the change since its last read.
+  // Each side reports the other one, with the change since its last read.
   // Nothing here reads the status events.
   let on_writer = wait_for(|| {
     let status = writer.get_publication_matched_status();
@@ -82,6 +83,20 @@ fn matched_status_follows_the_remote_endpoint() {
   );
   assert_eq!(
     (on_writer.current.count(), on_writer.current.count_change()),
+    (1, 1)
+  );
+
+  let on_reader = wait_for(|| {
+    let status = reader.get_subscription_matched_status();
+    (status.current.count() > 0).then_some(status)
+  })
+  .expect("the reader never reported a matched writer");
+  assert_eq!(
+    (on_reader.total.count(), on_reader.total.count_change()),
+    (1, 1)
+  );
+  assert_eq!(
+    (on_reader.current.count(), on_reader.current.count_change()),
     (1, 1)
   );
 

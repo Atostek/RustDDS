@@ -105,6 +105,8 @@ pub struct SimpleDataReader<D: Keyed, DA: DeserializerAdapter<D> = CDRDeserializ
 
   discovery_command: WakeSender<DiscoveryCommand>,
   status_receiver: StatusChannelReceiver<DataReaderStatus>,
+  /// How many writers the RTPS Reader is matched with.
+  matched: MatchedCountsView,
 
   #[allow(dead_code)] // TODO: This is currently unused, because we do not implement
   // resetting deadline missed status. Remove attribute when it is supported.
@@ -152,6 +154,7 @@ where
     topic_cache: Arc<Mutex<TopicCache>>,
     discovery_command: WakeSender<DiscoveryCommand>,
     status_receiver: StatusChannelReceiver<DataReaderStatus>,
+    matched_counts: Arc<MatchedCounts>,
     reader_command: BoundSender<ReaderCommand>,
     data_reader_waker: Arc<Mutex<Option<Waker>>>,
     event_source: PollEventSource,
@@ -190,6 +193,7 @@ where
       deserializer_type: PhantomData,
       discovery_command,
       status_receiver,
+      matched: MatchedCountsView::new(matched_counts),
       reader_command,
       data_reader_waker,
       event_source,
@@ -407,6 +411,21 @@ where
 
   pub fn topic(&self) -> &Topic {
     &self.my_topic
+  }
+
+  /// Reads the SUBSCRIPTION_MATCHED status of this DataReader: how many
+  /// DataWriters it is matched with now, and how many matches there have been
+  /// since it was created.
+  ///
+  /// The counts are those of the RTPS Reader itself. They do not come from the
+  /// status event stream, so they are right also when nothing reads that
+  /// stream and it has dropped events. Each `count_change()` is the change
+  /// since the previous call on this DataReader.
+  ///
+  /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
+  pub fn get_subscription_matched_status(&self) -> SubscriptionMatchedStatus {
+    let (total, current) = self.matched.read();
+    SubscriptionMatchedStatus { total, current }
   }
 
   pub fn as_async_stream<S>(&self) -> SimpleDataReaderStream<'_, D, S, DA>

@@ -13,7 +13,7 @@ use crate::{
     qos::{HasQoSPolicy, QosPolicies},
     readcondition::ReadCondition,
     result::ReadResult,
-    statusevents::DataReaderStatus,
+    statusevents::{DataReaderStatus, SubscriptionMatchedStatus},
     with_key::{
       datareader as datareader_with_key,
       datasample::{DataSample as WithKeyDataSample, Sample},
@@ -421,6 +421,43 @@ where
     self.keyed_datareader.get_requested_deadline_missed_status()
   }
   */
+
+  /// Reads the SUBSCRIPTION_MATCHED status of this DataReader: how many
+  /// DataWriters it is matched with now, and how many matches there have been
+  /// since it was created.
+  ///
+  /// The counts are those of the RTPS Reader itself. They do not come from the
+  /// status event stream, so they are right also when nothing reads that
+  /// stream and it has dropped events. Each `count_change()` is the change
+  /// since the previous call on this DataReader.
+  ///
+  /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// # use serde::{Serialize, Deserialize};
+  /// # use rustdds::*;
+  /// # use rustdds::no_key::DataReader;
+  /// # use rustdds::serialization::CDRDeserializerAdapter;
+  /// #
+  /// let domain_participant = DomainParticipant::new(0).unwrap();
+  /// let qos = QosPolicyBuilder::new().build();
+  /// let subscriber = domain_participant.create_subscriber(&qos).unwrap();
+  ///
+  /// #[derive(Serialize, Deserialize)]
+  /// struct SomeType {}
+  ///
+  /// // NoKey is important
+  /// let topic = domain_participant.create_topic("some_topic".to_string(), "SomeType".to_string(), &qos, TopicKind::NoKey).unwrap();
+  /// let data_reader = subscriber.create_datareader_no_key::<SomeType, CDRDeserializerAdapter<_>>(&topic, None).unwrap();
+  ///
+  /// let matched = data_reader.get_subscription_matched_status();
+  /// println!("{} writers now, {} ever", matched.current.count(), matched.total.count());
+  /// ```
+  pub fn get_subscription_matched_status(&self) -> SubscriptionMatchedStatus {
+    self.keyed_datareader.get_subscription_matched_status()
+  }
 
   /// An async stream for reading the (bare) data samples
   pub fn async_bare_sample_stream(self) -> BareDataReaderStream<D, DA> {

@@ -87,6 +87,22 @@ where
     self.keyed_simpledatareader.guid()
   }
 
+  /// Reads the SUBSCRIPTION_MATCHED status of this DataReader: how many
+  /// DataWriters it is matched with now, and how many matches there have been
+  /// since it was created.
+  ///
+  /// The counts are those of the RTPS Reader itself. They do not come from the
+  /// status event stream, so they are right also when nothing reads that
+  /// stream and it has dropped events. Each `count_change()` is the change
+  /// since the previous call on this DataReader.
+  ///
+  /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
+  pub fn get_subscription_matched_status(&self) -> SubscriptionMatchedStatus {
+    self
+      .keyed_simpledatareader
+      .get_subscription_matched_status()
+  }
+
   pub fn as_async_stream(
     &self,
   ) -> impl FusedStream<Item = ReadResult<DeserializedCacheChange<D>>> + '_

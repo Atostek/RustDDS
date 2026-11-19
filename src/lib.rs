@@ -219,6 +219,7 @@ pub use dds::{
   statusevents::{
     DataReaderStatus, DataWriterStatus, DomainParticipantStatusEvent, EndpointDescription,
     LostReason, ParticipantDescription, PublicationMatchedStatus, StatusEvented,
+    SubscriptionMatchedStatus,
   },
   topic::{Topic, TopicDescription, TopicKind},
   typedesc::TypeDesc,
