@@ -65,12 +65,17 @@ pub(crate) struct DiscoveryDB {
   external_topic_readers: BTreeMap<GUID, DiscoveredReaderData>,
   external_topic_writers: BTreeMap<GUID, DiscoveredWriterData>,
 
-  // The "attic": the readers and writers of a participant that was lost due to
-  // a time-out. They are not matched with local endpoints. They are kept
-  // because SEDP does not deliver them a second time. When the participant is
-  // discovered again, restore_endpoints_from_attic() enters them and returns
-  // them for matching. A dispose of the participant, or of the endpoint, drops
-  // them.
+  // The "attic": remote readers and writers whose participant is not in
+  // participant_proxies. Endpoints belong to a discovered participant (RTPS
+  // 2.5 8.5.4.1, 8.5.5), so these are not matched with local endpoints.
+  // - The endpoints of a participant that timed out are moved here.
+  // - An endpoint whose SEDP sample Discovery processes while its participant
+  //   is not known is entered here, e.g. because the participant was disposed
+  //   or timed out after the sample was received.
+  // They are kept because SEDP does not deliver them a second time. When the
+  // participant is discovered (again), restore_endpoints_from_attic() enters
+  // them and returns them for matching. A dispose of the participant, or of
+  // the endpoint, drops them.
   external_topic_readers_attic: BTreeMap<GUID, DiscoveredReaderData>,
   external_topic_writers_attic: BTreeMap<GUID, DiscoveredWriterData>,
 
@@ -430,32 +435,36 @@ impl DiscoveryDB {
   // them from the remote participant.
   //
   // The topic is updated to the topics table.
-  pub fn update_subscription(&mut self, data: &DiscoveredReaderData) -> DiscoveredReaderData {
+  //
+  // If the remote participant is not known, the reader is kept in the attic
+  // until the participant is discovered, and None is returned: it must not be
+  // matched yet. See restore_endpoints_from_attic().
+  pub fn update_subscription(
+    &mut self,
+    data: &DiscoveredReaderData,
+  ) -> Option<DiscoveredReaderData> {
     let guid = data.reader_proxy.remote_reader_guid;
 
     // fill in the default locators from participant, in case DRD did not provide
     // any
-    let default_locator_lists = self
-      .find_participant_proxy(guid.prefix)
-      .map(|pp| {
-        debug!("Added participant locators to Reader {guid:?}");
-        (
-          pp.default_unicast_locators.clone(),
-          pp.default_multicast_locators.clone(),
-        )
-      })
-      .unwrap_or_else(|| {
-        if guid.prefix != GuidPrefix::UNKNOWN {
-          // This is normal, since we might not know about the participant yet.
-          debug!(
-            "No remote participant known for {:?}\nSearched with {:?} in {:?}",
-            data,
-            guid.prefix,
-            self.participant_proxies.keys()
-          );
-        }
-        (Vec::default(), Vec::default())
-      });
+    let Some(default_locator_lists) = self.find_participant_proxy(guid.prefix).map(|pp| {
+      debug!("Added participant locators to Reader {guid:?}");
+      (
+        pp.default_unicast_locators.clone(),
+        pp.default_multicast_locators.clone(),
+      )
+    }) else {
+      // The participant may not be known yet, or it may be gone already. A
+      // reader matched now would then never be removed again.
+      debug!(
+        "No remote participant known for Reader {guid:?}. Keeping it until the participant is \
+         discovered."
+      );
+      self.external_topic_readers_attic.insert(guid, data.clone());
+      return None;
+    };
+    // Newer data than any in the attic
+    self.external_topic_readers_attic.remove(&guid);
 
     // Build enriched data with participant's default locators filled in, so that
     // later lookups via readers_on_topic() return usable locator information.
@@ -483,36 +492,37 @@ impl DiscoveryDB {
     // reader update. If there is a DiscoveredVia::Topic record, use QosPolicies
     // from that record and modify by QoS given in the DRD.
 
-    enriched
+    Some(enriched)
   }
 
   // TODO: This is silly. Returns one of the parameters cloned, or None
-  pub fn update_publication(&mut self, data: &DiscoveredWriterData) -> DiscoveredWriterData {
+  //
+  // As update_subscription(), a writer of an unknown participant is kept in the
+  // attic until the participant is discovered, and None is returned.
+  pub fn update_publication(
+    &mut self,
+    data: &DiscoveredWriterData,
+  ) -> Option<DiscoveredWriterData> {
     let guid = data.writer_proxy.remote_writer_guid;
 
     // fill in the default locators from participant, in case DRD did not provide
     // any
-    let default_locator_lists = self
-      .find_participant_proxy(guid.prefix)
-      .map(|pp| {
-        debug!("Added participant locators to Writer {guid:?}");
-        (
-          pp.default_unicast_locators.clone(),
-          pp.default_multicast_locators.clone(),
-        )
-      })
-      .unwrap_or_else(|| {
-        if guid.prefix != GuidPrefix::UNKNOWN {
-          // This is normal, since we might not know about the participant yet.
-          debug!(
-            "No remote participant known for {:?}\nSearched with {:?} in {:?}",
-            data,
-            guid.prefix,
-            self.participant_proxies.keys()
-          );
-        }
-        (Vec::default(), Vec::default())
-      });
+    let Some(default_locator_lists) = self.find_participant_proxy(guid.prefix).map(|pp| {
+      debug!("Added participant locators to Writer {guid:?}");
+      (
+        pp.default_unicast_locators.clone(),
+        pp.default_multicast_locators.clone(),
+      )
+    }) else {
+      debug!(
+        "No remote participant known for Writer {guid:?}. Keeping it until the participant is \
+         discovered."
+      );
+      self.external_topic_writers_attic.insert(guid, data.clone());
+      return None;
+    };
+    // Newer data than any in the attic
+    self.external_topic_writers_attic.remove(&guid);
 
     // Build enriched data with participant's default locators filled in, so that
     // later lookups via writers_on_topic() return usable locator information.
@@ -536,7 +546,7 @@ impl DiscoveryDB {
       DiscoveredVia::Publication,
     );
 
-    enriched
+    Some(enriched)
   }
 
   // The readers and writers of this participant that are in the attic. Call
@@ -552,11 +562,11 @@ impl DiscoveryDB {
     }
     let readers = remove_by_guid_prefix(guid_prefix, &mut self.external_topic_readers_attic)
       .iter()
-      .map(|drd| self.update_subscription(drd))
+      .filter_map(|drd| self.update_subscription(drd))
       .collect();
     let writers = remove_by_guid_prefix(guid_prefix, &mut self.external_topic_writers_attic)
       .iter()
-      .map(|dwd| self.update_publication(dwd))
+      .filter_map(|dwd| self.update_publication(dwd))
       .collect();
     (readers, writers)
   }
@@ -961,6 +971,66 @@ mod tests {
       .any(|w| w.writer_proxy.remote_writer_guid == writer.writer_proxy.remote_writer_guid)
   }
 
+  // An endpoint that SEDP announces while its participant is not known, i.e.
+  // before the participant's SPDP data or after the participant was removed,
+  // is not entered until the participant is discovered, and it is dropped with
+  // the participant.
+  #[test]
+  fn discdb_endpoints_wait_for_their_participant() {
+    let mut db = empty_db();
+    let reader = |prefix: &[u8; 12]| reader_of(GuidPrefix::new(prefix));
+    let writer = |prefix: &[u8; 12]| writer_of(GuidPrefix::new(prefix));
+
+    // SEDP before SPDP: the endpoints wait for their participant.
+    let (early_reader, early_writer) = (reader(b"early_partcp"), writer(b"early_partcp"));
+    let early = early_reader.reader_proxy.remote_reader_guid.prefix;
+    assert!(db.update_subscription(&early_reader).is_none());
+    assert!(db.update_publication(&early_writer).is_none());
+    assert!(!reader_known(&db, &early_reader) && !writer_known(&db, &early_writer));
+    assert_eq!(
+      db.restore_endpoints_from_attic(early),
+      (vec![], vec![]),
+      "endpoints were released while their participant is unknown"
+    );
+    db.update_participant(&participant_data(early));
+    let (readers, writers) = db.restore_endpoints_from_attic(early);
+    assert_eq!(readers.len(), 1);
+    assert_eq!(writers.len(), 1);
+    assert!(reader_known(&db, &early_reader) && writer_known(&db, &early_writer));
+    // The participant is known now, so updates are entered at once.
+    assert!(db.update_subscription(&early_reader).is_some());
+    assert!(db.update_publication(&early_writer).is_some());
+
+    // SEDP after the participant was removed: the endpoints are not entered.
+    let (late_reader, late_writer) = (reader(b"late_partcpt"), writer(b"late_partcpt"));
+    let late = late_reader.reader_proxy.remote_reader_guid.prefix;
+    db.update_participant(&participant_data(late));
+    db.remove_participant(late, true);
+    assert!(db.update_subscription(&late_reader).is_none());
+    assert!(db.update_publication(&late_writer).is_none());
+    assert!(!reader_known(&db, &late_reader) && !writer_known(&db, &late_writer));
+
+    // A participant removed while its endpoints wait takes them with it.
+    let (gone_reader, gone_writer) = (reader(b"gone_partcpt"), writer(b"gone_partcpt"));
+    let gone = gone_reader.reader_proxy.remote_reader_guid.prefix;
+    assert!(db.update_subscription(&gone_reader).is_none());
+    assert!(db.update_publication(&gone_writer).is_none());
+    db.remove_participant(gone, true);
+    db.update_participant(&participant_data(gone));
+    assert_eq!(db.restore_endpoints_from_attic(gone), (vec![], vec![]));
+    assert!(!reader_known(&db, &gone_reader) && !writer_known(&db, &gone_writer));
+
+    // An endpoint disposed over SEDP while it waits is dropped too.
+    let (disposed_reader, disposed_writer) = (reader(b"disp_partcpt"), writer(b"disp_partcpt"));
+    let disposed = disposed_reader.reader_proxy.remote_reader_guid.prefix;
+    assert!(db.update_subscription(&disposed_reader).is_none());
+    assert!(db.update_publication(&disposed_writer).is_none());
+    db.remove_topic_reader(disposed_reader.reader_proxy.remote_reader_guid);
+    db.remove_topic_writer(disposed_writer.writer_proxy.remote_writer_guid);
+    db.update_participant(&participant_data(disposed));
+    assert_eq!(db.restore_endpoints_from_attic(disposed), (vec![], vec![]));
+  }
+
   // SEDP does not deliver the endpoints of a participant a second time, so
   // the endpoints of a participant that timed out are kept. When the
   // participant is discovered again, they are entered again and returned, so
@@ -1193,7 +1263,8 @@ mod tests {
     assert_eq!(discovery_db.get_all_external_topic_readers().count(), 0);
     assert_eq!(discovery_db.get_all_external_topic_writers().count(), 0);
 
-    // Discover one external Reader via SEDP subscription data.
+    // Discover one external Reader via SEDP subscription data. Its participant
+    // has to be known first.
     let reader = reader_proxy_data().unwrap();
     let reader_sub = subscription_builtin_topic_data().unwrap();
     let dreader = DiscoveredReaderData {
@@ -1202,6 +1273,9 @@ mod tests {
       content_filter: None,
       user_data: Vec::new(),
     };
+    discovery_db.update_participant(&participant_data(
+      dreader.reader_proxy.remote_reader_guid.prefix,
+    ));
     discovery_db.update_subscription(&dreader);
 
     // Discover one external Writer via SEDP publication data.
@@ -1222,6 +1296,7 @@ mod tests {
       .create_datawriter::<RandomData, CDRSerializerAdapter<RandomData, LittleEndian>>(&topic, None)
       .unwrap();
     let writer_data = DiscoveredWriterData::new(&dw, &topic, &domain_participant, None);
+    discovery_db.update_participant(&participant_data(domain_participant.guid_prefix()));
     discovery_db.update_publication(&writer_data);
 
     // Both accessors return the discovered endpoints as a snapshot.
