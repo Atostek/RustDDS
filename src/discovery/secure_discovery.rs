@@ -420,7 +420,9 @@ impl SecureDiscovery {
         reader_data.reader_proxy.remote_reader_guid.prefix,
       ),
       Sample::Dispose(reader_guid) => {
-        if let Some(reader) = discovery_db_read(discovery_db).get_topic_reader(reader_guid) {
+        if let Some(reader) =
+          discovery_db_read(discovery_db).get_disposable_topic_reader(reader_guid)
+        {
           // We do know a reader with this guid
           (
             reader.subscription_topic_data.topic_name().clone(),
@@ -592,7 +594,9 @@ impl SecureDiscovery {
         writer_data.writer_proxy.remote_writer_guid.prefix,
       ),
       Sample::Dispose(writer_guid) => {
-        if let Some(writer) = discovery_db_read(discovery_db).get_topic_writer(writer_guid) {
+        if let Some(writer) =
+          discovery_db_read(discovery_db).get_disposable_topic_writer(writer_guid)
+        {
           // We do know a writer with this guid
           (
             writer.publication_topic_data.topic_name().clone(),
@@ -978,7 +982,9 @@ impl SecureDiscovery {
           .prefix,
       ),
       Sample::Dispose(reader_guid) => {
-        if let Some(reader) = discovery_db_read(discovery_db).get_topic_reader(reader_guid) {
+        if let Some(reader) =
+          discovery_db_read(discovery_db).get_disposable_topic_reader(reader_guid)
+        {
           // We do know a reader with this guid
           (
             reader.subscription_topic_data.topic_name().clone(),
@@ -1101,7 +1107,9 @@ impl SecureDiscovery {
           .prefix,
       ),
       Sample::Dispose(writer_guid) => {
-        if let Some(writer) = discovery_db_read(discovery_db).get_topic_writer(writer_guid) {
+        if let Some(writer) =
+          discovery_db_read(discovery_db).get_disposable_topic_writer(writer_guid)
+        {
           // We do know a writer with this guid
           (
             writer.publication_topic_data.topic_name().clone(),
@@ -1360,7 +1368,14 @@ impl SecureDiscovery {
     // DP event loop. This will result in matching the builtin
     // ParticipantStatelessMessage endpoints, which are used for exchanging
     // authentication messages.
-    discovery_db_write(discovery_db).update_participant(participant_data);
+    {
+      let mut db = discovery_db_write(discovery_db);
+      db.update_participant(participant_data);
+      // If the participant returns after a timeout, the readers and writers it
+      // had stay in the attic of the DiscoveryDB for now. Once it is
+      // authenticated, Discovery::process_discovered_participant_data()
+      // processes them as new SEDP data, which checks them again.
+    }
     self.update_participant_authentication_status_and_notify_dp(
       remote_guid.prefix,
       AuthenticationStatus::Authenticating,

@@ -1056,13 +1056,38 @@ impl Discovery {
     &mut self,
     participant_data: &SpdpDiscoveredParticipantData,
   ) {
-    let was_new = discovery_db_write(&self.discovery_db).update_participant(participant_data);
     let guid_prefix = participant_data.participant_guid.prefix;
+    // Readers and writers kept in the attic while this participant was not
+    // known, e.g. since it timed out
+    let (was_new, (readers, writers)) = {
+      let mut db = discovery_db_write(&self.discovery_db);
+      let was_new = db.update_participant(participant_data);
+      (was_new, db.take_endpoints_from_attic(guid_prefix))
+    };
 
     // Send notification to dp_event_loop. It will update local reader/writer
     // proxies as the SpdpDiscoveredParticipantData contains a bitmap of the
     // available built-in endpoints.
     self.send_discovery_notification(DiscoveryNotificationType::ParticipantUpdated { guid_prefix });
+
+    // SEDP does not deliver them again, so they are processed as if it did
+    // now. With security, that checks them again: what Discovery accepted
+    // before the participant was lost does not count, since the participant
+    // may e.g. be unauthenticated now, or have other permissions.
+    for reader in readers {
+      debug!(
+        "Participant {guid_prefix:?} discovered, processing its reader {:?}",
+        reader.reader_proxy.remote_reader_guid
+      );
+      self.process_subscription_sample(Sample::Value(reader), None);
+    }
+    for writer in writers {
+      debug!(
+        "Participant {guid_prefix:?} discovered, processing its writer {:?}",
+        writer.writer_proxy.remote_writer_guid
+      );
+      self.process_publication_sample(Sample::Value(writer));
+    }
 
     if was_new {
       // Inform DDS Applications
@@ -1197,52 +1222,67 @@ impl Discovery {
       };
 
     for d in drds {
-      #[cfg(not(feature = "security"))]
-      let permission = NormalDiscoveryPermission::Allow;
+      self.process_subscription_sample(d, read_history);
+    }
+  }
 
-      #[cfg(feature = "security")]
-      let permission = if let Some(security) = self.security_opt.as_mut() {
-        // Security is enabled. Do a secure read
-        security.check_nonsecure_subscription_read(&d, &self.discovery_db)
-      } else {
-        // No security configured, always allowed
-        NormalDiscoveryPermission::Allow
-      };
+  // A sample of DCPSSubscription: a remote reader is entered into the
+  // DiscoveryDB and announced to the local writers, or it is removed.
+  fn process_subscription_sample(
+    &mut self,
+    d: Sample<DiscoveredReaderData, GUID>,
+    read_history: Option<GuidPrefix>,
+  ) {
+    #[cfg(not(feature = "security"))]
+    let permission = NormalDiscoveryPermission::Allow;
 
-      if permission == NormalDiscoveryPermission::Allow {
-        match d {
-          Sample::Value(d) => {
-            trace!("sedp_receive_subscription - {d:?}");
-            let drd = discovery_db_write(&self.discovery_db).update_subscription(&d);
-            debug!(
-              "sedp_receive_subscription - send_discovery_notification ReaderUpdated  {:?}",
-              drd
+    #[cfg(feature = "security")]
+    let permission = if let Some(security) = self.security_opt.as_mut() {
+      // Security is enabled. Do a secure read
+      security.check_nonsecure_subscription_read(&d, &self.discovery_db)
+    } else {
+      // No security configured, always allowed
+      NormalDiscoveryPermission::Allow
+    };
+
+    if permission == NormalDiscoveryPermission::Allow {
+      match d {
+        Sample::Value(d) => {
+          trace!("sedp_receive_subscription - {d:?}");
+          let drd = discovery_db_write(&self.discovery_db).update_subscription(&d);
+          let Some(drd) = drd else {
+            // Its participant is not known. The reader is matched if the
+            // participant is discovered (again).
+            return;
+          };
+          debug!(
+            "sedp_receive_subscription - send_discovery_notification ReaderUpdated  {:?}",
+            drd
+          );
+          self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
+            discovered_reader_data: drd,
+          });
+          if read_history == Some(d.reader_proxy.remote_reader_guid.prefix) {
+            info!(
+              "Rediscovered reader {:?} topic={:?}",
+              d.reader_proxy.remote_reader_guid,
+              d.subscription_topic_data.topic_name()
             );
-            self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
-              discovered_reader_data: drd,
-            });
-            if read_history == Some(d.reader_proxy.remote_reader_guid.prefix) {
-              info!(
-                "Rediscovered reader {:?} topic={:?}",
-                d.reader_proxy.remote_reader_guid,
-                d.subscription_topic_data.topic_name()
-              );
-            }
-          }
-          Sample::Dispose(reader_key) => {
-            info!("Dispose Reader {reader_key:?}");
-            discovery_db_write(&self.discovery_db).remove_topic_reader(reader_key);
-            self.send_discovery_notification(DiscoveryNotificationType::ReaderLost {
-              reader_guid: reader_key,
-            });
-            self.send_participant_status(DomainParticipantStatusEvent::ReaderLost {
-              guid: reader_key,
-              reason: LostReason::Disposed,
-            });
           }
         }
+        Sample::Dispose(reader_key) => {
+          info!("Dispose Reader {reader_key:?}");
+          discovery_db_write(&self.discovery_db).remove_topic_reader(reader_key);
+          self.send_discovery_notification(DiscoveryNotificationType::ReaderLost {
+            reader_guid: reader_key,
+          });
+          self.send_participant_status(DomainParticipantStatusEvent::ReaderLost {
+            guid: reader_key,
+            reason: LostReason::Disposed,
+          });
+        }
       }
-    } // loop
+    }
   }
 
   pub fn sedp_receive_publication(&mut self, read_history: Option<GuidPrefix>) {
@@ -1276,44 +1316,55 @@ impl Discovery {
       };
 
     for d in dwds {
-      #[cfg(not(feature = "security"))]
-      let permission = NormalDiscoveryPermission::Allow;
+      self.process_publication_sample(d);
+    }
+  }
 
-      #[cfg(feature = "security")]
-      let permission = if let Some(security) = self.security_opt.as_mut() {
-        // Security is enabled. Do a secure read
-        security.check_nonsecure_publication_read(&d, &self.discovery_db)
-      } else {
-        // No security configured, always allowed
-        NormalDiscoveryPermission::Allow
-      };
+  // A sample of DCPSPublication: a remote writer is entered into the
+  // DiscoveryDB and announced to the local readers, or it is removed.
+  fn process_publication_sample(&mut self, d: Sample<DiscoveredWriterData, GUID>) {
+    #[cfg(not(feature = "security"))]
+    let permission = NormalDiscoveryPermission::Allow;
 
-      if permission == NormalDiscoveryPermission::Allow {
-        match d {
-          Sample::Value(dwd) => {
-            trace!("sedp_receive_publication discovered {:?}", dwd);
-            let discovered_writer_data =
-              discovery_db_write(&self.discovery_db).update_publication(&dwd);
-            self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
-              discovered_writer_data,
-            });
-            debug!("Discovered Writer {:?}", dwd);
-          }
-          Sample::Dispose(writer_key) => {
-            discovery_db_write(&self.discovery_db).remove_topic_writer(writer_key);
-            self.send_discovery_notification(DiscoveryNotificationType::WriterLost {
-              writer_guid: writer_key,
-            });
-            self.send_participant_status(DomainParticipantStatusEvent::WriterLost {
-              guid: writer_key,
-              reason: LostReason::Disposed,
-            });
+    #[cfg(feature = "security")]
+    let permission = if let Some(security) = self.security_opt.as_mut() {
+      // Security is enabled. Do a secure read
+      security.check_nonsecure_publication_read(&d, &self.discovery_db)
+    } else {
+      // No security configured, always allowed
+      NormalDiscoveryPermission::Allow
+    };
 
-            debug!("Disposed Writer {writer_key:?}");
-          }
+    if permission == NormalDiscoveryPermission::Allow {
+      match d {
+        Sample::Value(dwd) => {
+          trace!("sedp_receive_publication discovered {:?}", dwd);
+          let discovered_writer_data =
+            discovery_db_write(&self.discovery_db).update_publication(&dwd);
+          let Some(discovered_writer_data) = discovered_writer_data else {
+            // Its participant is not known. The writer is matched if the
+            // participant is discovered (again).
+            return;
+          };
+          self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
+            discovered_writer_data,
+          });
+          debug!("Discovered Writer {:?}", dwd);
+        }
+        Sample::Dispose(writer_key) => {
+          discovery_db_write(&self.discovery_db).remove_topic_writer(writer_key);
+          self.send_discovery_notification(DiscoveryNotificationType::WriterLost {
+            writer_guid: writer_key,
+          });
+          self.send_participant_status(DomainParticipantStatusEvent::WriterLost {
+            guid: writer_key,
+            reason: LostReason::Disposed,
+          });
+
+          debug!("Disposed Writer {writer_key:?}");
         }
       }
-    } // loop
+    }
   }
 
   // TODO: Try to remember why the read_history parameter below was introduced
@@ -1684,9 +1735,11 @@ impl Discovery {
             // Currently we use only the DiscoveredReaderData field, no DataTag
             let drd_from_topic = sec_sub.discovered_reader_data;
             let drd = discovery_db_write(&self.discovery_db).update_subscription(&drd_from_topic);
-            self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
-              discovered_reader_data: drd,
-            });
+            if let Some(drd) = drd {
+              self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
+                discovered_reader_data: drd,
+              });
+            }
           }
           Sample::Dispose(reader_guid) => {
             info!("Secure Dispose Reader {reader_guid:?}");
@@ -1731,9 +1784,11 @@ impl Discovery {
             // Currently we use only the DiscoveredWriterData field, no DataTag
             let dwd_from_topic = se_pub.discovered_writer_data;
             let dwd = discovery_db_write(&self.discovery_db).update_publication(&dwd_from_topic);
-            self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
-              discovered_writer_data: dwd,
-            });
+            if let Some(dwd) = dwd {
+              self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
+                discovered_writer_data: dwd,
+              });
+            }
           }
           Sample::Dispose(writer_guid) => {
             info!("Secure Dispose Writer {writer_guid:?}");
@@ -2171,8 +2226,8 @@ mod tests {
     test::{
       shape_type::ShapeType,
       test_data::{
-        create_cdr_pl_rtps_data_message, spdp_participant_msg_mod, spdp_publication_msg,
-        spdp_subscription_msg,
+        create_cdr_pl_rtps_data_message, spdp_participant_data, spdp_participant_msg_mod,
+        spdp_publication_msg, spdp_subscription_msg,
       },
       test_domain::test_domain_id,
     },
@@ -2611,6 +2666,14 @@ mod tests {
     let subscriptions_writer = GUID::new(other, EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER);
     let publications_writer = GUID::new(other, EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER);
 
+    // The observer knows the other participant. Endpoints of a participant it
+    // does not know are not matched (see
+    // sedp_reader_of_removed_participant_is_not_matched).
+    let mut other_data = spdp_participant_data().unwrap();
+    other_data.participant_guid = GUID::new(other, EntityId::PARTICIPANT);
+    other_data.lease_duration = Some(Duration::from_secs(60));
+    discovery_db_write(&observer.discovery_db()).update_participant(&other_data);
+
     // A reader and a writer that the observer knows and matches before the
     // new participant appears. Their dispose is pending below.
     add_pending_sedp_sample(
@@ -2771,6 +2834,779 @@ mod tests {
     assert!(
       reported.disposed(disposed_reader_guid) && reported.disposed(disposed_writer_guid),
       "the disposed reader and writer were not reported lost"
+    );
+  }
+
+  // A reader that SEDP announces is matched only while its participant is
+  // known.
+  //
+  // The SEDP readers deliver a sample only once its WriterProxy has received
+  // it, i.e. while the participant was known. But Discovery may process the
+  // sample after the participant was disposed (or timed out), e.g. when the
+  // SPDP dispose is handled first. Matching it then creates a ReaderProxy that
+  // nothing removes again: the participant is no longer there to be disposed
+  // or to time out. The proxy never acknowledges, so a reliable local writer
+  // never completes wait_for_acknowledgments() and stays on
+  // HEARTBEAT_PERIOD_FAST for the life of the process, with a multicast
+  // HEARTBEAT that every live reader answers ten times a second.
+  //
+  // If the participant is discovered again, its reader is matched.
+  #[test]
+  fn sedp_reader_of_removed_participant_is_not_matched() {
+    use std::{collections::BTreeSet, net::Ipv4Addr};
+
+    use serde::{Deserialize, Serialize};
+
+    use crate::{
+      dds::{qos::policy, statusevents::DataWriterStatus},
+      discovery::sedp_messages::{ReaderProxy, SubscriptionBuiltinTopicData},
+      rtps::Message,
+      structure::{guid::EntityKind, locator::Locator},
+      Keyed, StatusEvented, TopicKind,
+    };
+
+    #[derive(Serialize, Deserialize, Clone, Debug)]
+    struct Item {
+      key: i32,
+    }
+    impl Keyed for Item {
+      type K = i32;
+      fn key(&self) -> i32 {
+        self.key
+      }
+    }
+
+    const TOPIC: &str = "orphan_reader";
+    const TYPE: &str = "Item";
+    let domain_id = test_domain_id(44);
+    // The QoS of rt/ros_discovery_info
+    let qos = QosPolicyBuilder::new()
+      .reliability(policy::Reliability::Reliable {
+        max_blocking_time: crate::Duration::from_millis(100),
+      })
+      .durability(policy::Durability::TransientLocal)
+      .history(policy::History::KeepLast { depth: 1 })
+      .build();
+
+    let observer = DomainParticipant::new(domain_id).expect("participant creation");
+    let observer_db = observer.discovery_db();
+    let topic = observer
+      .create_topic(
+        TOPIC.to_string(),
+        TYPE.to_string(),
+        &qos,
+        TopicKind::WithKey,
+      )
+      .unwrap();
+    let publisher = observer.create_publisher(&qos).unwrap();
+    let local_writer = publisher
+      .create_datawriter_cdr::<Item>(&topic, None)
+      .unwrap();
+    local_writer.write(Item { key: 1 }, None).unwrap();
+
+    // A short-lived remote participant, which has a reliable reader on the
+    // topic. Nothing listens on its locators.
+    let remote = GuidPrefix::new(b"short_lived!");
+    let remote_known = || {
+      discovery_db_read(&observer_db)
+        .find_participant_proxy(remote)
+        .is_some()
+    };
+    let wait_until = |what: &str, condition: &dyn Fn() -> bool| {
+      let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+      while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(StdDuration::from_millis(10));
+      }
+    };
+    let mut participant_data = spdp_participant_data().unwrap();
+    participant_data.participant_guid = GUID::new(remote, EntityId::PARTICIPANT);
+    let nowhere = Locator::from(SocketAddr::new("127.0.0.1".parse().unwrap(), 9));
+    participant_data.metatraffic_unicast_locators = vec![nowhere];
+    participant_data.metatraffic_multicast_locators.clear();
+    participant_data.default_unicast_locators = vec![nowhere];
+    participant_data.default_multicast_locators.clear();
+    // Its lease does not run out during the test: it has to leave by the
+    // dispose below. If it timed out before the dispose is processed, the
+    // dispose would later drop its reader from the attic.
+    participant_data.lease_duration = Some(Duration::from_secs(600));
+    let spdp_writer = GUID::new(remote, EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER);
+    let participant_dispose = DDSData::new_disposed_by_key(
+      ChangeKind::NotAliveDisposed,
+      SerializedPayload::new_from_bytes(
+        RepresentationIdentifier::PL_CDR_LE,
+        Participant_GUID(participant_data.participant_guid)
+          .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
+          .unwrap(),
+      ),
+    );
+    let remote_reader = GUID::new(
+      remote,
+      EntityId::new([0, 0, 1], EntityKind::READER_WITH_KEY_USER_DEFINED),
+    );
+    let reader_data = DiscoveredReaderData {
+      reader_proxy: ReaderProxy::new(remote_reader, false, vec![], vec![]),
+      subscription_topic_data: SubscriptionBuiltinTopicData::new(
+        remote_reader,
+        None,
+        TOPIC.to_string(),
+        TYPE.to_string(),
+        &qos,
+        None,
+      ),
+      content_filter: None,
+      user_data: Vec::new(),
+    };
+
+    // The observer discovers the remote participant. A new participant's SPDP
+    // announcement wakes the observer's SPDP processing, which then takes the
+    // sample put into its SPDP reader here too.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PARTICIPANT,
+      spdp_writer,
+      1,
+      sedp_value(&participant_data),
+    );
+    let _newcomer = DomainParticipant::new(domain_id).expect("participant creation");
+    wait_until("the remote participant is discovered", &remote_known);
+
+    // The remote participant is disposed.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PARTICIPANT,
+      spdp_writer,
+      2,
+      participant_dispose,
+    );
+    let _newcomer = DomainParticipant::new(domain_id).expect("participant creation");
+    wait_until("the remote participant is disposed", &|| !remote_known());
+
+    // The remote participant's reader, received while the participant was
+    // known, is only now processed by Discovery.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_SUBSCRIPTION,
+      GUID::new(remote, EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER),
+      1,
+      sedp_value(&reader_data),
+    );
+
+    // HEARTBEATs of reliable user writers go to the user traffic multicast
+    // group.
+    let mut multicast = UDPListener::new_multicast(
+      "0.0.0.0",
+      user_traffic_multicast_port(domain_id),
+      Ipv4Addr::new(239, 255, 0, 1),
+    )
+    .expect("multicast listener");
+
+    // A local reader on the topic. Its SEDP announcement comes back through
+    // the observer's SEDP subscriptions reader and wakes Discovery, which then
+    // processes the remote reader too. The local reader is matched with the
+    // local writer and acknowledges its sample.
+    let subscriber = observer.create_subscriber(&qos).unwrap();
+    let local_reader = subscriber
+      .create_datareader_cdr::<Item>(&topic, None)
+      .unwrap();
+
+    let mut writer_status = Vec::new();
+    let matched = |status: &mut Vec<DataWriterStatus>, reader: GUID, timeout: StdDuration| {
+      let deadline = std::time::Instant::now() + timeout;
+      loop {
+        status.extend(std::iter::from_fn(|| local_writer.try_recv_status()));
+        let is_matched = status.iter().any(|s| {
+          matches!(s, DataWriterStatus::PublicationMatched { reader: r, current, .. }
+            if *r == reader && current.count_change() == 1)
+        });
+        if is_matched || std::time::Instant::now() >= deadline {
+          return is_matched;
+        }
+        std::thread::sleep(StdDuration::from_millis(20));
+      }
+    };
+    assert!(
+      matched(
+        &mut writer_status,
+        local_reader.guid(),
+        StdDuration::from_secs(10)
+      ),
+      "the local writer was not matched with the local reader"
+    );
+    let remote_reader_matched =
+      matched(&mut writer_status, remote_reader, StdDuration::from_secs(1));
+    let all_acked = local_writer
+      .wait_for_acknowledgments(StdDuration::from_secs(2))
+      .unwrap();
+
+    // Count the local writer's HEARTBEATs for two seconds. A HEARTBEAT is sent
+    // once per interface, with the same count.
+    multicast.messages_bounded(usize::MAX); // drop what came before
+    let mut heartbeat_counts = BTreeSet::new();
+    let window = StdDuration::from_secs(2);
+    let end = std::time::Instant::now() + window;
+    while std::time::Instant::now() < end {
+      for (datagram, _origin) in multicast.messages_bounded(usize::MAX) {
+        let Ok(message) = Message::read_from_buffer(&datagram) else {
+          continue;
+        };
+        if message.header.guid_prefix != observer.guid_prefix() {
+          continue;
+        }
+        for submessage in message.submessages {
+          if let SubmessageBody::Writer(WriterSubmessage::Heartbeat(hb, _)) = submessage.body {
+            if hb.writer_id == local_writer.guid().entity_id {
+              heartbeat_counts.insert(hb.count);
+            }
+          }
+        }
+      }
+      std::thread::sleep(StdDuration::from_millis(10));
+    }
+    let heartbeats_per_s = heartbeat_counts.len() as f64 / window.as_secs_f64();
+    let outcome = format!(
+      "local writer matched with the reader of the disposed participant: {remote_reader_matched}, \
+       all its samples acknowledged: {all_acked}, its HEARTBEATs/s after that: {heartbeats_per_s}"
+    );
+    eprintln!("{outcome}");
+    assert!(
+      !remote_reader_matched && all_acked && heartbeats_per_s < 2.0,
+      "{outcome}"
+    );
+
+    // The remote participant is discovered again: its reader is matched.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PARTICIPANT,
+      spdp_writer,
+      3,
+      sedp_value(&participant_data),
+    );
+    let _newcomer = DomainParticipant::new(domain_id).expect("participant creation");
+    assert!(
+      matched(
+        &mut writer_status,
+        remote_reader,
+        StdDuration::from_secs(10)
+      ),
+      "the reader was not matched when its participant was discovered again"
+    );
+  }
+
+  // A participant that times out and is discovered again gets its readers and
+  // writers matched again.
+  //
+  // Its SEDP samples are not delivered a second time, because the SEDP
+  // DataReaders have read them already. So the DiscoveryDB keeps the
+  // endpoints of a participant that timed out, and Discovery has to announce
+  // them to the local endpoints when the participant returns.
+  #[test]
+  fn endpoints_of_a_timed_out_participant_are_matched_again_when_it_returns() {
+    use crate::{
+      dds::statusevents::{DataReaderStatus, DataWriterStatus},
+      discovery::sedp_messages::{
+        PublicationBuiltinTopicData, ReaderProxy, SubscriptionBuiltinTopicData, WriterProxy,
+      },
+      structure::{guid::EntityKind, locator::Locator},
+      StatusEvented, TopicKind,
+    };
+
+    const TOPIC: &str = "returning";
+    let domain_id = test_domain_id(45);
+
+    let observer = DomainParticipant::new(domain_id).expect("participant creation");
+    let observer_db = observer.discovery_db();
+    let topic = observer
+      .create_topic(
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        &QosPolicies::qos_none(),
+        TopicKind::WithKey,
+      )
+      .unwrap();
+    let publisher = observer.create_publisher(&QosPolicies::qos_none()).unwrap();
+    let local_writer = publisher
+      .create_datawriter_cdr::<ShapeType>(&topic, None)
+      .unwrap();
+    let subscriber = observer
+      .create_subscriber(&QosPolicies::qos_none())
+      .unwrap();
+    let local_reader = subscriber
+      .create_datareader_cdr::<ShapeType>(&topic, None)
+      .unwrap();
+
+    // The remote participant, with a reader and a writer on the topic. Nothing
+    // listens on its locators, and it sends nothing, so it times out.
+    let remote = GuidPrefix::new(b"comes_back!!");
+    let remote_reader = GUID::new(
+      remote,
+      EntityId::new([0, 0, 1], EntityKind::READER_WITH_KEY_USER_DEFINED),
+    );
+    let remote_writer = GUID::new(
+      remote,
+      EntityId::new([0, 0, 2], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+    );
+    let mut participant_data = spdp_participant_data().unwrap();
+    participant_data.participant_guid = GUID::new(remote, EntityId::PARTICIPANT);
+    let nowhere = Locator::from(SocketAddr::new("127.0.0.1".parse().unwrap(), 9));
+    participant_data.metatraffic_unicast_locators = vec![nowhere];
+    participant_data.metatraffic_multicast_locators.clear();
+    participant_data.default_unicast_locators = vec![nowhere];
+    participant_data.default_multicast_locators.clear();
+    participant_data.lease_duration = Some(Duration::from_secs(1));
+    let reader_data = DiscoveredReaderData {
+      reader_proxy: ReaderProxy::new(remote_reader, false, vec![], vec![]),
+      subscription_topic_data: SubscriptionBuiltinTopicData::new(
+        remote_reader,
+        None,
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        &QosPolicies::qos_none(),
+        None,
+      ),
+      content_filter: None,
+      user_data: Vec::new(),
+    };
+    let writer_data = DiscoveredWriterData {
+      last_updated: std::time::Instant::now(),
+      writer_proxy: WriterProxy::new(remote_writer, vec![], vec![]),
+      publication_topic_data: PublicationBuiltinTopicData::new(
+        remote_writer,
+        None,
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        None,
+      ),
+      user_data: Vec::new(),
+    };
+
+    let remote_known = || {
+      discovery_db_read(&observer_db)
+        .find_participant_proxy(remote)
+        .is_some()
+    };
+    // How many times the local writer was matched with (change 1) or unmatched
+    // from (change -1) the remote reader so far, and the local reader with the
+    // remote writer
+    let mut writer_status = Vec::new();
+    let mut reader_status = Vec::new();
+    let mut matches = |change: i32| {
+      writer_status.extend(std::iter::from_fn(|| local_writer.try_recv_status()));
+      reader_status.extend(std::iter::from_fn(|| local_reader.try_recv_status()));
+      let with_reader = writer_status
+        .iter()
+        .filter(|s| {
+          matches!(s, DataWriterStatus::PublicationMatched { reader, current, .. }
+            if *reader == remote_reader && current.count_change() == change)
+        })
+        .count();
+      let with_writer = reader_status
+        .iter()
+        .filter(|s| {
+          matches!(s, DataReaderStatus::SubscriptionMatched { writer, current, .. }
+            if *writer == remote_writer && current.count_change() == change)
+        })
+        .count();
+      (with_reader, with_writer)
+    };
+    let wait_until = |what: &str, condition: &mut dyn FnMut() -> bool| {
+      let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+      while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(StdDuration::from_millis(20));
+      }
+    };
+
+    // The observer discovers the remote participant and its endpoints. A new
+    // participant's SPDP announcement wakes the observer's SPDP processing,
+    // which then takes the SPDP sample put into its reader here too, and with
+    // it the pending SEDP samples.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_SUBSCRIPTION,
+      GUID::new(remote, EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER),
+      1,
+      sedp_value(&reader_data),
+    );
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PUBLICATION,
+      GUID::new(remote, EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER),
+      1,
+      sedp_value(&writer_data),
+    );
+    let spdp_writer = GUID::new(remote, EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER);
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PARTICIPANT,
+      spdp_writer,
+      1,
+      sedp_value(&participant_data),
+    );
+    let _newcomer = DomainParticipant::new(domain_id).expect("participant creation");
+    wait_until(
+      "the remote participant's endpoints are matched",
+      &mut || matches(1) == (1, 1),
+    );
+
+    // The remote participant times out. Its endpoints are unmatched.
+    wait_until(
+      "the remote participant's endpoints are unmatched at its timeout",
+      &mut || !remote_known() && matches(-1) == (1, 1),
+    );
+
+    // The remote participant is discovered again.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PARTICIPANT,
+      spdp_writer,
+      2,
+      sedp_value(&participant_data),
+    );
+    let _newcomer = DomainParticipant::new(domain_id).expect("participant creation");
+    wait_until("the remote participant is discovered again", &mut || {
+      remote_known()
+    });
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(3);
+    while matches(1) != (2, 2) && std::time::Instant::now() < deadline {
+      std::thread::sleep(StdDuration::from_millis(20));
+    }
+    assert_eq!(
+      matches(1),
+      (2, 2),
+      "matches of the local writer with the remote reader, and of the local reader with the \
+       remote writer: they were not matched again when the participant returned"
+    );
+  }
+
+  // The topic of governance.p7s and permissions.p7s in
+  // examples/security_configuration_files/allow_unauthenticated/. It has read
+  // and write access control, and no discovery protection.
+  #[cfg(feature = "security")]
+  const PROTECTED_TOPIC: &str = "Protected";
+
+  // A participant with the built-in security plugins. Its governance document
+  // allows unauthenticated participants.
+  #[cfg(feature = "security")]
+  fn participant_with_security(domain_id: u16) -> DomainParticipant {
+    use crate::{DomainParticipantBuilder, DomainParticipantSecurityConfigFiles};
+
+    let config_files = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("examples/security_configuration_files");
+    let mut security =
+      DomainParticipantSecurityConfigFiles::with_ros_default_names(&config_files, String::new());
+    security.domain_governance_document = config_files.join("allow_unauthenticated/governance.p7s");
+    security.participant_permissions_document =
+      config_files.join("allow_unauthenticated/permissions.p7s");
+    DomainParticipantBuilder::new(domain_id)
+      .builtin_security(security)
+      .build()
+      .expect("participant creation")
+  }
+
+  // With DDS Security, a participant that returns after a timeout is checked
+  // anew, and it may no longer be what it was. Here it was authenticated, and
+  // it returns as a participant that cannot be authenticated, which this
+  // governance document allows. The reader and the writer that it had on a
+  // topic with access control must not be matched again: Discovery would not
+  // accept them if SEDP announced them now (DDS Security 1.1, 8.8.7.1).
+  //
+  // This shows that endpoints from the attic get the check for new SEDP data
+  // at all. It does not show which rule of the check rejects them: the check
+  // looks up the security attributes of the topic with the permissions handle
+  // of the remote participant, an unauthenticated participant has none, and
+  // the check rejects the endpoint there, before it comes to the access
+  // control of the topic.
+  #[cfg(feature = "security")]
+  #[test]
+  fn endpoints_of_a_participant_that_returns_unauthenticated_are_checked_again() {
+    use crate::{
+      dds::statusevents::{DataReaderStatus, DataWriterStatus},
+      discovery::sedp_messages::{
+        PublicationBuiltinTopicData, ReaderProxy, SubscriptionBuiltinTopicData, WriterProxy,
+      },
+      structure::{guid::EntityKind, locator::Locator},
+      StatusEvented, TopicKind,
+    };
+
+    const TOPIC: &str = PROTECTED_TOPIC;
+    let domain_id = test_domain_id(48);
+
+    let observer = participant_with_security(domain_id);
+    let observer_db = observer.discovery_db();
+    let topic = observer
+      .create_topic(
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        &QosPolicies::qos_none(),
+        TopicKind::WithKey,
+      )
+      .unwrap();
+    let publisher = observer.create_publisher(&QosPolicies::qos_none()).unwrap();
+    let local_writer = publisher
+      .create_datawriter_cdr::<ShapeType>(&topic, None)
+      .unwrap();
+    let subscriber = observer
+      .create_subscriber(&QosPolicies::qos_none())
+      .unwrap();
+    let local_reader = subscriber
+      .create_datareader_cdr::<ShapeType>(&topic, None)
+      .unwrap();
+    // Remote endpoints are matched only if they have the security attributes of
+    // the local ones.
+    let (writer_security, reader_security) = {
+      let db = discovery_db_read(&observer_db);
+      (
+        db.get_local_topic_writer(local_writer.guid())
+          .unwrap()
+          .publication_topic_data
+          .security_info()
+          .clone(),
+        db.get_local_topic_reader(local_reader.guid())
+          .unwrap()
+          .subscription_topic_data
+          .security_info()
+          .clone(),
+      )
+    };
+    assert!(writer_security.is_some() && reader_security.is_some());
+
+    // The remote participant, with a reader and a writer on the topic. Its SPDP
+    // data has no identity token, so it cannot be authenticated.
+    let remote = GuidPrefix::new(b"unauthentic.");
+    let remote_reader = GUID::new(
+      remote,
+      EntityId::new([0, 0, 1], EntityKind::READER_WITH_KEY_USER_DEFINED),
+    );
+    let remote_writer = GUID::new(
+      remote,
+      EntityId::new([0, 0, 2], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+    );
+    let mut participant_data = spdp_participant_data().unwrap();
+    assert!(participant_data.identity_token.is_none());
+    participant_data.participant_guid = GUID::new(remote, EntityId::PARTICIPANT);
+    let nowhere = Locator::from(SocketAddr::new("127.0.0.1".parse().unwrap(), 9));
+    participant_data.metatraffic_unicast_locators = vec![nowhere];
+    participant_data.metatraffic_multicast_locators.clear();
+    participant_data.default_unicast_locators = vec![nowhere];
+    participant_data.default_multicast_locators.clear();
+    let reader_data = DiscoveredReaderData {
+      reader_proxy: ReaderProxy::new(remote_reader, false, vec![], vec![]),
+      subscription_topic_data: SubscriptionBuiltinTopicData::new(
+        remote_reader,
+        None,
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        &QosPolicies::qos_none(),
+        writer_security,
+      ),
+      content_filter: None,
+      user_data: Vec::new(),
+    };
+    let writer_data = DiscoveredWriterData {
+      last_updated: std::time::Instant::now(),
+      writer_proxy: WriterProxy::new(remote_writer, vec![], vec![]),
+      publication_topic_data: PublicationBuiltinTopicData::new(
+        remote_writer,
+        None,
+        TOPIC.to_string(),
+        "ShapeType".to_string(),
+        reader_security,
+      ),
+      user_data: Vec::new(),
+    };
+
+    // The state after the remote participant was authenticated, Discovery
+    // accepted its reader and its writer, and it timed out.
+    {
+      let mut db = discovery_db_write(&observer_db);
+      db.update_participant(&participant_data);
+      assert!(db.update_subscription(&reader_data).is_some());
+      assert!(db.update_publication(&writer_data).is_some());
+      db.remove_participant(remote, false); // false = timed out
+    }
+
+    // The remote participant is discovered again. A new participant's SPDP
+    // announcement wakes the observer's SPDP processing, which then takes the
+    // SPDP sample put into its reader here too.
+    add_pending_sedp_sample(
+      &observer,
+      builtin_topic_names::DCPS_PARTICIPANT,
+      GUID::new(remote, EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER),
+      1,
+      sedp_value(&participant_data),
+    );
+    let _newcomer = DomainParticipant::new(domain_id).expect("participant creation");
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+    while discovery_db_read(&observer_db)
+      .find_participant_proxy(remote)
+      .is_none()
+    {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the remote participant was not discovered again"
+      );
+      std::thread::sleep(StdDuration::from_millis(20));
+    }
+
+    // Its reader and its writer are not matched, and not entered either.
+    std::thread::sleep(StdDuration::from_secs(1));
+    let matched_with_reader = std::iter::from_fn(|| local_writer.try_recv_status()).any(|s| {
+      matches!(s, DataWriterStatus::PublicationMatched { reader, .. } if reader == remote_reader)
+    });
+    let matched_with_writer = std::iter::from_fn(|| local_reader.try_recv_status()).any(|s| {
+      matches!(s, DataReaderStatus::SubscriptionMatched { writer, .. } if writer == remote_writer)
+    });
+    assert_eq!(
+      (matched_with_reader, matched_with_writer),
+      (false, false),
+      "the local writer was matched with the remote reader, or the local reader with the remote \
+       writer, on a topic with access control, although their participant is unauthenticated now"
+    );
+    let db = discovery_db_read(&observer_db);
+    assert_eq!(
+      (
+        db.get_all_external_topic_readers()
+          .filter(|r| r.reader_proxy.remote_reader_guid.prefix == remote)
+          .count(),
+        db.get_all_external_topic_writers()
+          .filter(|w| w.writer_proxy.remote_writer_guid.prefix == remote)
+          .count()
+      ),
+      (0, 0),
+      "endpoints of the unauthenticated participant on a topic with access control were entered"
+    );
+  }
+
+  // A participant that returns after a timeout is authenticated again, and
+  // its readers and writers stay in the attic until its DCPSParticipantsSecure
+  // data is processed. They are then checked again and entered. But a reader
+  // or a writer that the participant deletes before that does not come back:
+  // its dispose is processed although it is not among the entered endpoints
+  // then.
+  #[cfg(feature = "security")]
+  #[test]
+  fn endpoint_disposed_while_its_participant_is_authenticated_again_does_not_return() {
+    use crate::{discovery::secure_discovery::AuthenticationStatus, TopicKind};
+
+    let domain_id = test_domain_id(49);
+    let qos = QosPolicies::qos_none();
+    let wait_until = |what: &str, condition: &mut dyn FnMut() -> bool| {
+      let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+      while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(StdDuration::from_millis(20));
+      }
+    };
+    let topic_of = |participant: &DomainParticipant| {
+      participant
+        .create_topic(
+          PROTECTED_TOPIC.to_string(),
+          "ShapeType".to_string(),
+          &qos,
+          TopicKind::WithKey,
+        )
+        .unwrap()
+    };
+
+    // Two participants with the same identity and permissions, which
+    // authenticate each other. Both have a reader and a writer on the topic.
+    let observer = participant_with_security(domain_id);
+    let observer_db = observer.discovery_db();
+    let observer_topic = topic_of(&observer);
+    let _local_reader = observer
+      .create_subscriber(&qos)
+      .unwrap()
+      .create_datareader_cdr::<ShapeType>(&observer_topic, None)
+      .unwrap();
+    let _local_writer = observer
+      .create_publisher(&qos)
+      .unwrap()
+      .create_datawriter_cdr::<ShapeType>(&observer_topic, None)
+      .unwrap();
+    let remote = participant_with_security(domain_id);
+    let remote_prefix = remote.guid().prefix;
+    let remote_topic = topic_of(&remote);
+    let remote_subscriber = remote.create_subscriber(&qos).unwrap();
+    let remote_publisher = remote.create_publisher(&qos).unwrap();
+    let remote_reader = remote_subscriber
+      .create_datareader_cdr::<ShapeType>(&remote_topic, None)
+      .unwrap();
+    let remote_writer = remote_publisher
+      .create_datawriter_cdr::<ShapeType>(&remote_topic, None)
+      .unwrap();
+
+    // Has the observer entered this reader or writer of the remote participant?
+    let entered = |endpoint: GUID| {
+      let db = discovery_db_read(&observer_db);
+      let is_reader = db
+        .get_all_external_topic_readers()
+        .any(|r| r.reader_proxy.remote_reader_guid == endpoint);
+      let is_writer = db
+        .get_all_external_topic_writers()
+        .any(|w| w.writer_proxy.remote_writer_guid == endpoint);
+      is_reader || is_writer
+    };
+    // Puts the observer into the state after the remote participant has timed
+    // out, has returned and has been authenticated again, before its
+    // DCPSParticipantsSecure data is processed: it is known and authenticated,
+    // and its endpoints are in the attic.
+    let lose_and_authenticate_again = || {
+      let mut db = discovery_db_write(&observer_db);
+      let participant_data = db.find_participant_proxy(remote_prefix).unwrap().clone();
+      db.remove_participant(remote_prefix, false); // false = timed out
+      db.update_participant(&participant_data);
+      db.update_authentication_status(remote_prefix, AuthenticationStatus::Authenticated);
+    };
+    // A new participant makes the remote participant announce itself at once,
+    // also on DCPSParticipantsSecure. With that, the observer processes the
+    // endpoints that the remote participant has in the attic.
+    let process_the_attic = || DomainParticipant::new(domain_id).expect("participant creation");
+
+    let (reader, writer) = (remote_reader.guid(), remote_writer.guid());
+    wait_until(
+      "the remote participant is authenticated and its endpoints are entered",
+      &mut || entered(reader) && entered(writer),
+    );
+    assert_eq!(
+      discovery_db_read(&observer_db).get_authentication_status(remote_prefix),
+      Some(AuthenticationStatus::Authenticated)
+    );
+
+    // The remote participant deletes its reader while it is in the attic. The
+    // observer gets the dispose before it processes the attic.
+    lose_and_authenticate_again();
+    assert!(!entered(reader) && !entered(writer));
+    drop(remote_reader);
+    std::thread::sleep(StdDuration::from_millis(500));
+    let _newcomer = process_the_attic();
+    wait_until(
+      "the writer of the participant that was authenticated again is entered again",
+      &mut || entered(writer),
+    );
+    wait_until(
+      "the reader that the remote participant deleted is not entered again",
+      &mut || !entered(reader),
+    );
+
+    // The same with a writer that the remote participant deletes.
+    let remote_reader = remote_subscriber
+      .create_datareader_cdr::<ShapeType>(&remote_topic, None)
+      .unwrap();
+    let reader = remote_reader.guid();
+    wait_until("the new reader is entered", &mut || entered(reader));
+    lose_and_authenticate_again();
+    assert!(!entered(reader) && !entered(writer));
+    drop(remote_writer);
+    std::thread::sleep(StdDuration::from_millis(500));
+    let _newcomer = process_the_attic();
+    wait_until(
+      "the reader of the participant that was authenticated again is entered again",
+      &mut || entered(reader),
+    );
+    wait_until(
+      "the writer that the remote participant deleted is not entered again",
+      &mut || !entered(writer),
     );
   }
 }
