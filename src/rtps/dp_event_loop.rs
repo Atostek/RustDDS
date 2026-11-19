@@ -801,9 +801,6 @@ impl DPEventLoop {
           .available_builtin_endpoints
           .contains(*reader_endpoint_set_elem)
         {
-          let reader_proxy =
-            discovered_participant.get_builtin_reader_proxy(*reader_eid, reader_qos);
-
           // Get the QoS for the built-in topic from the local writer
           let mut reader_qos = reader_qos.clone();
 
@@ -820,6 +817,12 @@ impl DPEventLoop {
             // BestEffort, and will therefore not send ACKNACKs. Now the
             // `writer` knows not to expect them, and avoid stalling.
           };
+
+          // The writer goes by the QoS in its reader proxy when it decides
+          // whether to wait for a reader's ACKNACKs, so the proxy has to be
+          // built with the reliability set above.
+          let reader_proxy =
+            discovered_participant.get_builtin_reader_proxy(*reader_eid, &reader_qos);
 
           writer.update_reader_proxy(&reader_proxy, &reader_qos);
           debug!(
@@ -1277,13 +1280,22 @@ mod tests {
   use super::*;
   use crate::{
     dds::{
+      ddsdata::DDSData,
       qos::QosPolicies,
-      statusevents::{sync_status_channel, DataReaderStatus},
+      statusevents::{sync_status_channel, DataReaderStatus, DataWriterStatus},
       typedesc::TypeDesc,
-      with_key::simpledatareader::ReaderCommand,
+      with_key::{datawriter::WriteOptions, simpledatareader::ReaderCommand},
     },
+    discovery::{
+      builtin_endpoint::BuiltinEndpointQos, discovery::Discovery, discovery_db::discovery_db_write,
+      spdp_participant_data::SpdpDiscoveredParticipantData,
+    },
+    messages::submessages::elements::serialized_payload::SerializedPayload,
     mio_source,
     polling::{ready_channel, wake_channel, wake_channel_unbounded, LoopWaker},
+    rtps::writer_send_buffer::{Admission, WriterSendBuffer},
+    test::test_data::spdp_participant_data,
+    RepresentationIdentifier,
   };
 
   //#[test]
@@ -1427,6 +1439,202 @@ mod tests {
     info!("\nsending end token\n");
     stop_poll_sender.send(EventLoopCommand::Stop).unwrap();
     child.join().unwrap();
+  }
+
+  // A DPEventLoop without UDP listeners. The channel ends that the test does
+  // not use stay open, because the event loop stops or logs errors when they
+  // close.
+  fn test_event_loop(participant_guid: GUID) -> DPEventLoop {
+    let waker = LoopWaker::new();
+    let (add_reader_sender, add_reader_receiver) = wake_channel::<ReaderIngredients>(8, &waker);
+    let (remove_reader_sender, remove_reader_receiver) = wake_channel::<GUID>(4, &waker);
+    let (add_writer_sender, add_writer_receiver) = wake_channel::<WriterIngredients>(8, &waker);
+    let (remove_writer_sender, remove_writer_receiver) = wake_channel::<GUID>(4, &waker);
+    let (stop_poll_sender, stop_poll_receiver) = wake_channel_unbounded(&waker);
+    let (discovery_update_notification_sender, discovery_update_notification_receiver) =
+      wake_channel(8, &waker);
+    let discovery_waker = LoopWaker::new();
+    let (discovery_command_sender, discovery_command_receiver) =
+      wake_channel::<DiscoveryCommand>(64, &discovery_waker);
+    let (spdp_liveness_sender, spdp_liveness_receiver) = wake_channel(8, &discovery_waker);
+    let (reader_ready_sender, reader_ready) = ready_channel(&waker);
+    let (writer_ready_sender, writer_ready) = ready_channel(&waker);
+    let (participant_status_sender, participant_status_receiver) = sync_status_channel(16).unwrap();
+    let (discovery_db_event_sender, discovery_db_event_receiver) = std::sync::mpsc::sync_channel(4);
+    std::mem::forget((
+      add_reader_sender,
+      remove_reader_sender,
+      add_writer_sender,
+      remove_writer_sender,
+      stop_poll_sender,
+      discovery_update_notification_sender,
+      discovery_command_receiver,
+      spdp_liveness_receiver,
+      reader_ready_sender,
+      writer_ready_sender,
+      participant_status_receiver,
+      discovery_db_event_receiver,
+    ));
+
+    let discovery_db = Arc::new(RwLock::new(DiscoveryDB::new(
+      participant_guid,
+      discovery_db_event_sender,
+      participant_status_sender.clone(),
+    )));
+    DPEventLoop::new(
+      DomainInfo {
+        domain_participant_guid: participant_guid,
+        domain_id: 0,
+        participant_id: 0,
+      },
+      Arc::new(RwLock::new(DDSCache::new())),
+      HashMap::new(),
+      discovery_db,
+      participant_guid.prefix,
+      TokenReceiverPair {
+        token: ADD_READER_TOKEN,
+        receiver: add_reader_receiver,
+      },
+      TokenReceiverPair {
+        token: REMOVE_READER_TOKEN,
+        receiver: remove_reader_receiver,
+      },
+      TokenReceiverPair {
+        token: ADD_WRITER_TOKEN,
+        receiver: add_writer_receiver,
+      },
+      TokenReceiverPair {
+        token: REMOVE_WRITER_TOKEN,
+        receiver: remove_writer_receiver,
+      },
+      stop_poll_receiver,
+      discovery_update_notification_receiver,
+      discovery_command_sender,
+      spdp_liveness_sender,
+      participant_status_sender,
+      None,
+      None,
+      0,
+      true,
+      reader_ready,
+      writer_ready,
+      waker,
+    )
+    .expect("DPEventLoop::new in test")
+  }
+
+  // SPDP data of a remote participant that has the built-in endpoints of the
+  // test data. It has no locators, so nothing is sent to it.
+  fn remote_participant(
+    guid_prefix: GuidPrefix,
+    builtin_endpoint_qos: Option<BuiltinEndpointQos>,
+  ) -> SpdpDiscoveredParticipantData {
+    let mut data = spdp_participant_data().unwrap();
+    data.participant_guid = GUID::new(guid_prefix, EntityId::PARTICIPANT);
+    data.metatraffic_unicast_locators.clear();
+    data.metatraffic_multicast_locators.clear();
+    data.default_unicast_locators.clear();
+    data.default_multicast_locators.clear();
+    data.builtin_endpoint_qos = builtin_endpoint_qos;
+    data
+  }
+
+  // A remote participant can declare in its SPDP data that its
+  // BuiltinParticipantMessageReader is best-effort (builtinEndpointQos, RTPS
+  // 2.5 Section 8.4.13.3). Such a reader never acknowledges. The local
+  // BuiltinParticipantMessageWriter has to know it as best-effort. If it took
+  // the reader for a reliable one, it would wait for its acknowledgments: the
+  // periodic HEARTBEAT would keep going, at the fast period, for as long as the
+  // participant is there.
+  #[test]
+  fn best_effort_participant_message_reader_does_not_keep_the_heartbeat_going() {
+    use speedy::{Endianness, Readable};
+
+    let participant_guid = GUID::new_participant_guid();
+    let mut event_loop = test_event_loop(participant_guid);
+
+    // The local BuiltinParticipantMessageWriter, which holds one sample
+    let writer_guid = GUID::new(
+      participant_guid.prefix,
+      EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
+    );
+    let send_buffer = WriterSendBuffer::new(
+      writer_guid,
+      "DCPSParticipantMessage".to_string(),
+      true,  // reliable
+      true,  // built-in
+      false, // TransientLocal
+      DEFAULT_WRITER_MAX_SAMPLES,
+      DEFAULT_WRITER_MAX_SAMPLES,
+      DEFAULT_WRITER_MAX_SAMPLES,
+    );
+    let sample = DDSData::new(SerializedPayload::new(
+      RepresentationIdentifier::CDR_LE,
+      vec![0; 8],
+    ));
+    assert!(matches!(
+      send_buffer.admit_blocking(WriteOptions::default(), sample, Some(Duration::ZERO)),
+      Admission::Admitted(_)
+    ));
+    let (status_sender, writer_status) = sync_status_channel::<DataWriterStatus>(16).unwrap();
+    event_loop.add_local_writer(WriterIngredients {
+      guid: writer_guid,
+      send_buffer,
+      topic_name: "DCPSParticipantMessage".to_string(),
+      like_stateless: false,
+      qos_policies: Discovery::PARTICIPANT_MESSAGE_QOS,
+      status_sender,
+      security_plugins: None,
+    });
+
+    // The event loop learns about a remote participant. Returns whether the
+    // local writer is matched with that participant's
+    // BuiltinParticipantMessageReader then.
+    let discover = |event_loop: &mut DPEventLoop, data: &SpdpDiscoveredParticipantData| {
+      discovery_db_write(&event_loop.discovery_db).update_participant(data);
+      event_loop.update_participant(data.participant_guid.prefix);
+      let remote_reader = GUID::new(
+        data.participant_guid.prefix,
+        EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
+      );
+      std::iter::from_fn(|| writer_status.try_recv().ok()).any(|status| {
+        matches!(status, DataWriterStatus::PublicationMatched { reader, current, .. }
+          if reader == remote_reader && current.count_change() == 1)
+      })
+    };
+    // Does the local writer's HEARTBEAT tick find a reader that it waits for?
+    let heartbeat_goes_on = |event_loop: &mut DPEventLoop| {
+      event_loop
+        .writers
+        .get_mut(&EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER)
+        .unwrap()
+        .handle_heartbeat_tick(false)
+    };
+
+    // A reliable BuiltinParticipantMessageReader that has acknowledged nothing
+    // keeps the HEARTBEAT going.
+    let reliable = remote_participant(GuidPrefix::new(b"reliable_rdr"), None);
+    assert!(discover(&mut event_loop, &reliable));
+    assert!(
+      heartbeat_goes_on(&mut event_loop),
+      "no HEARTBEAT for a reliable reader that has acknowledged nothing"
+    );
+    event_loop.remote_participant_lost(reliable.participant_guid.prefix);
+    assert!(!heartbeat_goes_on(&mut event_loop));
+
+    // A best-effort one does not.
+    let best_effort_reader = BuiltinEndpointQos::read_from_buffer_with_ctx(
+      Endianness::LittleEndian,
+      &BuiltinEndpointQos::BEST_EFFORT_PARTICIPANT_MESSAGE_DATA_READER.to_le_bytes(),
+    )
+    .unwrap();
+    let best_effort =
+      remote_participant(GuidPrefix::new(b"best_effort!"), Some(best_effort_reader));
+    assert!(discover(&mut event_loop, &best_effort));
+    assert!(
+      !heartbeat_goes_on(&mut event_loop),
+      "the writer waits for acknowledgments from a reader that was declared best-effort"
+    );
   }
 
   // TODO: Rewrite / remove this test - all asserts in it use
