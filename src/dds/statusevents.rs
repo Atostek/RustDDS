@@ -286,7 +286,7 @@ impl<T> mio1::event::Source for StatusChannelReceiver<T> {
 // -------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // TODO: try to make private
 pub struct StatusReceiverStream<'a, T> {
@@ -639,18 +639,16 @@ pub struct SubscriptionMatchedStatus {
 /// are right also when nobody drains the status channel.
 #[derive(Debug, Default)]
 pub(crate) struct MatchedCounts {
-  // The two are stored one after the other. A read that races with a match
-  // change may see only one of them updated; the next read sees both.
-  total: AtomicI32,
-  current: AtomicI32,
+  // (total, current). One lock for the two, so that a read always gets a pair
+  // that was stored together.
+  counts: Mutex<(i32, i32)>,
 }
 
 impl MatchedCounts {
   /// `total`: how many matches there have been ever. `current`: how many
   /// endpoints are matched now.
   pub(crate) fn set(&self, total: i32, current: i32) {
-    self.total.store(total, Ordering::Relaxed);
-    self.current.store(current, Ordering::Relaxed);
+    *self.counts.lock().unwrap() = (total, current);
   }
 }
 
@@ -659,26 +657,27 @@ impl MatchedCounts {
 #[derive(Debug)]
 pub(crate) struct MatchedCountsView {
   counts: Arc<MatchedCounts>,
-  seen_total: AtomicI32,
-  seen_current: AtomicI32,
+  // (total, current) as `read` returned them last.
+  seen: Mutex<(i32, i32)>,
 }
 
 impl MatchedCountsView {
   pub(crate) fn new(counts: Arc<MatchedCounts>) -> Self {
     Self {
       counts,
-      seen_total: AtomicI32::new(0),
-      seen_current: AtomicI32::new(0),
+      seen: Mutex::new((0, 0)),
     }
   }
 
   /// The total and the current count, each with its change since the previous
   /// call.
   pub(crate) fn read(&self) -> (CountWithChange, CountWithChange) {
-    let total = self.counts.total.load(Ordering::Relaxed);
-    let current = self.counts.current.load(Ordering::Relaxed);
-    let seen_total = self.seen_total.swap(total, Ordering::Relaxed);
-    let seen_current = self.seen_current.swap(current, Ordering::Relaxed);
+    // `seen` stays locked while the counts are read, so that concurrent reads
+    // take turns: the one that gets the newer counts is also the one that
+    // remembers them last.
+    let mut seen = self.seen.lock().unwrap();
+    let (total, current) = *self.counts.counts.lock().unwrap();
+    let (seen_total, seen_current) = std::mem::replace(&mut *seen, (total, current));
     (
       CountWithChange::new(total, total - seen_total),
       CountWithChange::new(current, current - seen_current),
@@ -756,5 +755,70 @@ mod tests {
 
     counts.set(2, 0); // the second one is lost too
     assert_eq!(view.read(), status((2, 0), (0, -1)));
+  }
+
+  // How many matches the two tests below store while other threads read.
+  const STORED_WHILE_READING: i32 = 200_000;
+
+  // The two counts are read as one snapshot. Every pair stored here has two
+  // equal counts, so a read that mixed two pairs would return different ones.
+  #[test]
+  fn matched_counts_are_read_as_one_snapshot() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+
+    std::thread::scope(|scope| {
+      scope.spawn(|| (1..=STORED_WHILE_READING).for_each(|n| counts.set(n, n)));
+      loop {
+        let (total, current) = view.read();
+        assert_eq!(
+          total.count(),
+          current.count(),
+          "the two counts are from different snapshots"
+        );
+        if total.count() == STORED_WHILE_READING {
+          break;
+        }
+      }
+    });
+  }
+
+  // Several threads may read the status of one endpoint. The total only
+  // grows, so no read may report that it went down, and the changes that all
+  // the reads report add up to the matches there were.
+  #[test]
+  fn concurrent_reads_report_each_match_once() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+
+    let reported: i32 = std::thread::scope(|scope| {
+      scope.spawn(|| (1..=STORED_WHILE_READING).for_each(|n| counts.set(n, n)));
+      let readers: Vec<_> = (0..2)
+        .map(|_| {
+          scope.spawn(|| {
+            let mut reported = 0;
+            loop {
+              let (total, _current) = view.read();
+              assert!(
+                total.count_change() >= 0,
+                "the total went down by {}",
+                -total.count_change()
+              );
+              reported += total.count_change();
+              if total.count() == STORED_WHILE_READING {
+                break reported;
+              }
+            }
+          })
+        })
+        .collect();
+      readers
+        .into_iter()
+        .map(|reader| reader.join().expect("a reading thread failed"))
+        .sum()
+    });
+
+    let (total, _current) = view.read();
+    assert_eq!(reported + total.count_change(), STORED_WHILE_READING);
   }
 }

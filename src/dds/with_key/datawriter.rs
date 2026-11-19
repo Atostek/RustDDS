@@ -621,9 +621,10 @@ where
   /// stream and it has dropped events. Each `count_change()` is the change
   /// since the previous call on this DataWriter.
   ///
-  /// The call takes no lock, so it is cheap enough to make before every write,
-  /// for example to skip producing a sample of a volatile topic that nobody
-  /// would receive.
+  /// The call is cheap enough to make before every write, for example to skip
+  /// producing a sample that nobody would receive. Skipping is right only for
+  /// a DataWriter with volatile durability, which keeps nothing for readers
+  /// that match later, and automatic liveliness, which no write has to assert.
   ///
   /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
   ///
