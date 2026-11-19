@@ -1,6 +1,6 @@
 use std::{
   cmp::max,
-  collections::{btree_map, BTreeMap, HashMap},
+  collections::{btree_map, BTreeMap, BTreeSet, HashMap},
   iter,
   ops::Bound::{Excluded, Included},
   sync::{Arc, Mutex},
@@ -154,6 +154,10 @@ pub(crate) struct TopicCache {
   // Therefore, data before the marker SN can be handed off to a Reliable DataReader.
   // Initially, we consider the marker for each Writer (GUID) to be SequenceNumber::new(1)
   received_reliably_before: BTreeMap<GUID, SequenceNumber>,
+  // Writers forgotten while some of their samples were still here. Their markers
+  // stay so a Reliable DataReader can still take those samples, and go with the
+  // last of them.
+  departed_writers: BTreeSet<GUID>,
 }
 
 impl TopicCache {
@@ -170,6 +174,7 @@ impl TopicCache {
       last_added_instant: Timestamp::ZERO,
       sequence_numbers: BTreeMap::new(),
       received_reliably_before: BTreeMap::new(),
+      departed_writers: BTreeSet::new(),
     };
 
     new_self.update_keep_limits(topic_qos);
@@ -215,6 +220,8 @@ impl TopicCache {
   // forward and false if not. The marker never moves backwards: the cache may
   // have given up on a missing sample that the Reader is still waiting for.
   pub fn mark_reliably_received_before(&mut self, writer: GUID, sn: SequenceNumber) -> bool {
+    // A Writer is matched again (e.g. its participant came back).
+    self.departed_writers.remove(&writer);
     let prev_sn = self.reliable_before(writer);
     // The entry must exist even at the initial value: withheld samples are
     // protected only for Writers that have one.
@@ -241,9 +248,26 @@ impl TopicCache {
     }
   }
 
-  // The Writer is gone, so samples it never completed are no longer awaited.
+  // The Writer is gone, so nothing more arrives from it. Every sample it sent
+  // that is still here is handed over, including any withheld behind a missing
+  // one. Removing the marker instead would hide them all: without a marker,
+  // nothing from sequence number 1 on can be taken.
   pub fn forget_reliable_writer(&mut self, writer: GUID) {
-    self.received_reliably_before.remove(&writer);
+    let last_present = self
+      .sequence_numbers
+      .get(&writer)
+      .and_then(|sn_map| sn_map.keys().next_back())
+      .copied();
+    match last_present {
+      Some(last) => {
+        let marker = self.received_reliably_before.entry(writer).or_default();
+        *marker = max(*marker, last.plus_1());
+        self.departed_writers.insert(writer);
+      }
+      None => {
+        self.received_reliably_before.remove(&writer);
+      }
+    }
   }
 
   // The oldest change that a Reliable DataReader cannot yet take, because an
@@ -476,6 +500,9 @@ impl TopicCache {
     });
     if emptied {
       self.sequence_numbers.remove(&cc.writer_guid);
+      if self.departed_writers.remove(&cc.writer_guid) {
+        self.received_reliably_before.remove(&cc.writer_guid);
+      }
     }
   }
 
@@ -802,6 +829,87 @@ mod tests {
       SequenceNumber::new(201)
     );
     assert!(topic_cache.changes.len() <= topic_cache.max_keep_samples as usize + 1);
+  }
+
+  fn reliably_readable(topic_cache: &TopicCache) -> Vec<i64> {
+    topic_cache
+      .get_changes_in_range_reliable(&BTreeMap::new())
+      .map(|(_, cc)| i64::from(cc.sequence_number))
+      .collect()
+  }
+
+  // A Writer can leave (e.g. its process exits right after writing) before the
+  // application takes what it sent. A sample received in full stays readable.
+  #[test]
+  fn received_samples_stay_readable_after_their_writer_is_forgotten() {
+    let mut topic_cache = keep_all_topic_cache();
+    let writer = user_writer();
+    topic_cache.add_change(
+      &Timestamp::now(),
+      CacheChange::new(
+        writer,
+        SequenceNumber::new(1),
+        WriteOptions::default(),
+        DDSData::new(SerializedPayload::default()),
+      ),
+    );
+    topic_cache.mark_reliably_received_before(writer, SequenceNumber::new(2));
+    assert_eq!(reliably_readable(&topic_cache), [1]);
+
+    topic_cache.forget_reliable_writer(writer);
+    assert_eq!(reliably_readable(&topic_cache), [1]);
+  }
+
+  // Samples withheld behind a missing one are no longer awaited once their
+  // Writer is gone: they are handed over.
+  #[test]
+  fn withheld_samples_are_handed_over_when_their_writer_is_forgotten() {
+    let mut topic_cache = keep_all_topic_cache();
+    let writer = user_writer();
+    for sn in 2..=3 {
+      add_after_missing_first(&mut topic_cache, writer, sn, 100);
+    }
+    assert_eq!(reliably_readable(&topic_cache), Vec::<i64>::new());
+
+    topic_cache.forget_reliable_writer(writer);
+    assert_eq!(reliably_readable(&topic_cache), [2, 3]);
+  }
+
+  // The marker kept for a forgotten Writer's samples goes away with them.
+  #[test]
+  fn a_forgotten_writer_leaves_no_marker_once_its_samples_are_gone() {
+    let mut topic_cache = TopicCache::new(
+      "Square".to_string(),
+      TypeDesc::new("ShapeType".to_string()),
+      &QosPolicyBuilder::new()
+        .history(History::KeepLast { depth: 1 })
+        .build(),
+    );
+    let sample = |writer, sn| {
+      CacheChange::new(
+        writer,
+        SequenceNumber::new(sn),
+        WriteOptions::default(),
+        DDSData::new(SerializedPayload::default()),
+      )
+    };
+    let departed = user_writer();
+    topic_cache.add_change(&Timestamp::now(), sample(departed, 1));
+    topic_cache.mark_reliably_received_before(departed, SequenceNumber::new(2));
+    topic_cache.forget_reliable_writer(departed);
+    assert!(topic_cache.received_reliably_before.contains_key(&departed));
+
+    // A newer sample from another Writer pushes it out (KeepLast 1).
+    let other = GUID::new(
+      GuidPrefix::new(&[8; 12]),
+      EntityId::new([0, 0, 1], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+    );
+    topic_cache.add_change(&Timestamp::now(), sample(other, 1));
+    topic_cache.mark_reliably_received_before(other, SequenceNumber::new(2));
+    topic_cache.remove_changes_before(Timestamp::now());
+    assert!(!topic_cache.sequence_numbers.contains_key(&departed));
+    assert!(!topic_cache.received_reliably_before.contains_key(&departed));
+    assert!(topic_cache.received_reliably_before.contains_key(&other));
   }
 
   #[test]
