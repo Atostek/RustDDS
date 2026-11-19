@@ -1,6 +1,7 @@
 use std::{
   marker::PhantomData,
   pin::Pin,
+  sync::Arc,
   task::{Context, Poll},
   time::{Duration, Instant},
 };
@@ -212,6 +213,8 @@ pub struct DataWriter<D: Keyed, SA: SerializerAdapter<D> = CDRSerializerAdapter<
   doorbell: Doorbell,
   discovery_command: WakeSender<DiscoveryCommand>,
   status_receiver: StatusChannelReceiver<DataWriterStatus>,
+  /// How many readers the RTPS Writer is matched with.
+  matched: MatchedCountsView,
 }
 
 impl<D, SA> Drop for DataWriter<D, SA>
@@ -253,6 +256,7 @@ where
     doorbell: Doorbell,
     discovery_command: WakeSender<DiscoveryCommand>,
     status_receiver: StatusChannelReceiver<DataWriterStatus>,
+    matched_counts: Arc<MatchedCounts>,
   ) -> CreateResult<Self> {
     if let Some(lv) = qos.liveliness {
       match lv {
@@ -275,6 +279,7 @@ where
       doorbell,
       discovery_command,
       status_receiver,
+      matched: MatchedCountsView::new(matched_counts),
     })
   }
 
@@ -605,12 +610,26 @@ where
     todo!()
   }
 
-  /// Unimplemented. <b>Do not use</b>.
+  */
+
+  /// Reads the PUBLICATION_MATCHED status of this DataWriter: how many
+  /// DataReaders it is matched with now, and how many matches there have been
+  /// since it was created.
+  ///
+  /// The counts are those of the RTPS Writer itself. They do not come from the
+  /// status event stream, so they are right also when nothing reads that
+  /// stream and it has dropped events. Each `count_change()` is the change
+  /// since the previous call on this DataWriter.
+  ///
+  /// The call takes no lock, so it is cheap enough to make before every write,
+  /// for example to skip producing a sample of a volatile topic that nobody
+  /// would receive.
+  ///
+  /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
   ///
   /// # Examples
   ///
-  /// ```no_run
-  // TODO: enable when functional
+  /// ```
   /// # use serde::{Serialize, Deserialize};
   /// # use rustdds::*;
   /// # use rustdds::with_key::DataWriter;
@@ -632,19 +651,16 @@ where
   ///
   /// // WithKey is important
   /// let topic = domain_participant.create_topic("some_topic".to_string(), "SomeType".to_string(), &qos, TopicKind::WithKey).unwrap();
-  /// let data_writer = publisher.create_datawriter::<SomeType, CDRSerializerAdapter<_>>(topic, None).unwrap();
+  /// let data_writer = publisher.create_datawriter::<SomeType, CDRSerializerAdapter<_>>(&topic, None).unwrap();
   ///
-  /// // Liveliness lost status has changed
-  ///
-  /// if let Ok(pms) = data_writer.get_publication_matched_status() {
-  ///   // do something
+  /// if data_writer.get_publication_matched_status().current.count() > 0 {
+  ///   data_writer.write(SomeType { a: 1 }, None).unwrap();
   /// }
   /// ```
-  pub fn get_publication_matched_status(&self) -> Result<PublicationMatchedStatus> {
-    todo!()
+  pub fn get_publication_matched_status(&self) -> PublicationMatchedStatus {
+    let (total, current) = self.matched.read();
+    PublicationMatchedStatus { total, current }
   }
-
-  */
 
   /// Topic assigned to this DataWriter
   ///

@@ -4,7 +4,7 @@ use std::{
   collections::{BTreeMap, BTreeSet},
   ops::Bound::Included,
   rc::Rc,
-  sync::{atomic, mpsc::TrySendError},
+  sync::{atomic, mpsc::TrySendError, Arc},
 };
 
 #[allow(unused_imports)]
@@ -20,7 +20,8 @@ use crate::{
       HasQoSPolicy, QosPolicies,
     },
     statusevents::{
-      CountWithChange, DataWriterStatus, DomainParticipantStatusEvent, StatusChannelSender,
+      CountWithChange, DataWriterStatus, DomainParticipantStatusEvent, MatchedCounts,
+      StatusChannelSender,
     },
   },
   messages::submessages::submessages::AckSubmessage,
@@ -135,6 +136,9 @@ pub(crate) struct WriterIngredients {
   pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Writer)
   pub qos_policies: QosPolicies,
   pub status_sender: StatusChannelSender<DataWriterStatus>,
+  /// Where the Writer stores how many readers it is matched with, for the
+  /// `DataWriter` to read.
+  pub(crate) matched_counts: Arc<MatchedCounts>,
 
   pub(crate) security_plugins: Option<SecurityPluginsHandle>,
 }
@@ -267,6 +271,8 @@ pub(crate) struct Writer {
 
   // Used for sending status info about messages sent
   status_sender: StatusChannelSender<DataWriterStatus>,
+  // The matched-reader counts, shared with the DataWriter.
+  matched_counts: Arc<MatchedCounts>,
   // offered_deadline_status: OfferedDeadlineMissedStatus,
   participant_status_sender: StatusChannelSender<DomainParticipantStatusEvent>,
 
@@ -367,6 +373,7 @@ impl Writer {
       like_stateless: i.like_stateless,
       qos_policies: i.qos_policies,
       status_sender: i.status_sender,
+      matched_counts: i.matched_counts,
       participant_status_sender,
 
       security_plugins: i.security_plugins,
@@ -2015,6 +2022,7 @@ impl Writer {
         self.refresh_acked_frontier();
         if new_reader {
           self.matched_readers_count_total += 1;
+          self.store_matched_counts();
           self.send_status(DataWriterStatus::PublicationMatched {
             // total: How many matches have been detected ever?
             total: CountWithChange::new(self.matched_readers_count_total, 1),
@@ -2208,6 +2216,7 @@ impl Writer {
       // Removing a reader may relax (raise) the writer-wide minimum budget.
       self.recompute_min_datagram_payload();
       // self.matched_readers_count_total -= 1; // this never decreases
+      self.store_matched_counts();
       self.send_status(DataWriterStatus::PublicationMatched {
         total: CountWithChange::new(self.matched_readers_count_total, 0),
         current: CountWithChange::new(self.readers.len() as i32, -1),
@@ -2230,6 +2239,15 @@ impl Writer {
     for reader in lost_readers {
       self.reader_lost(reader);
     }
+  }
+
+  // Stores the matched-reader counts for the DataWriter. Called with every
+  // PublicationMatched status event: the event is dropped when the status
+  // channel is full, the counts are not.
+  fn store_matched_counts(&self) {
+    self
+      .matched_counts
+      .set(self.matched_readers_count_total, self.readers.len() as i32);
   }
 
   fn lookup_reader_proxy_mut(&mut self, guid: GUID) -> Option<&mut RtpsReaderProxy> {
@@ -2775,7 +2793,7 @@ mod tests {
       dds::{
         ddsdata::DDSData,
         qos::{policy::Durability, QosPolicyBuilder},
-        statusevents::{sync_status_channel, StatusChannelReceiver},
+        statusevents::{sync_status_channel, MatchedCountsView, StatusChannelReceiver},
         with_key::datawriter::WriteOptions,
       },
       discovery::discovery::Discovery,
@@ -2794,6 +2812,8 @@ mod tests {
       timer: SharedTimer<DpTimerEvent>,
       _status: StatusChannelReceiver<DataWriterStatus>,
       _participant_status: StatusChannelReceiver<DomainParticipantStatusEvent>,
+      // The DataWriter's end of the Writer's matched-reader counts.
+      matched: MatchedCountsView,
     }
 
     impl Fixture {
@@ -2833,6 +2853,7 @@ mod tests {
         let (status_sender, status) = sync_status_channel(4).unwrap();
         let (participant_status_sender, participant_status) = sync_status_channel(16).unwrap();
         let timer = new_shared_timer();
+        let matched_counts = Arc::new(MatchedCounts::default());
         let mut writer = Writer::new(
           WriterIngredients {
             guid,
@@ -2841,6 +2862,7 @@ mod tests {
             like_stateless: false,
             qos_policies: writer_qos,
             status_sender,
+            matched_counts: Arc::clone(&matched_counts),
             security_plugins: None,
           },
           Rc::new(UDPSender::new(0).unwrap()),
@@ -2865,6 +2887,7 @@ mod tests {
           timer,
           _status: status,
           _participant_status: participant_status,
+          matched: MatchedCountsView::new(matched_counts),
         }
       }
 
@@ -2903,6 +2926,26 @@ mod tests {
 
       fn reader_proxy(&self) -> &RtpsReaderProxy {
         &self.writer.readers[&self.reader_guid]
+      }
+
+      // The total and the current matched-reader count, as the DataWriter
+      // reads them.
+      fn matched_counts(&self) -> (i32, i32) {
+        let (total, current) = self.matched.read();
+        (total.count(), current.count())
+      }
+
+      // Tells the Writer about a reader `entity` of the participant
+      // `participant` that asks for `qos`.
+      fn discover_reader(&mut self, participant: u8, qos: &QosPolicies) -> GUID {
+        let guid = GUID::new(
+          GuidPrefix::new(&[participant; 12]),
+          self.reader_guid.entity_id,
+        );
+        self
+          .writer
+          .update_reader_proxy(&RtpsReaderProxy::new(guid, qos.clone(), false), qos);
+        guid
       }
 
       fn unsent(&self) -> usize {
@@ -3149,6 +3192,76 @@ mod tests {
       assert!(!f.writer.process_pending());
       assert_eq!(f.writer.last_sent, SequenceNumber::new(5));
       assert!(!f.writer.process_pending());
+    }
+
+    // A reader counts as matched once, however often it is announced again.
+    #[test]
+    fn writer_counts_each_matched_reader_once() {
+      // The fixture's Writer is matched with a reader of participant 2.
+      let mut f = Fixture::user(3, 8, None);
+      let qos = f.writer.qos_policies.clone();
+      assert_eq!(f.matched_counts(), (1, 1));
+
+      // The same reader again, as after a QoS or locator update,
+      assert_eq!(f.discover_reader(2, &qos), f.reader_guid);
+      // and the repair path, which takes the proxy out of the map and puts it
+      // back, are not new matches.
+      f.ack_nack(1..=3, 1);
+      assert_eq!(f.matched_counts(), (1, 1));
+
+      // A reader of another participant is one.
+      f.discover_reader(3, &qos);
+      assert_eq!(f.matched_counts(), (2, 2));
+    }
+
+    // A reader the Writer cannot serve is not matched, so it is not counted.
+    #[test]
+    fn writer_does_not_count_a_reader_with_incompatible_qos() {
+      // The fixture's Writer is matched with a reader of participant 2.
+      let mut f = Fixture::user(0, 8, None);
+      // The Writer offers TransientLocal durability. This reader asks for more.
+      let asks_too_much = QosPolicyBuilder::new()
+        .durability(Durability::Persistent)
+        .build();
+      let reader = f.discover_reader(3, &asks_too_much);
+      assert!(!f.writer.readers.contains_key(&reader));
+      assert_eq!(f.matched_counts(), (1, 1));
+    }
+
+    // Losing a reader lowers the current count. The total counts the matches
+    // there have ever been, so it stays.
+    #[test]
+    fn writer_lowers_the_current_count_when_a_reader_is_lost() {
+      // The fixture's Writer is matched with a reader of participant 2.
+      let mut f = Fixture::user(0, 8, None);
+      let qos = f.writer.qos_policies.clone();
+      let reader_3 = f.discover_reader(3, &qos);
+
+      // A reader that was never matched changes nothing.
+      f.writer
+        .reader_lost(GUID::new(GuidPrefix::new(&[4; 12]), reader_3.entity_id));
+      assert_eq!(f.matched_counts(), (2, 2));
+
+      f.writer.reader_lost(f.reader_guid);
+      assert_eq!(f.matched_counts(), (2, 1));
+      // A lost participant takes its readers with it.
+      f.writer.participant_lost(reader_3.prefix);
+      assert_eq!(f.matched_counts(), (2, 0));
+    }
+
+    // The counts do not go through the status channel, which keeps a few
+    // events and drops the rest when nobody reads them.
+    #[test]
+    fn writer_counts_more_readers_than_the_status_channel_holds() {
+      // The fixture's Writer is matched with a reader of participant 2.
+      let mut f = Fixture::user(0, 8, None);
+      let qos = f.writer.qos_policies.clone();
+      // The fixture's status channel has room for 4 events, and nothing reads
+      // it.
+      for participant in 3..=11 {
+        f.discover_reader(participant, &qos);
+      }
+      assert_eq!(f.matched_counts(), (10, 10));
     }
   }
 }

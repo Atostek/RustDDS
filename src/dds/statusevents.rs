@@ -286,7 +286,7 @@ impl<T> mio1::event::Source for StatusChannelReceiver<T> {
 // -------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 // TODO: try to make private
 pub struct StatusReceiverStream<'a, T> {
@@ -592,6 +592,81 @@ impl CountWithChange {
   // }
 }
 
+/// The PUBLICATION_MATCHED status of a DataWriter: how many DataReaders it is
+/// matched with, that is, sends its samples to.
+///
+/// Returned by `DataWriter::get_publication_matched_status`. Each
+/// `count_change()` is the change since the status was last read from the same
+/// DataWriter.
+///
+/// See the tables of Section 2.2.4.1 in DDS Specification v1.4. Its
+/// `last_subscription_handle` is not included: the
+/// [`DataWriterStatus::PublicationMatched`] status event names the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationMatchedStatus {
+  /// How many matches with a DataReader there have been since the DataWriter
+  /// was created. This never decreases.
+  pub total: CountWithChange,
+  /// How many DataReaders the DataWriter is matched with now.
+  pub current: CountWithChange,
+}
+
+/// How many remote endpoints a DataWriter or DataReader is matched with: the
+/// counts of the PUBLICATION_MATCHED and SUBSCRIPTION_MATCHED statuses.
+///
+/// The RTPS Writer / Reader stores them whenever its set of matched endpoints
+/// changes, and the DataWriter / DataReader reads them through a
+/// [`MatchedCountsView`]. Unlike a status event, they are not queued, so they
+/// are right also when nobody drains the status channel.
+#[derive(Debug, Default)]
+pub(crate) struct MatchedCounts {
+  // The two are stored one after the other. A read that races with a match
+  // change may see only one of them updated; the next read sees both.
+  total: AtomicI32,
+  current: AtomicI32,
+}
+
+impl MatchedCounts {
+  /// `total`: how many matches there have been ever. `current`: how many
+  /// endpoints are matched now.
+  pub(crate) fn set(&self, total: i32, current: i32) {
+    self.total.store(total, Ordering::Relaxed);
+    self.current.store(current, Ordering::Relaxed);
+  }
+}
+
+/// The DataWriter's / DataReader's end of [`MatchedCounts`]. It remembers the
+/// counts it returned last, to tell how much they have changed since.
+#[derive(Debug)]
+pub(crate) struct MatchedCountsView {
+  counts: Arc<MatchedCounts>,
+  seen_total: AtomicI32,
+  seen_current: AtomicI32,
+}
+
+impl MatchedCountsView {
+  pub(crate) fn new(counts: Arc<MatchedCounts>) -> Self {
+    Self {
+      counts,
+      seen_total: AtomicI32::new(0),
+      seen_current: AtomicI32::new(0),
+    }
+  }
+
+  /// The total and the current count, each with its change since the previous
+  /// call.
+  pub(crate) fn read(&self) -> (CountWithChange, CountWithChange) {
+    let total = self.counts.total.load(Ordering::Relaxed);
+    let current = self.counts.current.load(Ordering::Relaxed);
+    let seen_total = self.seen_total.swap(total, Ordering::Relaxed);
+    let seen_current = self.seen_current.swap(current, Ordering::Relaxed);
+    (
+      CountWithChange::new(total, total - seen_total),
+      CountWithChange::new(current, current - seen_current),
+    )
+  }
+}
+
 // sample rejection reasons
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleRejectedStatusKind {
@@ -608,3 +683,59 @@ pub struct QosPolicyCount {
   count: i32,
 }
 */
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // Total and current count, each with its change, as a matched-status getter
+  // returns them.
+  fn status(total: (i32, i32), current: (i32, i32)) -> (CountWithChange, CountWithChange) {
+    (
+      CountWithChange::new(total.0, total.1),
+      CountWithChange::new(current.0, current.1),
+    )
+  }
+
+  // What the DataWriter / DataReader reads is what the RTPS endpoint stored
+  // last, and the first read counts the change from "nothing matched".
+  #[test]
+  fn matched_counts_view_reads_the_counts_stored_last() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+    assert_eq!(view.read(), status((0, 0), (0, 0)));
+
+    counts.set(1, 1);
+    counts.set(2, 2);
+    assert_eq!(view.read(), status((2, 2), (2, 2)));
+  }
+
+  // A change is reported once: a second read with nothing new in between
+  // shows the same counts and no change.
+  #[test]
+  fn matched_counts_view_reports_a_change_once() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+    counts.set(1, 1);
+    assert_eq!(view.read(), status((1, 1), (1, 1)));
+    assert_eq!(view.read(), status((1, 0), (1, 0)));
+  }
+
+  // Changes between two reads add up: a new match and the loss of an old one
+  // leave the current count where it was, while the total went up. A loss
+  // alone is a negative change of the current count only.
+  #[test]
+  fn matched_counts_view_nets_the_changes_between_reads() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+    counts.set(1, 1);
+    view.read();
+
+    counts.set(2, 2); // a second match
+    counts.set(2, 1); // the first one is lost
+    assert_eq!(view.read(), status((2, 1), (1, 0)));
+
+    counts.set(2, 0); // the second one is lost too
+    assert_eq!(view.read(), status((2, 0), (0, -1)));
+  }
+}
