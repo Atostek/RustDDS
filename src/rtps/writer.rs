@@ -1074,10 +1074,10 @@ impl Writer {
 
   /// This is called periodically.
   ///
-  /// Returns `true` if some matched reader still has unacknowledged data (i.e.
-  /// a HEARTBEAT was sent to prompt repair), so the caller can reschedule the
-  /// next periodic heartbeat sooner. Returns `false` when all readers are
-  /// caught up.
+  /// Returns `true` if some matched reliable reader still has unacknowledged
+  /// data (i.e. a HEARTBEAT was sent to prompt repair), so the caller can
+  /// reschedule the next periodic heartbeat sooner. Returns `false` when all
+  /// reliable readers are caught up.
   pub fn handle_heartbeat_tick(&mut self, is_manual_assertion: bool) -> bool {
     if self.like_stateless {
       info!(
@@ -1101,12 +1101,21 @@ impl Writer {
     let first_change = self.send_buffer.first_change_sequence_number();
     let last_change = self.send_buffer.last_change_sequence_number();
 
+    // Only a reliable reader acknowledges. A best-effort reader never sends an
+    // ACKNACK and ignores HEARTBEATs (RTPS 2.5, 8.4.11.1 and 8.4.12.1: the
+    // best-effort Reader behaviors have no HEARTBEAT transition), so its proxy
+    // stays at all_acked_before == 0. It must not count as a reader that is
+    // behind: it would keep the periodic HEARTBEAT, and the fast period, going
+    // for as long as it is matched. refresh_acked_frontier() filters the same
+    // way. A manual liveliness assertion keeps considering every reader, as
+    // before.
     if self
       .readers
       .values()
+      .filter(|rp| is_manual_assertion || rp.qos().is_reliable())
       .all(|rp| last_change < rp.all_acked_before)
     {
-      trace!("heartbeat tick: all readers have all available data.");
+      trace!("heartbeat tick: all reliable readers have all available data.");
       false
     } else {
       // the interface to .heartbeat_msg is silly: we give ref to ourself
@@ -2981,6 +2990,91 @@ mod tests {
         self.writer.handle_timed_event(event);
         before - self.unsent()
       }
+    }
+
+    fn best_effort_qos() -> QosPolicies {
+      QosPolicyBuilder::new()
+        .reliability(crate::dds::qos::policy::Reliability::BestEffort)
+        .build()
+    }
+
+    // The reader acknowledges everything below `next`.
+    fn acknowledge_all_before(f: &mut Fixture, next: i64) {
+      let ack_nack = AckNack {
+        reader_id: f.reader_guid.entity_id,
+        writer_id: f.writer.my_guid.entity_id,
+        reader_sn_state: SequenceNumberSet::from_base_and_set(
+          SequenceNumber::new(next),
+          &BTreeSet::new(),
+        ),
+        count: 1,
+      };
+      f.writer
+        .handle_ack_nack(f.reader_guid.prefix, &AckSubmessage::AckNack(ack_nack));
+    }
+
+    // A best-effort reader never acknowledges, so it must not keep a reliable
+    // Writer's periodic HEARTBEAT going, nor hold it on the fast period.
+    #[test]
+    fn best_effort_reader_does_not_keep_the_heartbeat_going() {
+      let writer_qos = QosPolicyBuilder::new()
+        .reliability(crate::dds::qos::policy::Reliability::Reliable {
+          max_blocking_time: crate::Duration::from_millis(100),
+        })
+        .history(crate::dds::qos::policy::History::KeepAll)
+        .durability(Durability::TransientLocal)
+        .build();
+      let mut f = Fixture::new(
+        EntityId::new([0, 0, 1], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+        writer_qos,
+        EntityId::new([0, 0, 2], EntityKind::READER_WITH_KEY_USER_DEFINED),
+        &best_effort_qos(),
+        3,
+        8,
+        None,
+      );
+      for _ in 0..3 {
+        assert!(
+          !f.writer.handle_heartbeat_tick(false),
+          "a best-effort reader kept the Writer heartbeating"
+        );
+      }
+    }
+
+    // A reliable reader that is behind still does, with a best-effort reader
+    // matched beside it, until it has acknowledged everything.
+    #[test]
+    fn reliable_reader_behind_keeps_the_heartbeat_going_beside_a_best_effort_one() {
+      let mut f = Fixture::user(3, 8, None);
+      let best_effort = GUID::new(GuidPrefix::new(&[3; 12]), f.reader_guid.entity_id);
+      let qos = best_effort_qos();
+      f.writer
+        .update_reader_proxy(&RtpsReaderProxy::new(best_effort, qos.clone(), false), &qos);
+      assert!(f.writer.readers.contains_key(&best_effort));
+
+      assert!(
+        f.writer.handle_heartbeat_tick(false),
+        "no HEARTBEAT for a reliable reader that has acknowledged nothing"
+      );
+      acknowledge_all_before(&mut f, 4);
+      assert!(
+        !f.writer.handle_heartbeat_tick(false),
+        "still heartbeating after the reliable reader acknowledged everything"
+      );
+    }
+
+    // A manual liveliness assertion is unchanged: it still considers every
+    // matched reader.
+    #[test]
+    fn manual_liveliness_assertion_still_considers_best_effort_readers() {
+      let mut f = Fixture::user(3, 8, None);
+      acknowledge_all_before(&mut f, 4);
+      let best_effort = GUID::new(GuidPrefix::new(&[3; 12]), f.reader_guid.entity_id);
+      let qos = best_effort_qos();
+      f.writer
+        .update_reader_proxy(&RtpsReaderProxy::new(best_effort, qos.clone(), false), &qos);
+      assert!(!f.writer.handle_heartbeat_tick(false));
+      assert!(f.writer.handle_heartbeat_tick(true));
     }
 
     // Built-in and user Writers alike answer an ACKNACK only after
