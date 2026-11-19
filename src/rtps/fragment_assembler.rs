@@ -15,6 +15,7 @@ use crate::{
     elements::serialized_payload::SerializedPayload,
     submessages::{DATAFRAG_Flags, DataFrag},
   },
+  rtps::constant::MAX_WITHHELD_BYTES_PER_TOPIC,
   structure::{
     cache_change::ChangeKind,
     sequence_number::{FragmentNumber, SequenceNumber},
@@ -24,6 +25,7 @@ use crate::{
 
 // This is for the assembly of a single object
 struct AssemblyBuffer {
+  data_size: usize,
   buffer_bytes: BytesMut,
   fragment_count: usize,
   received_bitmap: BitVec,
@@ -45,8 +47,18 @@ impl AssemblyBuffer {
       return None;
     }
 
-    let mut buffer_bytes = BytesMut::with_capacity(data_size);
-    buffer_bytes.resize(data_size, 0);
+    // data_size comes from the DATAFRAG header and is not trusted. Do not
+    // pre-allocate or zero-fill the claimed sample; grow the buffer as
+    // fragments arrive, and reject claims above the existing per-topic
+    // withheld-bytes cap (16 MiB).
+    if data_size > MAX_WITHHELD_BYTES_PER_TOPIC {
+      error!(
+        "Cannot create AssemblyBuffer: data_size={data_size} exceeds cap {}",
+        MAX_WITHHELD_BYTES_PER_TOPIC
+      );
+      return None;
+    }
+    let buffer_bytes = BytesMut::new();
 
     let fragment_count = usize::from(datafrag.total_number_of_fragments());
     if fragment_count == 0 {
@@ -57,6 +69,7 @@ impl AssemblyBuffer {
     let now = Timestamp::now();
 
     Some(Self {
+      data_size,
       buffer_bytes,
       fragment_count,
       received_bitmap: BitVec::from_elem(fragment_count, false),
@@ -117,14 +130,15 @@ impl AssemblyBuffer {
     // Last fragment might be smaller than fragment size
     // Copy reported number of fragments, or as much data as there is, whichever
     // ends first.
-    // And clamp to assembly buffer length to avoid buffer overrun.
+    // Clamp to the claimed sample size (not the current buffer length, which
+    // starts empty) and grow only as far as this fragment requires.
     let to_before_byte = std::cmp::min(
       from_byte
         + std::cmp::min(
           frags_in_submessage * frag_size,
           datafrag.serialized_payload.len(),
         ),
-      self.buffer_bytes.len(),
+      self.data_size,
     );
     if from_byte > to_before_byte {
       error!(
@@ -158,6 +172,10 @@ impl AssemblyBuffer {
       "insert_frags: dataFrag.serializedPayload.len = {:?}",
       datafrag.serialized_payload.len()
     );
+
+    if self.buffer_bytes.len() < to_before_byte {
+      self.buffer_bytes.resize(to_before_byte, 0);
+    }
 
     self.buffer_bytes.as_mut()[from_byte..to_before_byte]
       .copy_from_slice(&datafrag.serialized_payload[..payload_size]);
@@ -425,5 +443,17 @@ mod tests {
     assert!(fa
       .new_datafrag(&bad, BitFlags::<DATAFRAG_Flags>::empty())
       .is_none());
+  }
+
+  // A DATAFRAG that claims a sample larger than the assembly cap must not
+  // create a buffer. This test has not been compiled or run.
+  #[test]
+  fn reject_oversized_data_size() {
+    use crate::rtps::constant::MAX_WITHHELD_BYTES_PER_TOPIC;
+
+    let frag_size = 1024u16;
+    let data_size = (MAX_WITHHELD_BYTES_PER_TOPIC as u32).saturating_add(1);
+    let claimed = datafrag(1, 1, frag_size, data_size, vec![0u8; 1]);
+    assert!(AssemblyBuffer::new(&claimed).is_none());
   }
 }
