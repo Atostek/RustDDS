@@ -67,6 +67,10 @@ pub(crate) struct RtpsWriterProxy {
 
   pub sent_ack_nack_count: i32,
 
+  /// The Writer has sent this Reader a HEARTBEAT, so it has matched the
+  /// Reader on its side as well (`RemoteWriterConfirmed` was reported).
+  pub confirmed: bool,
+
   ack_base: SequenceNumber, // We can ACK everything before this number.
   // ack_base can be increased from N-1 to N, if we receive DATA with SequenceNumber N-1
   // heartbeat(first,last) => ack_base can be increased to first.
@@ -92,6 +96,7 @@ impl RtpsWriterProxy {
       changes: BTreeMap::new(),
       received_heartbeat_count: 0,
       sent_ack_nack_count: 0,
+      confirmed: false,
       // Sequence numbering must start at 1.
       // Therefore, we can ACK all sequence numbers below 1 even before receiving anything.
       ack_base: SequenceNumber::new(1),
@@ -328,6 +333,7 @@ impl RtpsWriterProxy {
       changes: BTreeMap::new(),
       received_heartbeat_count: 0,
       sent_ack_nack_count: 0,
+      confirmed: false,
       ack_base: SequenceNumber::default(),
       last_received_sequence_number: SequenceNumber::new(0),
       last_received_timestamp: Timestamp::INVALID,

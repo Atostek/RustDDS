@@ -379,6 +379,18 @@ pub enum DomainParticipantStatusEvent {
     local_reader: GUID,
     remote_writer: GUID,
   },
+  /// A matched remote Writer has sent its first HEARTBEAT to this Reader,
+  /// which it does only once it has matched the Reader too. Discovery is
+  /// asymmetric: [`RemoteWriterMatched`](Self::RemoteWriterMatched) says that
+  /// this side has matched the Writer, this says that the Writer's side has
+  /// matched this Reader, so the Writer's next samples will reach it.
+  ///
+  /// Reported once per matched Writer, and only for reliable Readers (a
+  /// best-effort Reader gets no HEARTBEATs).
+  RemoteWriterConfirmed {
+    local_reader: GUID,
+    remote_writer: GUID,
+  },
   RemoteReaderQosIncompatible {
     local_writer: GUID,
     remote_reader: GUID,

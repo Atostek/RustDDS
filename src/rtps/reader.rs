@@ -1,5 +1,5 @@
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   fmt, iter,
   rc::Rc,
   sync::{Arc, Mutex, MutexGuard},
@@ -70,6 +70,9 @@ pub(crate) enum TimedEvent {
 
 // Some pieces necessary to construct a reader.
 // These can be sent between threads, whereas a Reader cannot.
+/// How many not-yet-matched Writers' HEARTBEATs a Reader remembers.
+const MAX_HEARTBEATS_BEFORE_MATCH: usize = 256;
+
 pub(crate) struct ReaderIngredients {
   pub guid: GUID,
   pub notification_sender: crate::mio_source::NotificationSender,
@@ -137,6 +140,10 @@ pub(crate) struct Reader {
   last_fragment_garbage_collect: Timestamp,
   matched_writers: BTreeMap<GUID, RtpsWriterProxy>,
   writer_match_count_total: i32, // total count, never decreases
+  // Writers that sent us a HEARTBEAT before we matched them: the remote side
+  // matched first. Confirmed as soon as the match happens here. Bounded, since
+  // any remote may send HEARTBEATs.
+  heartbeats_before_match: BTreeSet<GUID>,
 
   requested_deadline_missed_count: i32,
   offered_incompatible_qos_count: i32,
@@ -204,6 +211,7 @@ impl Reader {
       last_fragment_garbage_collect: Timestamp::now(),
       matched_writers: BTreeMap::new(),
       writer_match_count_total: 0,
+      heartbeats_before_match: BTreeSet::new(),
       requested_deadline_missed_count: 0,
       offered_incompatible_qos_count: 0,
       timed_event_timer,
@@ -410,6 +418,9 @@ impl Reader {
             local_reader: self.my_guid,
             remote_writer: writer,
           });
+          if self.heartbeats_before_match.remove(&writer) {
+            self.confirm_writer(writer);
+          }
 
           info!(
             "Matched new remote writer on topic={:?} writer={:?}",
@@ -465,7 +476,26 @@ impl Reader {
     }
   }
 
+  /// Report, once per matched Writer, that it has matched this Reader too
+  /// (see `DomainParticipantStatusEvent::RemoteWriterConfirmed`).
+  fn confirm_writer(&mut self, writer_guid: GUID) {
+    let newly_confirmed = match self.matched_writers.get_mut(&writer_guid) {
+      Some(proxy) if !proxy.confirmed => {
+        proxy.confirmed = true;
+        true
+      }
+      _ => false,
+    };
+    if newly_confirmed {
+      self.send_participant_status(DomainParticipantStatusEvent::RemoteWriterConfirmed {
+        local_reader: self.my_guid,
+        remote_writer: writer_guid,
+      });
+    }
+  }
+
   pub fn remove_writer_proxy(&mut self, writer_guid: GUID) {
+    self.heartbeats_before_match.remove(&writer_guid);
     if self.matched_writers.contains_key(&writer_guid) {
       self.matched_writers.remove(&writer_guid);
       self
@@ -489,6 +519,9 @@ impl Reader {
   // Entire remote participant was lost.
   // Remove all remote writers belonging to it.
   pub fn participant_lost(&mut self, guid_prefix: GuidPrefix) {
+    self
+      .heartbeats_before_match
+      .retain(|writer| writer.prefix != guid_prefix);
     let lost_writers: Vec<GUID> = self
       .matched_writers
       .range(guid_prefix.range())
@@ -900,12 +933,22 @@ impl Reader {
       return false;
     }
 
+    // Only a HEARTBEAT addressed to this Reader shows that the Writer has
+    // matched it: one with readerId UNKNOWN may be meant for another Reader
+    // (multicast, or another Reader of this participant on the topic).
+    let directed = heartbeat.reader_id == self.my_guid.entity_id;
     if !self.matched_writers.contains_key(&writer_guid) {
       debug!(
         "HEARTBEAT from {:?}, but no writer proxy available. topic={:?} reader={:?}",
         writer_guid, self.topic_name, self.my_guid
       );
+      if directed && self.heartbeats_before_match.len() < MAX_HEARTBEATS_BEFORE_MATCH {
+        self.heartbeats_before_match.insert(writer_guid);
+      }
       return false;
+    }
+    if directed {
+      self.confirm_writer(writer_guid);
     }
     // sanity check
     if heartbeat.first_sn < SequenceNumber::default() {
@@ -1493,7 +1536,11 @@ mod tests {
   use std::sync::RwLock;
 
   use crate::{
-    dds::{qos::policy::Reliability, statusevents::sync_status_channel, typedesc::TypeDesc},
+    dds::{
+      qos::policy::Reliability,
+      statusevents::{sync_status_channel, StatusChannelReceiver},
+      typedesc::TypeDesc,
+    },
     polling::{new_shared_timer, wake_channel, LoopWaker},
     structure::{dds_cache::DDSCache, guid::EntityKind},
     QosPolicyBuilder,
@@ -2020,5 +2067,157 @@ mod tests {
     // 3. Verify that the reader does not contain a writer proxy for the writer that
     // we attempted to add
     assert!(reader.matched_writer(writer_guid).is_none());
+  }
+
+  /// A reliable Reader on a fresh topic, with the receiving end of its
+  /// participant status channel.
+  fn reliable_reader() -> (
+    Reader,
+    StatusChannelReceiver<DomainParticipantStatusEvent>,
+    QosPolicies,
+  ) {
+    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let reliable_qos = QosPolicyBuilder::new()
+      .reliability(Reliability::Reliable {
+        max_blocking_time: Duration::from_millis(100),
+      })
+      .build();
+    let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+      "confirm_test".to_string(),
+      TypeDesc::new("test_type".to_string()),
+      &reliable_qos,
+    );
+    let (notification_sender, _notification_receiver) =
+      crate::mio_source::notification_channel(100);
+    let (_notification_event_source, notification_event_sender) =
+      mio_source::make_poll_channel().unwrap();
+    let (status_sender, _status_receiver) = sync_status_channel::<DataReaderStatus>(4).unwrap();
+    let (participant_status_sender, participant_status_receiver) = sync_status_channel(16).unwrap();
+    let (_reader_command_sender, reader_command_receiver) =
+      wake_channel::<ReaderCommand>(10, &LoopWaker::new());
+    let reader_ing = ReaderIngredients {
+      guid: GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED),
+      notification_sender,
+      status_sender,
+      topic_name: "confirm_test".to_string(),
+      topic_cache_handle,
+      like_stateless: false,
+      qos_policy: reliable_qos.clone(),
+      data_reader_command_receiver: reader_command_receiver,
+      data_reader_waker: Arc::new(Mutex::new(None)),
+      poll_event_sender: notification_event_sender,
+      security_plugins: None,
+      discovery_notify: None,
+    };
+    let reader = Reader::new(
+      reader_ing,
+      Rc::new(UDPSender::new(0).unwrap()),
+      new_shared_timer(),
+      participant_status_sender,
+    );
+    (reader, participant_status_receiver, reliable_qos)
+  }
+
+  fn confirmations(
+    receiver: &StatusChannelReceiver<DomainParticipantStatusEvent>,
+  ) -> Vec<(GUID, GUID)> {
+    std::iter::from_fn(|| receiver.try_recv().ok())
+      .filter_map(|event| match event {
+        DomainParticipantStatusEvent::RemoteWriterConfirmed {
+          local_reader,
+          remote_writer,
+        } => Some((local_reader, remote_writer)),
+        _ => None,
+      })
+      .collect()
+  }
+
+  fn heartbeat(reader: &Reader, writer: GUID, count: i32) -> Heartbeat {
+    Heartbeat {
+      reader_id: reader.entity_id(),
+      writer_id: writer.entity_id,
+      first_sn: SequenceNumber::new(1),
+      last_sn: SequenceNumber::new(0),
+      count,
+    }
+  }
+
+  // A matched remote Writer sends HEARTBEATs to a Reader only once it has
+  // matched that Reader too, so the first one confirms that both sides match.
+  #[test]
+  fn the_first_heartbeat_confirms_a_matched_writer_once() {
+    let (mut reader, participant_status, qos) = reliable_reader();
+    let writer_guid = GUID::dummy_test_guid(EntityKind::WRITER_NO_KEY_USER_DEFINED);
+    let mr_state = MessageReceiverState {
+      source_guid_prefix: writer_guid.prefix,
+      ..Default::default()
+    };
+    reader.matched_writer_add(writer_guid, EntityId::UNKNOWN, vec![], vec![], &qos);
+    assert!(confirmations(&participant_status).is_empty());
+
+    reader.handle_heartbeat_msg(&heartbeat(&reader, writer_guid, 1), true, &mr_state);
+    assert_eq!(
+      confirmations(&participant_status),
+      vec![(reader.guid(), writer_guid)]
+    );
+
+    reader.handle_heartbeat_msg(&heartbeat(&reader, writer_guid, 2), true, &mr_state);
+    assert!(confirmations(&participant_status).is_empty());
+  }
+
+  // A participant that is lost and found again starts over: its HEARTBEATs
+  // from before the loss confirm nothing.
+  #[test]
+  fn a_lost_participant_forgets_its_early_heartbeats() {
+    let (mut reader, participant_status, qos) = reliable_reader();
+    let writer_guid = GUID::dummy_test_guid(EntityKind::WRITER_NO_KEY_USER_DEFINED);
+    let mr_state = MessageReceiverState {
+      source_guid_prefix: writer_guid.prefix,
+      ..Default::default()
+    };
+    reader.handle_heartbeat_msg(&heartbeat(&reader, writer_guid, 1), true, &mr_state);
+    reader.participant_lost(writer_guid.prefix);
+    reader.matched_writer_add(writer_guid, EntityId::UNKNOWN, vec![], vec![], &qos);
+    assert!(confirmations(&participant_status).is_empty());
+  }
+
+  // A HEARTBEAT with readerId UNKNOWN may be meant for another Reader, so it
+  // confirms nothing, before or after the match.
+  #[test]
+  fn an_undirected_heartbeat_confirms_nothing() {
+    let (mut reader, participant_status, qos) = reliable_reader();
+    let writer_guid = GUID::dummy_test_guid(EntityKind::WRITER_NO_KEY_USER_DEFINED);
+    let mr_state = MessageReceiverState {
+      source_guid_prefix: writer_guid.prefix,
+      ..Default::default()
+    };
+    let [first, second] = [1, 2].map(|count| Heartbeat {
+      reader_id: EntityId::UNKNOWN,
+      ..heartbeat(&reader, writer_guid, count)
+    });
+    reader.handle_heartbeat_msg(&first, true, &mr_state);
+    reader.matched_writer_add(writer_guid, EntityId::UNKNOWN, vec![], vec![], &qos);
+    reader.handle_heartbeat_msg(&second, true, &mr_state);
+    assert!(confirmations(&participant_status).is_empty());
+  }
+
+  // The remote side may match first: its HEARTBEAT then arrives before this
+  // Reader has a proxy for the Writer. The match confirms it right away.
+  #[test]
+  fn a_heartbeat_before_the_match_confirms_the_writer_on_match() {
+    let (mut reader, participant_status, qos) = reliable_reader();
+    let writer_guid = GUID::dummy_test_guid(EntityKind::WRITER_NO_KEY_USER_DEFINED);
+    let mr_state = MessageReceiverState {
+      source_guid_prefix: writer_guid.prefix,
+      ..Default::default()
+    };
+    reader.handle_heartbeat_msg(&heartbeat(&reader, writer_guid, 1), true, &mr_state);
+    assert!(confirmations(&participant_status).is_empty());
+
+    reader.matched_writer_add(writer_guid, EntityId::UNKNOWN, vec![], vec![], &qos);
+    assert_eq!(
+      confirmations(&participant_status),
+      vec![(reader.guid(), writer_guid)]
+    );
   }
 }
