@@ -3279,6 +3279,31 @@ mod tests {
     );
   }
 
+  // The topic of governance.p7s and permissions.p7s in
+  // examples/security_configuration_files/allow_unauthenticated/. It has read
+  // and write access control, and no discovery protection.
+  #[cfg(feature = "security")]
+  const PROTECTED_TOPIC: &str = "Protected";
+
+  // A participant with the built-in security plugins. Its governance document
+  // allows unauthenticated participants.
+  #[cfg(feature = "security")]
+  fn participant_with_security(domain_id: u16) -> DomainParticipant {
+    use crate::{DomainParticipantBuilder, DomainParticipantSecurityConfigFiles};
+
+    let config_files = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("examples/security_configuration_files");
+    let mut security =
+      DomainParticipantSecurityConfigFiles::with_ros_default_names(&config_files, String::new());
+    security.domain_governance_document = config_files.join("allow_unauthenticated/governance.p7s");
+    security.participant_permissions_document =
+      config_files.join("allow_unauthenticated/permissions.p7s");
+    DomainParticipantBuilder::new(domain_id)
+      .builtin_security(security)
+      .build()
+      .expect("participant creation")
+  }
+
   // With DDS Security, a participant that returns after a timeout is checked
   // anew, and it may no longer be what it was. Here it was authenticated, and
   // it returns as a participant that cannot be authenticated, which this
@@ -3295,32 +3320,19 @@ mod tests {
   #[cfg(feature = "security")]
   #[test]
   fn endpoints_of_a_participant_that_returns_unauthenticated_are_checked_again() {
-    use std::path::Path;
-
     use crate::{
       dds::statusevents::{DataReaderStatus, DataWriterStatus},
       discovery::sedp_messages::{
         PublicationBuiltinTopicData, ReaderProxy, SubscriptionBuiltinTopicData, WriterProxy,
       },
       structure::{guid::EntityKind, locator::Locator},
-      DomainParticipantBuilder, DomainParticipantSecurityConfigFiles, StatusEvented, TopicKind,
+      StatusEvented, TopicKind,
     };
 
-    // The topic of governance.p7s and permissions.p7s in allow_unauthenticated/
-    const TOPIC: &str = "Protected";
+    const TOPIC: &str = PROTECTED_TOPIC;
     let domain_id = test_domain_id(48);
 
-    let config_files =
-      Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/security_configuration_files");
-    let mut security =
-      DomainParticipantSecurityConfigFiles::with_ros_default_names(&config_files, String::new());
-    security.domain_governance_document = config_files.join("allow_unauthenticated/governance.p7s");
-    security.participant_permissions_document =
-      config_files.join("allow_unauthenticated/permissions.p7s");
-    let observer = DomainParticipantBuilder::new(domain_id)
-      .builtin_security(security)
-      .build()
-      .expect("participant creation");
+    let observer = participant_with_security(domain_id);
     let observer_db = observer.discovery_db();
     let topic = observer
       .create_topic(
@@ -3463,6 +3475,138 @@ mod tests {
       ),
       (0, 0),
       "endpoints of the unauthenticated participant on a topic with access control were entered"
+    );
+  }
+
+  // A participant that returns after a timeout is authenticated again, and
+  // its readers and writers stay in the attic until its DCPSParticipantsSecure
+  // data is processed. They are then checked again and entered. But a reader
+  // or a writer that the participant deletes before that does not come back:
+  // its dispose is processed although it is not among the entered endpoints
+  // then.
+  #[cfg(feature = "security")]
+  #[test]
+  fn endpoint_disposed_while_its_participant_is_authenticated_again_does_not_return() {
+    use crate::{discovery::secure_discovery::AuthenticationStatus, TopicKind};
+
+    let domain_id = test_domain_id(49);
+    let qos = QosPolicies::qos_none();
+    let wait_until = |what: &str, condition: &mut dyn FnMut() -> bool| {
+      let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+      while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(StdDuration::from_millis(20));
+      }
+    };
+    let topic_of = |participant: &DomainParticipant| {
+      participant
+        .create_topic(
+          PROTECTED_TOPIC.to_string(),
+          "ShapeType".to_string(),
+          &qos,
+          TopicKind::WithKey,
+        )
+        .unwrap()
+    };
+
+    // Two participants with the same identity and permissions, which
+    // authenticate each other. Both have a reader and a writer on the topic.
+    let observer = participant_with_security(domain_id);
+    let observer_db = observer.discovery_db();
+    let observer_topic = topic_of(&observer);
+    let _local_reader = observer
+      .create_subscriber(&qos)
+      .unwrap()
+      .create_datareader_cdr::<ShapeType>(&observer_topic, None)
+      .unwrap();
+    let _local_writer = observer
+      .create_publisher(&qos)
+      .unwrap()
+      .create_datawriter_cdr::<ShapeType>(&observer_topic, None)
+      .unwrap();
+    let remote = participant_with_security(domain_id);
+    let remote_prefix = remote.guid().prefix;
+    let remote_topic = topic_of(&remote);
+    let remote_subscriber = remote.create_subscriber(&qos).unwrap();
+    let remote_publisher = remote.create_publisher(&qos).unwrap();
+    let remote_reader = remote_subscriber
+      .create_datareader_cdr::<ShapeType>(&remote_topic, None)
+      .unwrap();
+    let remote_writer = remote_publisher
+      .create_datawriter_cdr::<ShapeType>(&remote_topic, None)
+      .unwrap();
+
+    // Has the observer entered this reader or writer of the remote participant?
+    let entered = |endpoint: GUID| {
+      let db = discovery_db_read(&observer_db);
+      let is_reader = db
+        .get_all_external_topic_readers()
+        .any(|r| r.reader_proxy.remote_reader_guid == endpoint);
+      let is_writer = db
+        .get_all_external_topic_writers()
+        .any(|w| w.writer_proxy.remote_writer_guid == endpoint);
+      is_reader || is_writer
+    };
+    // Puts the observer into the state after the remote participant has timed
+    // out, has returned and has been authenticated again, before its
+    // DCPSParticipantsSecure data is processed: it is known and authenticated,
+    // and its endpoints are in the attic.
+    let lose_and_authenticate_again = || {
+      let mut db = discovery_db_write(&observer_db);
+      let participant_data = db.find_participant_proxy(remote_prefix).unwrap().clone();
+      db.remove_participant(remote_prefix, false); // false = timed out
+      db.update_participant(&participant_data);
+      db.update_authentication_status(remote_prefix, AuthenticationStatus::Authenticated);
+    };
+    // A new participant makes the remote participant announce itself at once,
+    // also on DCPSParticipantsSecure. With that, the observer processes the
+    // endpoints that the remote participant has in the attic.
+    let process_the_attic = || DomainParticipant::new(domain_id).expect("participant creation");
+
+    let (reader, writer) = (remote_reader.guid(), remote_writer.guid());
+    wait_until(
+      "the remote participant is authenticated and its endpoints are entered",
+      &mut || entered(reader) && entered(writer),
+    );
+    assert_eq!(
+      discovery_db_read(&observer_db).get_authentication_status(remote_prefix),
+      Some(AuthenticationStatus::Authenticated)
+    );
+
+    // The remote participant deletes its reader while it is in the attic. The
+    // observer gets the dispose before it processes the attic.
+    lose_and_authenticate_again();
+    assert!(!entered(reader) && !entered(writer));
+    drop(remote_reader);
+    std::thread::sleep(StdDuration::from_millis(500));
+    let _newcomer = process_the_attic();
+    wait_until(
+      "the writer of the participant that was authenticated again is entered again",
+      &mut || entered(writer),
+    );
+    wait_until(
+      "the reader that the remote participant deleted is not entered again",
+      &mut || !entered(reader),
+    );
+
+    // The same with a writer that the remote participant deletes.
+    let remote_reader = remote_subscriber
+      .create_datareader_cdr::<ShapeType>(&remote_topic, None)
+      .unwrap();
+    let reader = remote_reader.guid();
+    wait_until("the new reader is entered", &mut || entered(reader));
+    lose_and_authenticate_again();
+    assert!(!entered(reader) && !entered(writer));
+    drop(remote_writer);
+    std::thread::sleep(StdDuration::from_millis(500));
+    let _newcomer = process_the_attic();
+    wait_until(
+      "the reader of the participant that was authenticated again is entered again",
+      &mut || entered(reader),
+    );
+    wait_until(
+      "the writer that the remote participant deleted is not entered again",
+      &mut || !entered(writer),
     );
   }
 }

@@ -340,6 +340,25 @@ impl DiscoveryDB {
     self.external_topic_writers.get(guid)
   }
 
+  // A remote reader or writer that SEDP may dispose: one of those above, or
+  // one in the attic, which remove_topic_reader() and remove_topic_writer()
+  // drop too.
+  #[cfg(feature = "security")]
+  pub fn get_disposable_topic_reader(&self, guid: &GUID) -> Option<&DiscoveredReaderData> {
+    self
+      .external_topic_readers
+      .get(guid)
+      .or_else(|| self.external_topic_readers_attic.get(guid))
+  }
+
+  #[cfg(feature = "security")]
+  pub fn get_disposable_topic_writer(&self, guid: &GUID) -> Option<&DiscoveredWriterData> {
+    self
+      .external_topic_writers
+      .get(guid)
+      .or_else(|| self.external_topic_writers_attic.get(guid))
+  }
+
   fn remove_topic_writer_with_prefix(&mut self, guid_prefix: GuidPrefix) {
     // TODO: Implement this using .drain_filter() in BTreeMap once it lands in
     // stable.
