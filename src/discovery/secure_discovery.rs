@@ -1360,7 +1360,17 @@ impl SecureDiscovery {
     // DP event loop. This will result in matching the builtin
     // ParticipantStatelessMessage endpoints, which are used for exchanging
     // authentication messages.
-    discovery_db_write(discovery_db).update_participant(participant_data);
+    {
+      let mut db = discovery_db_write(discovery_db);
+      db.update_participant(participant_data);
+      // If the participant returns after a timeout, its readers and writers are
+      // still in the attic. Enter them again here, as update_participant() used
+      // to do.
+      // TODO: They are not matched with local endpoints, unlike in
+      // Discovery::process_discovered_participant_data(). That should happen
+      // once the participant is authenticated.
+      db.restore_endpoints_from_attic(remote_guid.prefix);
+    }
     self.update_participant_authentication_status_and_notify_dp(
       remote_guid.prefix,
       AuthenticationStatus::Authenticating,
