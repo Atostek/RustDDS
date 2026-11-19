@@ -21,7 +21,7 @@ use crate::{
     participant::*,
     qos::*,
     result::{CreateError, CreateResult, WaitResult},
-    statusevents::{sync_status_channel, DataReaderStatus},
+    statusevents::{sync_status_channel, DataReaderStatus, MatchedCounts},
     topic::*,
     with_key,
     with_key::{
@@ -481,6 +481,8 @@ impl InnerPublisher {
   {
     // Status reports back from Writer to DataWriter.
     let (status_sender, status_receiver) = sync_status_channel(4)?;
+    // The Writer's matched-reader counts, for `get_publication_matched_status`.
+    let matched_counts = Arc::new(MatchedCounts::default());
 
     // DDS Spec 2.2.2.4.1.5 create_datawriter:
     // If no QoS is specified, we should take the Publisher default
@@ -618,6 +620,7 @@ impl InnerPublisher {
       doorbell.clone(),
       self.discovery_command.clone(),
       status_receiver,
+      Arc::clone(&matched_counts),
     )?;
 
     // Construct security info if needed
@@ -700,6 +703,7 @@ impl InnerPublisher {
       like_stateless: writer_like_stateless,
       qos_policies: writer_qos,
       status_sender,
+      matched_counts,
       security_plugins: self.security_plugins_handle.clone(),
     };
 
@@ -1129,6 +1133,8 @@ impl InnerSubscriber {
     let (send, rec) = crate::mio_source::notification_channel(4);
     // status change channel from Reader to DataReader
     let (status_sender, status_receiver) = sync_status_channel::<DataReaderStatus>(4)?;
+    // The Reader's matched-writer counts, for `get_subscription_matched_status`.
+    let matched_counts = Arc::new(MatchedCounts::default());
 
     // reader command channel from Datareader to Reader.
     // Capacity 0 is a rendezvous, matching the previous mio-extras channel: the
@@ -1232,6 +1238,7 @@ impl InnerSubscriber {
       guid: reader_guid,
       notification_sender: send,
       status_sender,
+      matched_counts: Arc::clone(&matched_counts),
       topic_name: topic.name(),
       topic_cache_handle: topic_cache_handle.clone(),
       like_stateless: reader_like_stateless,
@@ -1314,6 +1321,7 @@ impl InnerSubscriber {
       topic_cache_handle,
       self.discovery_command.clone(),
       status_receiver,
+      matched_counts,
       reader_command_sender,
       data_reader_waker,
       poll_event_source,

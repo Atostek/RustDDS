@@ -1230,6 +1230,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: "test".to_string(),
       topic_cache_handle: topic_cache_handle.clone(),
       like_stateless: false,

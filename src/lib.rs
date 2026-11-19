@@ -218,7 +218,8 @@ pub use dds::{
   sampleinfo::{InstanceState, NotAliveGenerationCounts, SampleInfo, SampleState, ViewState},
   statusevents::{
     DataReaderStatus, DataWriterStatus, DomainParticipantStatusEvent, EndpointDescription,
-    LostReason, ParticipantDescription, StatusEvented,
+    LostReason, ParticipantDescription, PublicationMatchedStatus, StatusEvented,
+    SubscriptionMatchedStatus,
   },
   topic::{Topic, TopicDescription, TopicKind},
   typedesc::TypeDesc,

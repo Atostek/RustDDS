@@ -19,7 +19,8 @@ use crate::{
     ddsdata::DDSData,
     qos::{policy, HasQoSPolicy, QosPolicies},
     statusevents::{
-      CountWithChange, DataReaderStatus, DomainParticipantStatusEvent, StatusChannelSender,
+      CountWithChange, DataReaderStatus, DomainParticipantStatusEvent, MatchedCounts,
+      StatusChannelSender,
     },
     with_key::{
       datawriter::{WriteOptions, WriteOptionsBuilder},
@@ -74,6 +75,9 @@ pub(crate) struct ReaderIngredients {
   pub guid: GUID,
   pub notification_sender: crate::mio_source::NotificationSender,
   pub status_sender: StatusChannelSender<DataReaderStatus>,
+  /// Where the Reader stores how many writers it is matched with, for the
+  /// `DataReader` to read.
+  pub(crate) matched_counts: Arc<MatchedCounts>,
   pub topic_name: String,
   pub(crate) topic_cache_handle: Arc<Mutex<TopicCache>>, /* A handle to the topic cache in DDS
                                                           * cache */
@@ -104,6 +108,8 @@ pub(crate) struct Reader {
   // Should the instant be sent?
   notification_sender: crate::mio_source::NotificationSender,
   status_sender: StatusChannelSender<DataReaderStatus>,
+  // The matched-writer counts, shared with the DataReader.
+  matched_counts: Arc<MatchedCounts>,
   udp_sender: Rc<UDPSender>,
 
   // By default, this reader is a StatefulReader (see RTPS spec section 8.4.12)
@@ -183,6 +189,7 @@ impl Reader {
     Self {
       notification_sender: i.notification_sender,
       status_sender: i.status_sender,
+      matched_counts: i.matched_counts,
       udp_sender,
       like_stateless: i.like_stateless,
       reliability: i
@@ -401,6 +408,7 @@ impl Reader {
         let count_change = self.matched_writer_update(proxy);
         if count_change > 0 {
           self.writer_match_count_total += count_change;
+          self.store_matched_counts();
           self.send_status_change(DataReaderStatus::SubscriptionMatched {
             total: CountWithChange::new(self.writer_match_count_total, count_change),
             current: CountWithChange::new(self.matched_writers.len() as i32, count_change),
@@ -478,12 +486,23 @@ impl Reader {
           .unregister_remote_writer(&self.my_guid, &writer_guid)
           .unwrap_or_else(|e| error!("{e}"));
       }
+      self.store_matched_counts();
       self.send_status_change(DataReaderStatus::SubscriptionMatched {
         total: CountWithChange::new(self.writer_match_count_total, 0),
         current: CountWithChange::new(self.matched_writers.len() as i32, -1),
         writer: writer_guid,
       });
     }
+  }
+
+  // Stores the matched-writer counts for the DataReader. Called with every
+  // SubscriptionMatched status event: the event is dropped when the status
+  // channel is full, the counts are not.
+  fn store_matched_counts(&self) {
+    self.matched_counts.set(
+      self.writer_match_count_total,
+      self.matched_writers.len() as i32,
+    );
   }
 
   // Entire remote participant was lost.
@@ -1500,6 +1519,158 @@ mod tests {
   };
   use super::*;
 
+  // A Reader that asks for `qos`, and the DataReader's end of its
+  // matched-writer counts.
+  struct MatchFixture {
+    reader: Reader,
+    matched: crate::dds::statusevents::MatchedCountsView,
+    // The other ends of the Reader's channels, kept open.
+    _channels: Vec<Box<dyn std::any::Any>>,
+  }
+
+  impl MatchFixture {
+    fn new(qos: QosPolicies) -> Self {
+      let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+      let topic_name = "matched_counts_test";
+      let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+        topic_name.to_string(),
+        TypeDesc::new("test_type".to_string()),
+        &qos,
+      );
+      let (notification_sender, notification_receiver) =
+        crate::mio_source::notification_channel(100);
+      let (notification_event_source, notification_event_sender) =
+        mio_source::make_poll_channel().unwrap();
+      let (status_sender, status_receiver) = sync_status_channel::<DataReaderStatus>(4).unwrap();
+      let (participant_status_sender, participant_status_receiver) =
+        sync_status_channel(16).unwrap();
+      let (reader_command_sender, reader_command_receiver) =
+        wake_channel::<ReaderCommand>(10, &LoopWaker::new());
+      let matched_counts = Arc::new(MatchedCounts::default());
+
+      let reader = Reader::new(
+        ReaderIngredients {
+          guid: GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED),
+          notification_sender,
+          status_sender,
+          matched_counts: Arc::clone(&matched_counts),
+          topic_name: topic_name.to_string(),
+          topic_cache_handle,
+          like_stateless: false,
+          qos_policy: qos,
+          data_reader_command_receiver: reader_command_receiver,
+          data_reader_waker: Arc::new(Mutex::new(None)),
+          poll_event_sender: notification_event_sender,
+          security_plugins: None,
+          discovery_notify: None,
+        },
+        Rc::new(UDPSender::new(0).unwrap()),
+        new_shared_timer(),
+        participant_status_sender,
+      );
+      Self {
+        reader,
+        matched: crate::dds::statusevents::MatchedCountsView::new(matched_counts),
+        _channels: vec![
+          Box::new(notification_receiver),
+          Box::new(notification_event_source),
+          Box::new(status_receiver),
+          Box::new(participant_status_receiver),
+          Box::new(reader_command_sender),
+        ],
+      }
+    }
+
+    // The total and the current matched-writer count, as the DataReader reads
+    // them.
+    fn matched_counts(&self) -> (i32, i32) {
+      let (total, current) = self.matched.read();
+      (total.count(), current.count())
+    }
+
+    // Tells the Reader about a writer of the participant `participant` that
+    // offers `qos`.
+    fn discover_writer(&mut self, participant: u8, qos: &QosPolicies) -> GUID {
+      let guid = GUID::new(
+        GuidPrefix::new(&[participant; 12]),
+        EntityId::new([0, 0, 1], EntityKind::WRITER_NO_KEY_USER_DEFINED),
+      );
+      self
+        .reader
+        .matched_writer_add(guid, EntityId::UNKNOWN, vec![], vec![], qos);
+      guid
+    }
+  }
+
+  // A writer counts as matched once, however often it is announced again.
+  #[test]
+  fn reader_counts_each_matched_writer_once() {
+    let qos = QosPolicies::qos_none();
+    let mut f = MatchFixture::new(qos.clone());
+    assert_eq!(f.matched_counts(), (0, 0));
+
+    let writer_2 = f.discover_writer(2, &qos);
+    assert_eq!(f.matched_counts(), (1, 1));
+    // The same writer again, as after a QoS or locator update, is not a new
+    // match.
+    assert_eq!(f.discover_writer(2, &qos), writer_2);
+    assert_eq!(f.matched_counts(), (1, 1));
+
+    // A writer of another participant is one.
+    f.discover_writer(3, &qos);
+    assert_eq!(f.matched_counts(), (2, 2));
+  }
+
+  // A writer that does not offer what the Reader asks for is not matched, so
+  // it is not counted.
+  #[test]
+  fn reader_does_not_count_a_writer_with_incompatible_qos() {
+    let asks_for_history = QosPolicyBuilder::new()
+      .durability(policy::Durability::TransientLocal)
+      .build();
+    let mut f = MatchFixture::new(asks_for_history.clone());
+    f.discover_writer(2, &asks_for_history);
+    // This writer offers the default, Volatile durability.
+    let writer = f.discover_writer(3, &QosPolicies::qos_none());
+    assert!(!f.reader.matched_writers.contains_key(&writer));
+    assert_eq!(f.matched_counts(), (1, 1));
+  }
+
+  // Losing a writer lowers the current count. The total counts the matches
+  // there have ever been, so it stays.
+  #[test]
+  fn reader_lowers_the_current_count_when_a_writer_is_lost() {
+    let qos = QosPolicies::qos_none();
+    let mut f = MatchFixture::new(qos.clone());
+    let writer_2 = f.discover_writer(2, &qos);
+    let writer_3 = f.discover_writer(3, &qos);
+
+    // A writer that was never matched changes nothing.
+    f.reader
+      .remove_writer_proxy(GUID::new(GuidPrefix::new(&[4; 12]), writer_3.entity_id));
+    assert_eq!(f.matched_counts(), (2, 2));
+
+    f.reader.remove_writer_proxy(writer_2);
+    assert_eq!(f.matched_counts(), (2, 1));
+    // A lost participant takes its writers with it.
+    f.reader.participant_lost(writer_3.prefix);
+    assert_eq!(f.matched_counts(), (2, 0));
+  }
+
+  // The counts do not go through the status channel, which keeps a few events
+  // and drops the rest when nobody reads them.
+  #[test]
+  fn reader_counts_more_writers_than_the_status_channel_holds() {
+    let qos = QosPolicies::qos_none();
+    let mut f = MatchFixture::new(qos.clone());
+    // The fixture's status channel has room for 4 events, and nothing reads
+    // it.
+    for participant in 2..=11 {
+      f.discover_writer(participant, &qos);
+    }
+    assert_eq!(f.matched_counts(), (10, 10));
+  }
+
   #[test]
   fn reader_sends_notification_when_receiving_data() {
     // 1. Create a reader
@@ -1538,6 +1709,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic_name.to_string(),
       topic_cache_handle,
       like_stateless: false,
@@ -1625,6 +1797,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic_name.to_string(),
       topic_cache_handle: topic_cache_handle.clone(),
       like_stateless: false,
@@ -1733,6 +1906,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic_name.to_string(),
       topic_cache_handle,
       like_stateless: false,
@@ -1844,6 +2018,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic_name.to_string(),
       topic_cache_handle,
       like_stateless: false,
@@ -1984,6 +2159,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic_name.to_string(),
       topic_cache_handle,
       like_stateless,

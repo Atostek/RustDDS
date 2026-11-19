@@ -732,6 +732,50 @@ where
     vec![].into_iter()
   }
 
+  /// Reads the SUBSCRIPTION_MATCHED status of this DataReader: how many
+  /// DataWriters it is matched with now, and how many matches there have been
+  /// since it was created.
+  ///
+  /// The counts are those of the RTPS Reader itself. They do not come from the
+  /// status event stream, so they are right also when nothing reads that
+  /// stream and it has dropped events. Each `count_change()` is the change
+  /// since the previous call on this DataReader.
+  ///
+  /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// # use serde::{Serialize, Deserialize};
+  /// # use rustdds::*;
+  /// # use rustdds::with_key::DataReader;
+  /// # use rustdds::serialization::CDRDeserializerAdapter;
+  /// #
+  /// let domain_participant = DomainParticipant::new(0).unwrap();
+  /// let qos = QosPolicyBuilder::new().build();
+  /// let subscriber = domain_participant.create_subscriber(&qos).unwrap();
+  ///
+  /// #[derive(Serialize, Deserialize, Debug)]
+  /// struct SomeType { a: i32 }
+  /// impl Keyed for SomeType {
+  ///   type K = i32;
+  ///
+  ///   fn key(&self) -> Self::K {
+  ///     self.a
+  ///   }
+  /// }
+  ///
+  /// // WithKey is important
+  /// let topic = domain_participant.create_topic("some_topic".to_string(), "SomeType".to_string(), &qos, TopicKind::WithKey).unwrap();
+  /// let data_reader = subscriber.create_datareader::<SomeType, CDRDeserializerAdapter<_>>(&topic, None).unwrap();
+  ///
+  /// let matched = data_reader.get_subscription_matched_status();
+  /// println!("{} writers now, {} ever", matched.current.count(), matched.total.count());
+  /// ```
+  pub fn get_subscription_matched_status(&self) -> SubscriptionMatchedStatus {
+    self.simple_data_reader.get_subscription_matched_status()
+  }
+
   /// An async stream for reading the (bare) data samples.
   /// The resulting Stream can be used to get another stream of status events.
   pub fn async_bare_sample_stream(self) -> BareDataReaderStream<D, DA> {
@@ -1247,6 +1291,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic.name(),
       topic_cache_handle: topic_cache,
       like_stateless: false,
@@ -1432,6 +1477,7 @@ mod tests {
       guid: reader_guid,
       notification_sender,
       status_sender,
+      matched_counts: Default::default(),
       topic_name: topic.name(),
       topic_cache_handle: topic_cache,
       like_stateless: false,

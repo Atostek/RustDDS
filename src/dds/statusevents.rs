@@ -592,6 +592,99 @@ impl CountWithChange {
   // }
 }
 
+/// The PUBLICATION_MATCHED status of a DataWriter: how many DataReaders it is
+/// matched with, that is, sends its samples to.
+///
+/// Returned by `DataWriter::get_publication_matched_status`. Each
+/// `count_change()` is the change since the status was last read from the same
+/// DataWriter.
+///
+/// See the tables of Section 2.2.4.1 in DDS Specification v1.4. Its
+/// `last_subscription_handle` is not included: the
+/// [`DataWriterStatus::PublicationMatched`] status event names the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationMatchedStatus {
+  /// How many matches with a DataReader there have been since the DataWriter
+  /// was created. This never decreases.
+  pub total: CountWithChange,
+  /// How many DataReaders the DataWriter is matched with now.
+  pub current: CountWithChange,
+}
+
+/// The SUBSCRIPTION_MATCHED status of a DataReader: how many DataWriters it is
+/// matched with, that is, receives samples from.
+///
+/// Returned by `DataReader::get_subscription_matched_status`. Each
+/// `count_change()` is the change since the status was last read from the same
+/// DataReader.
+///
+/// See the tables of Section 2.2.4.1 in DDS Specification v1.4. Its
+/// `last_publication_handle` is not included: the
+/// [`DataReaderStatus::SubscriptionMatched`] status event names the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionMatchedStatus {
+  /// How many matches with a DataWriter there have been since the DataReader
+  /// was created. This never decreases.
+  pub total: CountWithChange,
+  /// How many DataWriters the DataReader is matched with now.
+  pub current: CountWithChange,
+}
+
+/// How many remote endpoints a DataWriter or DataReader is matched with: the
+/// counts of the PUBLICATION_MATCHED and SUBSCRIPTION_MATCHED statuses.
+///
+/// The RTPS Writer / Reader stores them whenever its set of matched endpoints
+/// changes, and the DataWriter / DataReader reads them through a
+/// [`MatchedCountsView`]. Unlike a status event, they are not queued, so they
+/// are right also when nobody drains the status channel.
+#[derive(Debug, Default)]
+pub(crate) struct MatchedCounts {
+  // (total, current). One lock for the two, so that a read always gets a pair
+  // that was stored together.
+  counts: Mutex<(i32, i32)>,
+}
+
+impl MatchedCounts {
+  /// `total`: how many matches there have been ever. `current`: how many
+  /// endpoints are matched now.
+  pub(crate) fn set(&self, total: i32, current: i32) {
+    *self.counts.lock().unwrap() = (total, current);
+  }
+}
+
+/// The DataWriter's / DataReader's end of [`MatchedCounts`]. It remembers the
+/// counts it returned last, to tell how much they have changed since.
+#[derive(Debug)]
+pub(crate) struct MatchedCountsView {
+  counts: Arc<MatchedCounts>,
+  // (total, current) as `read` returned them last.
+  seen: Mutex<(i32, i32)>,
+}
+
+impl MatchedCountsView {
+  pub(crate) fn new(counts: Arc<MatchedCounts>) -> Self {
+    Self {
+      counts,
+      seen: Mutex::new((0, 0)),
+    }
+  }
+
+  /// The total and the current count, each with its change since the previous
+  /// call.
+  pub(crate) fn read(&self) -> (CountWithChange, CountWithChange) {
+    // `seen` stays locked while the counts are read, so that concurrent reads
+    // take turns: the one that gets the newer counts is also the one that
+    // remembers them last.
+    let mut seen = self.seen.lock().unwrap();
+    let (total, current) = *self.counts.counts.lock().unwrap();
+    let (seen_total, seen_current) = std::mem::replace(&mut *seen, (total, current));
+    (
+      CountWithChange::new(total, total - seen_total),
+      CountWithChange::new(current, current - seen_current),
+    )
+  }
+}
+
 // sample rejection reasons
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleRejectedStatusKind {
@@ -608,3 +701,124 @@ pub struct QosPolicyCount {
   count: i32,
 }
 */
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // Total and current count, each with its change, as a matched-status getter
+  // returns them.
+  fn status(total: (i32, i32), current: (i32, i32)) -> (CountWithChange, CountWithChange) {
+    (
+      CountWithChange::new(total.0, total.1),
+      CountWithChange::new(current.0, current.1),
+    )
+  }
+
+  // What the DataWriter / DataReader reads is what the RTPS endpoint stored
+  // last, and the first read counts the change from "nothing matched".
+  #[test]
+  fn matched_counts_view_reads_the_counts_stored_last() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+    assert_eq!(view.read(), status((0, 0), (0, 0)));
+
+    counts.set(1, 1);
+    counts.set(2, 2);
+    assert_eq!(view.read(), status((2, 2), (2, 2)));
+  }
+
+  // A change is reported once: a second read with nothing new in between
+  // shows the same counts and no change.
+  #[test]
+  fn matched_counts_view_reports_a_change_once() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+    counts.set(1, 1);
+    assert_eq!(view.read(), status((1, 1), (1, 1)));
+    assert_eq!(view.read(), status((1, 0), (1, 0)));
+  }
+
+  // Changes between two reads add up: a new match and the loss of an old one
+  // leave the current count where it was, while the total went up. A loss
+  // alone is a negative change of the current count only.
+  #[test]
+  fn matched_counts_view_nets_the_changes_between_reads() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+    counts.set(1, 1);
+    view.read();
+
+    counts.set(2, 2); // a second match
+    counts.set(2, 1); // the first one is lost
+    assert_eq!(view.read(), status((2, 1), (1, 0)));
+
+    counts.set(2, 0); // the second one is lost too
+    assert_eq!(view.read(), status((2, 0), (0, -1)));
+  }
+
+  // How many matches the two tests below store while other threads read.
+  const STORED_WHILE_READING: i32 = 200_000;
+
+  // The two counts are read as one snapshot. Every pair stored here has two
+  // equal counts, so a read that mixed two pairs would return different ones.
+  #[test]
+  fn matched_counts_are_read_as_one_snapshot() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+
+    std::thread::scope(|scope| {
+      scope.spawn(|| (1..=STORED_WHILE_READING).for_each(|n| counts.set(n, n)));
+      loop {
+        let (total, current) = view.read();
+        assert_eq!(
+          total.count(),
+          current.count(),
+          "the two counts are from different snapshots"
+        );
+        if total.count() == STORED_WHILE_READING {
+          break;
+        }
+      }
+    });
+  }
+
+  // Several threads may read the status of one endpoint. The total only
+  // grows, so no read may report that it went down, and the changes that all
+  // the reads report add up to the matches there were.
+  #[test]
+  fn concurrent_reads_report_each_match_once() {
+    let counts = Arc::new(MatchedCounts::default());
+    let view = MatchedCountsView::new(Arc::clone(&counts));
+
+    let reported: i32 = std::thread::scope(|scope| {
+      scope.spawn(|| (1..=STORED_WHILE_READING).for_each(|n| counts.set(n, n)));
+      let readers: Vec<_> = (0..2)
+        .map(|_| {
+          scope.spawn(|| {
+            let mut reported = 0;
+            loop {
+              let (total, _current) = view.read();
+              assert!(
+                total.count_change() >= 0,
+                "the total went down by {}",
+                -total.count_change()
+              );
+              reported += total.count_change();
+              if total.count() == STORED_WHILE_READING {
+                break reported;
+              }
+            }
+          })
+        })
+        .collect();
+      readers
+        .into_iter()
+        .map(|reader| reader.join().expect("a reading thread failed"))
+        .sum()
+    });
+
+    let (total, _current) = view.read();
+    assert_eq!(reported + total.count_change(), STORED_WHILE_READING);
+  }
+}

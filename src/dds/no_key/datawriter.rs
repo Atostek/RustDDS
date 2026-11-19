@@ -9,7 +9,7 @@ use crate::{
     pubsub::Publisher,
     qos::{HasQoSPolicy, QosPolicies},
     result::{unwrap_no_key_write_error, WriteResult},
-    statusevents::{DataWriterStatus, StatusReceiverStream},
+    statusevents::{DataWriterStatus, PublicationMatchedStatus, StatusReceiverStream},
     topic::Topic,
     with_key::datawriter as datawriter_with_key,
   },
@@ -221,12 +221,27 @@ where
     self.keyed_datawriter.get_offered_incompatible_qos_status()
   }
 
-  /// Unimplemented. <b>Do not use</b>.
+  */
+
+  /// Reads the PUBLICATION_MATCHED status of this DataWriter: how many
+  /// DataReaders it is matched with now, and how many matches there have been
+  /// since it was created.
+  ///
+  /// The counts are those of the RTPS Writer itself. They do not come from the
+  /// status event stream, so they are right also when nothing reads that
+  /// stream and it has dropped events. Each `count_change()` is the change
+  /// since the previous call on this DataWriter.
+  ///
+  /// The call is cheap enough to make before every write, for example to skip
+  /// producing a sample that nobody would receive. Skipping is right only for
+  /// a DataWriter with volatile durability, which keeps nothing for readers
+  /// that match later, and automatic liveliness, which no write has to assert.
+  ///
+  /// See DDS Spec 1.4 Section 2.2.4.1 Communication Status.
   ///
   /// # Examples
   ///
-  // TODO: enable run when implemented
-  /// ```no_run
+  /// ```
   /// # use serde::{Serialize, Deserialize};
   /// # use rustdds::*;
   /// # use rustdds::no_key::DataWriter;
@@ -236,21 +251,21 @@ where
   /// let qos = QosPolicyBuilder::new().build();
   /// let publisher = domain_participant.create_publisher(&qos).unwrap();
   ///
-  /// # #[derive(Serialize, Deserialize)]
-  /// # struct SomeType {}
-  /// #
+  /// #[derive(Serialize, Deserialize, Debug)]
+  /// struct SomeType { a: i32 }
+  ///
   /// // NoKey is important
   /// let topic = domain_participant.create_topic("some_topic".to_string(), "SomeType".to_string(), &qos, TopicKind::NoKey).unwrap();
-  /// let data_writer = publisher.create_datawriter_no_key::<SomeType, CDRSerializerAdapter<_>>(topic, None).unwrap();
+  /// let data_writer = publisher.create_datawriter_no_key::<SomeType, CDRSerializerAdapter<_>>(&topic, None).unwrap();
   ///
-  /// if let Ok(status) = data_writer.get_publication_matched_status() {
-  ///   // Do something
+  /// if data_writer.get_publication_matched_status().current.count() > 0 {
+  ///   data_writer.write(SomeType { a: 1 }, None).unwrap();
   /// }
   /// ```
-  pub fn get_publication_matched_status(&self) -> Result<PublicationMatchedStatus> {
+  pub fn get_publication_matched_status(&self) -> PublicationMatchedStatus {
     self.keyed_datawriter.get_publication_matched_status()
   }
-  */
+
   /// Topic this DataWriter is connected to.
   ///
   /// # Examples
