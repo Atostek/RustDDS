@@ -375,6 +375,18 @@ pub enum DomainParticipantStatusEvent {
     local_writer: GUID,
     remote_reader: GUID,
   },
+  /// A matched remote Reader has sent its first ACKNACK to this Writer,
+  /// which it does only once it has matched the Writer too. Discovery is
+  /// asymmetric: [`RemoteReaderMatched`](Self::RemoteReaderMatched) says that
+  /// this side has matched the Reader, this says that the Reader's side has
+  /// matched this Writer, so it will accept the Writer's next samples.
+  ///
+  /// Reported once per matched Reader, and only for reliable Writers. A
+  /// best-effort Reader sends no ACKNACKs, so it is reported on match.
+  RemoteReaderConfirmed {
+    local_writer: GUID,
+    remote_reader: GUID,
+  },
   RemoteWriterMatched {
     local_reader: GUID,
     remote_writer: GUID,

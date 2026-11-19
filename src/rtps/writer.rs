@@ -126,6 +126,9 @@ pub(crate) enum TimedEvent {
 
 // This is used to construct an actual Writer.
 // Ingredients are sendable between threads, whereas the Writer is not.
+/// How many not-yet-matched Readers' ACKNACKs a Writer remembers.
+const MAX_ACKNACKS_BEFORE_MATCH: usize = 256;
+
 pub(crate) struct WriterIngredients {
   pub guid: GUID,
   /// Shared, flow-controlled buffer of outgoing samples. The producer end is
@@ -191,6 +194,10 @@ pub(crate) struct Writer {
   /// StatefulWriter maintains on each matched RTPS Reader
   readers: BTreeMap<GUID, RtpsReaderProxy>,
   matched_readers_count_total: i32, // all matches ever, never decremented
+  // Readers that sent us an ACKNACK before we matched them: the remote side
+  // matched first. Confirmed as soon as the match happens here. Bounded, since
+  // any remote may send ACKNACKs.
+  acknacks_before_match: BTreeSet<GUID>,
   requested_incompatible_qos_count: i32, // how many times some Reader requested incompatible QoS
 
   // Sending mechanism
@@ -351,6 +358,7 @@ impl Writer {
       my_guid: i.guid,
       readers: BTreeMap::new(),
       matched_readers_count_total: 0,
+      acknacks_before_match: BTreeSet::new(),
       requested_incompatible_qos_count: 0,
       udp_sender,
       extra_unicast_destinations: Vec::new(),
@@ -1190,6 +1198,11 @@ impl Writer {
         }
 
         let reader_guid = GUID::new(reader_guid_prefix, an.reader_id);
+        if self.lookup_reader_proxy_mut(reader_guid).is_some() {
+          self.confirm_reader(reader_guid);
+        } else if self.acknacks_before_match.len() < MAX_ACKNACKS_BEFORE_MATCH {
+          self.acknacks_before_match.insert(reader_guid);
+        }
 
         // sanity check
         if an.reader_sn_state.base() < SequenceNumber::from(1) {
@@ -2026,6 +2039,19 @@ impl Writer {
             local_writer: self.my_guid,
             remote_reader: reader_proxy.remote_reader_guid,
           });
+          // A best-effort Reader sends no ACKNACK, so nothing could confirm it
+          // later: report it now, as a match was all one could know before.
+          let best_effort = !matches!(
+            reader_proxy.qos().reliability(),
+            Some(policy::Reliability::Reliable { .. })
+          );
+          if self
+            .acknacks_before_match
+            .remove(&reader_proxy.remote_reader_guid)
+            || best_effort
+          {
+            self.confirm_reader(reader_proxy.remote_reader_guid);
+          }
           // Reliable: send an initial HEARTBEAT to the newly matched reader so it
           // can request the samples we already hold (repair/late-join). This runs
           // synchronously on the discovery-match event in the event loop, so it
@@ -2177,7 +2203,26 @@ impl Writer {
     self.recompute_min_datagram_payload();
   }
 
+  /// Report, once per matched Reader, that it has matched this Writer too
+  /// (see `DomainParticipantStatusEvent::RemoteReaderConfirmed`).
+  fn confirm_reader(&mut self, reader_guid: GUID) {
+    let newly_confirmed = match self.readers.get_mut(&reader_guid) {
+      Some(proxy) if !proxy.confirmed => {
+        proxy.confirmed = true;
+        true
+      }
+      _ => false,
+    };
+    if newly_confirmed {
+      self.send_participant_status(DomainParticipantStatusEvent::RemoteReaderConfirmed {
+        local_writer: self.my_guid,
+        remote_reader: reader_guid,
+      });
+    }
+  }
+
   fn matched_reader_remove(&mut self, guid: GUID) -> Option<RtpsReaderProxy> {
+    self.acknacks_before_match.remove(&guid);
     let removed = self.readers.remove(&guid);
     if let Some(ref removed_reader) = removed {
       info!(
@@ -2222,6 +2267,9 @@ impl Writer {
   // Entire remote participant was lost.
   // Remove all remote readers belonging to it.
   pub fn participant_lost(&mut self, guid_prefix: GuidPrefix) {
+    self
+      .acknacks_before_match
+      .retain(|reader| reader.prefix != guid_prefix);
     let lost_readers: Vec<GUID> = self
       .readers
       .range(guid_prefix.range())
@@ -3115,6 +3163,95 @@ mod tests {
       f.ack_nack(1..=5, 2);
       assert_eq!(f.unsent(), 5);
       assert_eq!(f.repair_round(), 5);
+    }
+
+    fn reader_confirmations(f: &Fixture) -> Vec<(GUID, GUID)> {
+      std::iter::from_fn(|| f._participant_status.try_recv().ok())
+        .filter_map(|event| match event {
+          DomainParticipantStatusEvent::RemoteReaderConfirmed {
+            local_writer,
+            remote_reader,
+          } => Some((local_writer, remote_reader)),
+          _ => None,
+        })
+        .collect()
+    }
+
+    // A remote Reader sends ACKNACKs to a Writer only once it has matched that
+    // Writer too, so the first one confirms that both sides match.
+    #[test]
+    fn the_first_acknack_confirms_a_matched_reader_once() {
+      let mut f = Fixture::user(0, 8, None);
+      assert!(reader_confirmations(&f).is_empty());
+
+      f.ack_nack([], 1);
+      assert_eq!(
+        reader_confirmations(&f),
+        vec![(f.writer.my_guid, f.reader_guid)]
+      );
+
+      f.ack_nack([], 2);
+      assert!(reader_confirmations(&f).is_empty());
+    }
+
+    // A participant that is lost and found again starts over: its ACKNACKs
+    // from before the loss confirm nothing.
+    #[test]
+    fn a_lost_participant_forgets_its_early_acknacks() {
+      let mut f = Fixture::user(0, 8, None);
+      let proxy = f.writer.matched_reader_remove(f.reader_guid).unwrap();
+      reader_confirmations(&f);
+      f.ack_nack([], 1);
+      f.writer.participant_lost(f.reader_guid.prefix);
+
+      let qos = proxy.qos().clone();
+      f.writer.update_reader_proxy(&proxy, &qos);
+      assert!(reader_confirmations(&f).is_empty());
+    }
+
+    // A best-effort Reader never sends ACKNACKs, so nothing could confirm it
+    // later: it counts as confirmed on match.
+    #[test]
+    fn a_best_effort_reader_is_confirmed_on_match() {
+      let best_effort = QosPolicyBuilder::new()
+        .reliability(Reliability::BestEffort)
+        .build();
+      let f = Fixture::new(
+        EntityId::new([0, 0, 1], EntityKind::WRITER_WITH_KEY_USER_DEFINED),
+        QosPolicyBuilder::new()
+          .reliability(Reliability::Reliable {
+            max_blocking_time: Duration::from_millis(100),
+          })
+          .build(),
+        EntityId::new([0, 0, 2], EntityKind::READER_WITH_KEY_USER_DEFINED),
+        &best_effort,
+        0,
+        8,
+        None,
+      );
+      assert_eq!(
+        reader_confirmations(&f),
+        vec![(f.writer.my_guid, f.reader_guid)]
+      );
+    }
+
+    // The remote side may match first: its ACKNACK then arrives before this
+    // Writer has a proxy for the Reader. The match confirms it right away.
+    #[test]
+    fn an_acknack_before_the_match_confirms_the_reader_on_match() {
+      let mut f = Fixture::user(0, 8, None);
+      let proxy = f.writer.matched_reader_remove(f.reader_guid).unwrap();
+      reader_confirmations(&f);
+
+      f.ack_nack([], 1);
+      assert!(reader_confirmations(&f).is_empty());
+
+      let qos = proxy.qos().clone();
+      f.writer.update_reader_proxy(&proxy, &qos);
+      assert_eq!(
+        reader_confirmations(&f),
+        vec![(f.writer.my_guid, f.reader_guid)]
+      );
     }
 
     // While the reader's send socket has queued control datagrams, a round
