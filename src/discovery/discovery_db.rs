@@ -78,9 +78,9 @@ pub(crate) struct DiscoveryDB {
   //   is not known is entered here, e.g. because the participant was disposed
   //   or timed out after the sample was received.
   // They are kept because SEDP does not deliver them a second time. When the
-  // participant is discovered (again), restore_endpoints_from_attic() enters
-  // them and returns them for matching. A dispose of the participant, or of
-  // the endpoint, drops them.
+  // participant is discovered (again), Discovery takes them out with
+  // take_endpoints_from_attic() and processes them as new SEDP data. A dispose
+  // of the participant, or of the endpoint, drops them.
   // The attic has the locators that the endpoints announced, without default
   // locators of the participant: it may return with other ones.
   external_topic_readers_attic: BTreeMap<GUID, DiscoveredReaderData>,
@@ -216,8 +216,8 @@ impl DiscoveryDB {
 
       // This may be a rediscovery: Participant lease time timed out, but then
       // came back, e.g. by network outage. Its readers/writers are still in the
-      // attic. The caller restores them with restore_endpoints_from_attic(),
-      // which also returns them, so that they are matched again.
+      // attic. The caller gets them with take_endpoints_from_attic() and
+      // processes them as new SEDP data, so that they are matched again.
     }
 
     // In any case:
@@ -481,7 +481,7 @@ impl DiscoveryDB {
   //
   // If the remote participant is not known, the reader is kept in the attic
   // until the participant is discovered, and None is returned: it must not be
-  // matched yet. See restore_endpoints_from_attic().
+  // matched yet. See take_endpoints_from_attic().
   pub fn update_subscription(
     &mut self,
     data: &DiscoveredReaderData,
@@ -622,26 +622,22 @@ impl DiscoveryDB {
     }
   }
 
-  // The readers and writers of this participant that are in the attic. Call
-  // this once the participant is in the DB. They are entered as
-  // update_subscription() and update_publication() do, and returned so that
-  // they can be matched with local endpoints.
-  pub fn restore_endpoints_from_attic(
+  // Takes the readers and writers of this participant out of the attic. Call
+  // this once the participant is in the DB, and process them as SEDP data
+  // that arrives now: update_subscription() and update_publication() enter
+  // them and return them, so that they can be matched with local endpoints.
+  // With security, they have to be checked again before that.
+  pub fn take_endpoints_from_attic(
     &mut self,
     guid_prefix: GuidPrefix,
   ) -> (Vec<DiscoveredReaderData>, Vec<DiscoveredWriterData>) {
     if self.find_participant_proxy(guid_prefix).is_none() {
       return (Vec::new(), Vec::new());
     }
-    let readers = remove_by_guid_prefix(guid_prefix, &mut self.external_topic_readers_attic)
-      .iter()
-      .filter_map(|drd| self.update_subscription(drd))
-      .collect();
-    let writers = remove_by_guid_prefix(guid_prefix, &mut self.external_topic_writers_attic)
-      .iter()
-      .filter_map(|dwd| self.update_publication(dwd))
-      .collect();
-    (readers, writers)
+    (
+      remove_by_guid_prefix(guid_prefix, &mut self.external_topic_readers_attic),
+      remove_by_guid_prefix(guid_prefix, &mut self.external_topic_writers_attic),
+    )
   }
 
   // This is for local participant updating the topic table
@@ -1034,6 +1030,26 @@ mod tests {
     }
   }
 
+  // What Discovery does with the endpoints that a participant has in the
+  // attic when it is discovered: they are entered as new SEDP data. Returns the
+  // entered ones, which Discovery announces to the local endpoints.
+  fn enter_endpoints_from_attic(
+    db: &mut DiscoveryDB,
+    guid_prefix: GuidPrefix,
+  ) -> (Vec<DiscoveredReaderData>, Vec<DiscoveredWriterData>) {
+    let (readers, writers) = db.take_endpoints_from_attic(guid_prefix);
+    (
+      readers
+        .iter()
+        .filter_map(|r| db.update_subscription(r))
+        .collect(),
+      writers
+        .iter()
+        .filter_map(|w| db.update_publication(w))
+        .collect(),
+    )
+  }
+
   // Is the reader, or the writer, among the external ones of the DB?
   fn reader_known(db: &DiscoveryDB, reader: &DiscoveredReaderData) -> bool {
     db.get_all_external_topic_readers()
@@ -1061,12 +1077,12 @@ mod tests {
     assert!(db.update_publication(&early_writer).is_none());
     assert!(!reader_known(&db, &early_reader) && !writer_known(&db, &early_writer));
     assert_eq!(
-      db.restore_endpoints_from_attic(early),
+      enter_endpoints_from_attic(&mut db, early),
       (vec![], vec![]),
       "endpoints were released while their participant is unknown"
     );
     db.update_participant(&participant_data(early));
-    let (readers, writers) = db.restore_endpoints_from_attic(early);
+    let (readers, writers) = enter_endpoints_from_attic(&mut db, early);
     assert_eq!(readers.len(), 1);
     assert_eq!(writers.len(), 1);
     assert!(reader_known(&db, &early_reader) && writer_known(&db, &early_writer));
@@ -1090,7 +1106,7 @@ mod tests {
     assert!(db.update_publication(&gone_writer).is_none());
     db.remove_participant(gone, true);
     db.update_participant(&participant_data(gone));
-    assert_eq!(db.restore_endpoints_from_attic(gone), (vec![], vec![]));
+    assert_eq!(enter_endpoints_from_attic(&mut db, gone), (vec![], vec![]));
     assert!(!reader_known(&db, &gone_reader) && !writer_known(&db, &gone_writer));
 
     // An endpoint disposed over SEDP while it waits is dropped too.
@@ -1101,7 +1117,10 @@ mod tests {
     db.remove_topic_reader(disposed_reader.reader_proxy.remote_reader_guid);
     db.remove_topic_writer(disposed_writer.writer_proxy.remote_writer_guid);
     db.update_participant(&participant_data(disposed));
-    assert_eq!(db.restore_endpoints_from_attic(disposed), (vec![], vec![]));
+    assert_eq!(
+      enter_endpoints_from_attic(&mut db, disposed),
+      (vec![], vec![])
+    );
   }
 
   // SEDP does not deliver the endpoints of a participant a second time, so
@@ -1122,7 +1141,7 @@ mod tests {
     assert!(!reader_known(&db, &reader) && !writer_known(&db, &writer));
 
     db.update_participant(&participant_data(prefix));
-    let (readers, writers) = db.restore_endpoints_from_attic(prefix);
+    let (readers, writers) = enter_endpoints_from_attic(&mut db, prefix);
     assert_eq!(
       readers
         .iter()
@@ -1195,7 +1214,7 @@ mod tests {
 
     db.remove_participant(prefix, false); // false = timed out
     db.update_participant(&participant_at(prefix, 2, 2));
-    let (readers, writers) = db.restore_endpoints_from_attic(prefix);
+    let (readers, writers) = enter_endpoints_from_attic(&mut db, prefix);
 
     let reader_locators: Vec<_> = readers
       .iter()
@@ -1247,7 +1266,10 @@ mod tests {
     db.remove_topic_writer(writer.writer_proxy.remote_writer_guid);
 
     db.update_participant(&participant_data(prefix));
-    assert_eq!(db.restore_endpoints_from_attic(prefix), (vec![], vec![]));
+    assert_eq!(
+      enter_endpoints_from_attic(&mut db, prefix),
+      (vec![], vec![])
+    );
     assert!(!reader_known(&db, &reader) && !writer_known(&db, &writer));
   }
 
@@ -1267,7 +1289,10 @@ mod tests {
     db.remove_participant(prefix, true); // true = disposed
 
     db.update_participant(&participant_data(prefix));
-    assert_eq!(db.restore_endpoints_from_attic(prefix), (vec![], vec![]));
+    assert_eq!(
+      enter_endpoints_from_attic(&mut db, prefix),
+      (vec![], vec![])
+    );
     assert!(!reader_known(&db, &reader) && !writer_known(&db, &writer));
   }
 
