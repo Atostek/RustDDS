@@ -299,6 +299,7 @@ pub(crate) fn publication_builtin_topic_data() -> Option<PublicationBuiltinTopic
       ordered_access: false,
     }),
     data_representation: None,
+    user_data: None,
     related_datareader_key: None,
     service_instance_name: None,
     topic_aliases: None,

@@ -210,6 +210,9 @@ impl QosPolicyBuilder {
       // (drop glue) which is incompatible with `const fn`, and the built-in QoS
       // policies never need it. Set it via `QosPolicies::with_data_representation`.
       data_representation: None,
+      // USER_DATA is not part of the (const) builder either, for the same
+      // reason. Set it via `QosPolicies::with_user_data`.
+      user_data: None,
       #[cfg(feature = "security")]
       property: None,
     }
@@ -235,6 +238,7 @@ pub struct QosPolicies {
   pub(crate) resource_limits: Option<policy::ResourceLimits>,
   pub(crate) lifespan: Option<policy::Lifespan>,
   pub(crate) data_representation: Option<policy::DataRepresentation>,
+  pub(crate) user_data: Option<policy::UserData>,
   #[cfg(feature = "security")]
   pub(crate) property: Option<policy::Property>,
 }
@@ -333,6 +337,23 @@ impl QosPolicies {
     self
   }
 
+  pub fn user_data(&self) -> Option<policy::UserData> {
+    self.user_data.clone()
+  }
+
+  /// Set the USER_DATA QoS policy (DDS spec v1.4 Section 2.2.3.1).
+  ///
+  /// A DataReader or DataWriter announces it to remote participants in its
+  /// discovery data. ROS 2, for example, puts the type hash of a topic there
+  /// (REP-2016). It does not affect matching. This is not part of
+  /// [`QosPolicyBuilder`] because it holds a `Vec` (incompatible with the
+  /// `const` builder used for built-in QoS).
+  #[must_use]
+  pub fn with_user_data(mut self, user_data: policy::UserData) -> Self {
+    self.user_data = Some(user_data);
+    self
+  }
+
   #[cfg(feature = "security")]
   pub fn property(&self) -> Option<policy::Property> {
     self.property.clone()
@@ -362,6 +383,7 @@ impl QosPolicies {
         .data_representation
         .clone()
         .or(self.data_representation.clone()),
+      user_data: other.user_data.clone().or(self.user_data.clone()),
       #[cfg(feature = "security")]
       property: other.property.clone().or(self.property.clone()),
     }
@@ -566,6 +588,7 @@ impl QosPolicies {
       resource_limits,
       lifespan,
       data_representation,
+      user_data,
       #[cfg(feature = "security")]
         property: _, // TODO: properties to parameter list?
     } = self;
@@ -652,6 +675,7 @@ impl QosPolicies {
       data_representation,
       policy::DataRepresentation
     );
+    emit_option!(PID_USER_DATA, user_data, policy::UserData);
 
     Ok(pl)
   }
@@ -718,6 +742,7 @@ impl QosPolicies {
     let lifespan: Option<policy::Lifespan> = get_option!(PID_LIFESPAN);
     let data_representation: Option<policy::DataRepresentation> =
       get_option!(PID_DATA_REPRESENTATION);
+    let user_data: Option<policy::UserData> = get_option!(PID_USER_DATA);
 
     #[cfg(feature = "security")]
     let property: Option<policy::Property> = None; // TODO: Should also properties be read?
@@ -738,6 +763,7 @@ impl QosPolicies {
       resource_limits,
       lifespan,
       data_representation,
+      user_data,
       #[cfg(feature = "security")]
       property,
     })
@@ -936,6 +962,15 @@ pub mod policy {
   pub const XML_DATA_REPRESENTATION: DataRepresentationId = 1;
   /// Extensible CDR encoding version 2 (not supported by RustDDS).
   pub const XCDR2_DATA_REPRESENTATION: DataRepresentationId = 2;
+
+  /// DDS spec v1.4 Section 2.2.3.1 USER_DATA QoS policy: application data
+  /// attached to an entity and sent along with its discovery data.
+  ///
+  /// On the wire this is `PID_USER_DATA` (0x002c), a CDR `sequence<octet>`.
+  #[derive(Clone, Debug, PartialEq, Eq, Hash, Readable, Writable, Serialize, Deserialize)]
+  pub struct UserData {
+    pub value: Vec<u8>,
+  }
 
   /// DDS-XTypes v1.3 Section 7.6.3.1 DATA_REPRESENTATION QoS policy.
   ///

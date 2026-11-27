@@ -34,6 +34,7 @@ impl ROSDiscoveryTopic {
       duration: Duration::INFINITE,
     }),
     data_representation: None,
+    user_data: None,
     #[cfg(feature = "security")]
     property: None,
   };
@@ -73,6 +74,7 @@ impl ParameterEventsTopic {
     resource_limits: None,
     lifespan: None,
     data_representation: None,
+    user_data: None,
     #[cfg(feature = "security")]
     property: None,
   };
@@ -118,6 +120,7 @@ impl RosOutTopic {
       duration: Duration::from_secs(10),
     }),
     data_representation: None,
+    user_data: None,
     #[cfg(feature = "security")]
     property: None,
   };
