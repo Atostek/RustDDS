@@ -16,7 +16,7 @@ use crate::{
       policy::{
         DataRepresentation, Deadline, DestinationOrder, Durability, History, LatencyBudget,
         Lifespan, Liveliness, Ownership, Presentation, Reliability, ResourceLimits,
-        TimeBasedFilter,
+        TimeBasedFilter, UserData,
       },
       HasQoSPolicy, QosPolicies,
     },
@@ -171,7 +171,6 @@ pub struct SubscriptionBuiltinTopicData {
   reliability: Option<Reliability>,
   ownership: Option<Ownership>,
   destination_order: Option<DestinationOrder>,
-  // pub user_data: Option<UserData>,
   time_based_filter: Option<TimeBasedFilter>,
   presentation: Option<Presentation>,
   // pub partition: Option<Partition>,
@@ -180,6 +179,7 @@ pub struct SubscriptionBuiltinTopicData {
   // pub durability_service: Option<DurabilityService>,
   lifespan: Option<Lifespan>,
   data_representation: Option<DataRepresentation>,
+  user_data: Option<UserData>,
 
   // From spec Remote Procedure Call over DDS:
   service_instance_name: Option<String>,
@@ -220,6 +220,7 @@ impl SubscriptionBuiltinTopicData {
       presentation: None,
       lifespan: None,
       data_representation: None,
+      user_data: None,
       // DDS-RPC
       // TODO: these are not implemented
       service_instance_name: None,  // Note: Not implemented
@@ -268,6 +269,7 @@ impl SubscriptionBuiltinTopicData {
     self.presentation = qos.presentation;
     self.lifespan = qos.lifespan;
     self.data_representation = qos.data_representation.clone();
+    self.user_data = qos.user_data.clone();
     // history does not exist
     // resource_limits does not exist
   }
@@ -287,6 +289,7 @@ impl SubscriptionBuiltinTopicData {
       resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
       lifespan: self.lifespan,
       data_representation: self.data_representation.clone(),
+      user_data: self.user_data.clone(),
 
       #[cfg(feature = "security")]
       property: None, // TODO: no property QoS?
@@ -489,6 +492,7 @@ impl ParameterListable for DiscoveredReaderData {
           presentation: _,
           lifespan: _,
           data_representation: _,
+          user_data: _,
 
           service_instance_name,
           related_datawriter_key,
@@ -645,6 +649,7 @@ pub struct PublicationBuiltinTopicData {
   pub destination_order: Option<DestinationOrder>,
   pub presentation: Option<Presentation>,
   pub data_representation: Option<DataRepresentation>,
+  pub user_data: Option<UserData>,
 
   // From Remote Procedure Call over DDS:
   pub service_instance_name: Option<String>,
@@ -684,6 +689,7 @@ impl PublicationBuiltinTopicData {
       destination_order: None,
       presentation: None,
       data_representation: None,
+      user_data: None,
 
       service_instance_name: None,  // TODO: These are not supported/used
       related_datareader_key: None, // TODO
@@ -719,6 +725,7 @@ impl PublicationBuiltinTopicData {
     self.destination_order = qos.destination_order;
     self.presentation = qos.presentation;
     self.data_representation = qos.data_representation.clone();
+    self.user_data = qos.user_data.clone();
   }
 
   pub fn qos(&self) -> QosPolicies {
@@ -736,6 +743,7 @@ impl PublicationBuiltinTopicData {
       resource_limits: None, // nor Resource Limits, see Figure 8.30 in RTPS spec 2.5
       lifespan: self.lifespan,
       data_representation: self.data_representation.clone(),
+      user_data: self.user_data.clone(),
       #[cfg(feature = "security")]
       property: None, // TODO: no property Qos?
     }
@@ -949,6 +957,7 @@ impl ParameterListable for DiscoveredWriterData {
           presentation: _,
           lifespan: _,
           data_representation: _,
+          user_data: _,
 
           service_instance_name,
           related_datareader_key,
@@ -1097,6 +1106,7 @@ impl HasQoSPolicy for TopicBuiltinTopicData {
       resource_limits: self.resource_limits,
       lifespan: self.lifespan,
       data_representation: None, // Topic-level DATA_REPRESENTATION not tracked
+      user_data: None,
       #[cfg(feature = "security")]
       property: None, // TODO: no property Qos?
     }
@@ -1464,6 +1474,111 @@ mod tests {
     let sdata2 =
       PlCdrSerializerAdapter::<DiscoveredWriterData, LittleEndian>::to_bytes(&dwd2).unwrap();
     assert_eq!(sdata, sdata2);
+  }
+
+  const TYPE_HASH: &[u8] = b"typehash=RIHS01_ab;";
+
+  fn user_data_qos() -> QosPolicies {
+    QosPolicies::builder().build().with_user_data(UserData {
+      value: TYPE_HASH.to_vec(),
+    })
+  }
+
+  /// `PID_USER_DATA` carries a CDR `sequence<octet>`: the length, then the
+  /// bytes.
+  fn encoded_user_data() -> Vec<u8> {
+    let mut encoded = (TYPE_HASH.len() as u32).to_le_bytes().to_vec();
+    encoded.extend_from_slice(TYPE_HASH);
+    encoded
+  }
+
+  #[test]
+  fn a_reader_announces_its_user_data() {
+    let mut reader_proxy = reader_proxy_data().unwrap();
+    let guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
+    reader_proxy.remote_reader_guid = guid;
+    let drd = DiscoveredReaderData {
+      reader_proxy,
+      subscription_topic_data: SubscriptionBuiltinTopicData::new(
+        guid,
+        None,
+        "rt/chatter".to_string(),
+        "std_msgs::msg::dds_::String_".to_string(),
+        &user_data_qos(),
+        None,
+      ),
+      content_filter: None,
+      user_data: Vec::new(),
+    };
+
+    let sdata = drd
+      .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
+      .unwrap();
+    let drd2: DiscoveredReaderData =
+      PlCdrDeserializerAdapter::from_bytes(&sdata, RepresentationIdentifier::PL_CDR_LE).unwrap();
+
+    // The raw parameter value, padded to a multiple of 4 bytes.
+    assert!(drd2.user_data.starts_with(&encoded_user_data()));
+    assert_eq!(drd2.user_data.len() % 4, 0);
+    assert_eq!(
+      drd2.subscription_topic_data.qos().user_data(),
+      user_data_qos().user_data()
+    );
+  }
+
+  #[test]
+  fn a_writer_announces_its_user_data() {
+    let mut writer_proxy = writer_proxy_data().unwrap();
+    let guid = GUID::dummy_test_guid(EntityKind::WRITER_NO_KEY_USER_DEFINED);
+    writer_proxy.remote_writer_guid = guid;
+    let dwd = DiscoveredWriterData {
+      last_updated: Instant::now(),
+      writer_proxy,
+      publication_topic_data: PublicationBuiltinTopicData::new_with_qos(
+        guid,
+        None,
+        "rt/chatter".to_string(),
+        "std_msgs::msg::dds_::String_".to_string(),
+        &user_data_qos(),
+        None,
+      ),
+      user_data: Vec::new(),
+    };
+
+    let sdata = dwd
+      .to_pl_cdr_bytes(RepresentationIdentifier::PL_CDR_LE)
+      .unwrap();
+    let dwd2: DiscoveredWriterData =
+      PlCdrDeserializerAdapter::from_bytes(&sdata, RepresentationIdentifier::PL_CDR_LE).unwrap();
+
+    // The raw parameter value, padded to a multiple of 4 bytes.
+    assert!(dwd2.user_data.starts_with(&encoded_user_data()));
+    assert_eq!(dwd2.user_data.len() % 4, 0);
+    assert_eq!(
+      dwd2.publication_topic_data.qos().user_data(),
+      user_data_qos().user_data()
+    );
+  }
+
+  #[test]
+  fn an_endpoint_without_user_data_announces_none() {
+    let mut writer_proxy = writer_proxy_data().unwrap();
+    let pub_topic_data = publication_builtin_topic_data().unwrap();
+    writer_proxy.remote_writer_guid = pub_topic_data.key;
+    let dwd = DiscoveredWriterData {
+      last_updated: Instant::now(),
+      writer_proxy,
+      publication_topic_data: pub_topic_data,
+      user_data: Vec::new(),
+    };
+
+    let pl = dwd
+      .to_parameter_list(RepresentationIdentifier::PL_CDR_LE)
+      .unwrap();
+    assert!(!pl
+      .parameters
+      .iter()
+      .any(|p| p.parameter_id == ParameterId::PID_USER_DATA));
   }
 
   // Do not test ser/deser. This is never seen on the wire out of
